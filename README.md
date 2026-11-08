@@ -206,6 +206,8 @@ make test         # go test ./...
 make test-race    # go test -race -count=1 ./...
 make test-suite   # black-box suite: go test ./tests/... -v
 make vet
+make clean        # removes the binaries only; data/ is never touched
+make clean-cache  # drops .fragment_cache and data/pagecache
 ```
 
 - [`tests/`](tests/README.md): black-box tests through the exported API
