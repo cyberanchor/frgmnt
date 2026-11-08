@@ -753,19 +753,23 @@ func parseRetryAfter(raw string, fallback time.Duration) time.Duration {
 // HTTP client + rate limiter
 // -----------------------------------------------------------------------------
 
+// newHTTPClient builds the client of one Checker. c.Timeout bounds the
+// whole request and every phase of it: the dial, TLS handshake and
+// response-header timeouts used to be fixed at 10 s, so a timeout above
+// 10 s (-timeout 30s) still gave up after 10 s.
 func newHTTPClient(c Config) *http.Client {
 	transport := &http.Transport{
 		MaxIdleConns:          c.MaxConns,
 		MaxIdleConnsPerHost:   c.MaxConns,
 		MaxConnsPerHost:       c.MaxConns,
 		IdleConnTimeout:       60 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
+		TLSHandshakeTimeout:   c.Timeout,
+		ResponseHeaderTimeout: c.Timeout,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		DisableCompression:    true,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   c.Timeout,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		TLSClientConfig: &tls.Config{

@@ -328,3 +328,38 @@ func TestChallengePageWithoutHeader(t *testing.T) {
 		t.Errorf("Stats.Challenges = %d, want 1", got)
 	}
 }
+
+// The transport had fixed 10 s dial, TLS and response-header timeouts, so
+// Config.Timeout (the console's -timeout) above 10 s did not help a slow
+// Fragment: -timeout 30s gave up after 10 s with "timeout awaiting
+// response headers". TestSlowHeadersWithinTimeout is the end-to-end case.
+func TestTransportTimeoutsFollowConfig(t *testing.T) {
+	for _, d := range []time.Duration{2 * time.Second, 30 * time.Second, 90 * time.Second} {
+		c := New(Config{Timeout: d})
+		tr := c.client.Transport.(*http.Transport)
+		if tr.ResponseHeaderTimeout != d || tr.TLSHandshakeTimeout != d || c.client.Timeout != d {
+			t.Errorf("Timeout %v: header %v, TLS %v, client %v", d, tr.ResponseHeaderTimeout, tr.TLSHandshakeTimeout, c.client.Timeout)
+		}
+		c.Close()
+	}
+}
+
+// End to end: headers that come after 10.5 s are fine with a 13 s timeout.
+func TestSlowHeadersWithinTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("takes 10 s")
+	}
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(10500 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		http.Redirect(w, r, "/?query=slowname", http.StatusFound)
+	})
+	c := New(Config{Timeout: 13 * time.Second, Retries: 0})
+	defer c.Close()
+	if r := c.CheckOne(context.Background(), "slowname"); r.Status != StatusFree {
+		t.Errorf("headers after 10.5 s with a 13 s timeout: %s (%s), want free", r.Status, r.Error)
+	}
+}
