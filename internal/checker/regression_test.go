@@ -363,3 +363,31 @@ func TestSlowHeadersWithinTimeout(t *testing.T) {
 		t.Errorf("headers after 10.5 s with a 13 s timeout: %s (%s), want free", r.Status, r.Error)
 	}
 }
+
+// Both modes read lists with ScanNames. The console used to take one name
+// per line ("alice, bob" was a single invalid name), the web panel split
+// on spaces, commas and semicolons.
+func TestScanNamesRules(t *testing.T) {
+	cases := map[string][]string{
+		"alice, bobby;carol\tdave\r\n@Erin  frank\n":   {"alice", "bobby", "carol", "dave", "erin", "frank"},
+		"@alice | free\n@bobby | error (HTTP 403)\nca": {"alice", "bobby", "ca"}, // a results file reads back as its names
+		"one|two three\nfour":                          {"one", "four"},
+		"":                                             nil,
+		"@ , ;\n":                                      nil,
+	}
+	for in, want := range cases {
+		var got []string
+		if err := ScanNames(strings.NewReader(in), func(n string) error { got = append(got, n); return nil }); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("ScanNames(%q) = %q, want %q", in, got, want)
+		}
+	}
+	long := strings.Repeat("x", 3*maxNameToken)
+	var got []string
+	_ = ScanNames(strings.NewReader(long+",durov"), func(n string) error { got = append(got, n); return nil })
+	if len(got) != 2 || len(got[0]) != maxNameToken || got[1] != "durov" {
+		t.Errorf("a %d-byte token: got %d tokens, first %d bytes", len(long), len(got), len(got[0]))
+	}
+}

@@ -95,7 +95,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 
 | Flag | Default | Description |
 | ---- | ------- | ----------- |
-| `-input` | | Name list, one per line (`-` = stdin); a leading `@` is stripped |
+| `-input` | | Name list (`-` = stdin), read like in the web panel: new lines, spaces, commas and semicolons separate names, a leading `@` is stripped, the part of a line after `\|` is ignored (a results file can be read back) |
 | `-output` | | Results file (truncated unless `-append` or `-resume`) |
 | `-workers` | `50` | Parallel workers (up to 1000) |
 | `-conns` | `8` | TCP connections to fragment.com (HTTP/2 multiplexing) |
@@ -135,7 +135,8 @@ answers with a Cloudflare challenge (see above).
   workers and continues stopped ones (it never deletes results; finished
   workers are left as they are), Stop all stops every running one.
 - **Input**: paste names or upload a file; commas, spaces, tabs, semicolons and
-  new lines all separate names, a leading `@` is stripped. A new list keeps
+  new lines all separate names, a leading `@` is stripped, and the part of a
+  line after `|` is ignored (the console reads lists the same way). A new list keeps
   the results of the names that are in it (Resume checks only the new ones)
   and deletes the others; the panel asks first when there are results.
 - **Results**: filter chips per status, plain-text download, confidence,

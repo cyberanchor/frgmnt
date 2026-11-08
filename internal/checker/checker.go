@@ -986,87 +986,90 @@ func clamp(v, lo, hi int) int {
 // Input parsing helpers
 // -----------------------------------------------------------------------------
 
-// ParseNames extracts and deduplicates valid usernames from a free-form
-// blob. Whitespace, commas, semicolons, and newlines act as separators.
-// Leading "@" is stripped. Returns (names, rejected) where rejected is
-// the number of lines that failed validation.
-func ParseNames(blob string) (names []string, rejected int) {
-	seen := make(map[string]struct{}, 256)
-	sep := func(r rune) bool {
-		return r == '\n' || r == '\r' || r == ' ' || r == '\t' || r == ',' || r == ';'
-	}
-	for _, raw := range strings.FieldsFunc(blob, sep) {
-		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "@")))
-		if name == "" {
-			continue
-		}
-		if err := ValidateUsername(name); err != nil {
-			rejected++
-			continue
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return names, rejected
-}
-
-// maxNameToken caps how much of one separator-free token ParseNamesReader
-// keeps; anything longer cannot be a valid name and is counted as rejected.
+// maxNameToken caps how much of one separator-free token ScanNames keeps;
+// anything longer cannot be a valid name.
 const maxNameToken = 4096
 
-// ParseNamesReader streams names from r with the same rules as ParseNames.
-// It splits on the separators byte by byte instead of reading lines, so a
-// comma-separated export on a single multi-megabyte line works like one
-// name per line (the old line scanner failed on lines over 1 MiB), and
-// memory stays O(unique names) rather than O(file size).
-func ParseNamesReader(r io.Reader) (names []string, rejected int, err error) {
+// ScanNames splits a list into names the way both modes read lists: names
+// are separated by spaces, tabs, new lines, commas and semicolons; a "|"
+// ends the names of its line, so a results file ("@name | status") can be
+// read back as a list; a leading "@" is stripped and names are
+// lower-cased. It reads byte by byte, so one huge line (a single-line CSV
+// export) works like one name per line, and memory does not grow with the
+// file. fn gets every token in order, valid or not (a token longer than
+// maxNameToken is cut there; it is invalid anyway); it may return an error
+// to stop. The console used to read one name per line, so "alice, bob"
+// was a single invalid name there while the web panel read two.
+func ScanNames(r io.Reader, fn func(name string) error) error {
 	br := bufio.NewReaderSize(r, 64*1024)
-	seen := make(map[string]struct{}, 256)
 	tok := make([]byte, 0, 64)
-	tooLong := false
-	emit := func() {
-		defer func() { tok, tooLong = tok[:0], false }()
-		if tooLong {
-			rejected++
-			return
+	skipLine := false
+	emit := func() error {
+		if len(tok) == 0 {
+			return nil
 		}
-		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(string(tok), "@")))
+		name := strings.ToLower(strings.TrimPrefix(string(tok), "@"))
+		tok = tok[:0]
 		if name == "" {
-			return
+			return nil
 		}
-		if ValidateUsername(name) != nil {
-			rejected++
-			return
-		}
-		if _, ok := seen[name]; ok {
-			return
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
+		return fn(name)
 	}
 	for {
-		b, rerr := br.ReadByte()
-		if rerr != nil {
-			emit()
-			if rerr == io.EOF {
-				return names, rejected, nil
+		b, err := br.ReadByte()
+		if err != nil {
+			if eerr := emit(); eerr != nil {
+				return eerr
 			}
-			return names, rejected, rerr
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if skipLine {
+			skipLine = b != '\n'
+			continue
 		}
 		switch b {
-		case '\n', '\r', ' ', '\t', ',', ';': // the separators of ParseNames
-			emit()
+		case '\n', '\r', ' ', '\t', ',', ';':
+			if err := emit(); err != nil {
+				return err
+			}
+		case '|':
+			if err := emit(); err != nil {
+				return err
+			}
+			skipLine = true
 		default:
 			if len(tok) < maxNameToken {
 				tok = append(tok, b)
-			} else {
-				tooLong = true
 			}
 		}
 	}
+}
+
+// ParseNamesReader reads a list with ScanNames and returns the valid names
+// without duplicates, in order, and the number of invalid ones.
+func ParseNamesReader(r io.Reader) (names []string, rejected int, err error) {
+	seen := make(map[string]struct{}, 256)
+	err = ScanNames(r, func(name string) error {
+		if ValidateUsername(name) != nil {
+			rejected++
+			return nil
+		}
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
+		return nil
+	})
+	return names, rejected, err
+}
+
+// ParseNames is ParseNamesReader for a string (the text box of the panel).
+func ParseNames(blob string) (names []string, rejected int) {
+	names, rejected, _ = ParseNamesReader(strings.NewReader(blob))
+	return names, rejected
 }
 
 // probeReuse is how old a probe result may be when a "302 /" only decides

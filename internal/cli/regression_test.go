@@ -505,3 +505,34 @@ func TestDefaultWorkersMatchWeb(t *testing.T) {
 		t.Errorf("console default workers = %d, web default = %d", defaultWorkers, want)
 	}
 }
+
+// The console read one name per line: "alice, bobby" was one name, written
+// as "error (invalid: ...)", while the web panel read two names from the
+// same text. A results file given as input checked "@name | status" as a
+// name too.
+func TestConsoleReadsListsLikeWeb(t *testing.T) {
+	srv := newHitServer(t, freeHandler)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	if err := os.WriteFile(in, []byte("alice, bobby;carol\n@Dave | taken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := Main([]string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "2"}); code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	raw, _ := os.ReadFile(out)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	got := map[string]bool{}
+	for _, l := range lines {
+		got[l] = true
+	}
+	for _, want := range []string{"@alice | free", "@bobby | free", "@carol | free", "@dave | free"} {
+		if !got[want] {
+			t.Errorf("missing %q in %q", want, lines)
+		}
+	}
+	if len(lines) != 4 {
+		t.Errorf("%d lines, want 4: %q", len(lines), lines)
+	}
+}

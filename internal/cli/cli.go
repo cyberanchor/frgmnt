@@ -286,10 +286,14 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 // Input streaming
 // -----------------------------------------------------------------------------
 
-// produceUsernames streams names from src (file or stdin) into tasks.
-// When dedup is true, duplicates within the input are skipped. When skip is
-// non-nil, names already present in it are dropped (used for -resume).
-// Memory usage is O(unique-names) when dedup is on, O(1) otherwise.
+// produceUsernames streams names from src (file or stdin) into tasks. The
+// list is split like in the web panel (checker.ScanNames): new lines,
+// spaces, commas and semicolons separate names, and the part of a line
+// after "|" is ignored, so a results file can be read back. When dedup is
+// true, duplicates are skipped. When skip is non-nil, names in it are
+// dropped (used for -resume). Invalid names are passed on: the engine
+// reports them as "invalid" errors without a request. Memory usage is
+// O(unique-names) when dedup is on, O(1) otherwise.
 func produceUsernames(
 	ctx context.Context,
 	src io.Reader,
@@ -298,40 +302,32 @@ func produceUsernames(
 	skip map[string]struct{},
 	stats *Stats,
 ) (rejected int64, err error) {
-	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
-
 	var seen map[string]struct{}
 	if dedup {
 		seen = make(map[string]struct{}, 1024)
 	}
-
-	for scanner.Scan() {
-		raw := scanner.Text()
-		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "@")))
-		if name == "" {
-			continue
-		}
+	err = checker.ScanNames(src, func(name string) error {
 		if dedup {
 			if _, ok := seen[name]; ok {
-				continue
+				return nil
 			}
 			seen[name] = struct{}{}
 		}
 		if skip != nil {
 			if _, ok := skip[name]; ok {
 				rejected++
-				continue
+				return nil
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return rejected, ctx.Err()
+			return ctx.Err()
 		case tasks <- name:
 			atomic.AddInt64(&stats.total, 1)
+			return nil
 		}
-	}
-	return rejected, scanner.Err()
+	})
+	return rejected, err
 }
 
 // -----------------------------------------------------------------------------
