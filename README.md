@@ -88,7 +88,7 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
 ## Console mode
 
 ```bash
-./frgmnt check -input names.txt -output results.txt                  # 500 workers, 8 connections
+./frgmnt check -input names.txt -output results.txt                  # 50 workers, 8 connections
 ./frgmnt check -input names.txt -output results.txt -resume          # skip names with a verdict in results.txt
 cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 ```
@@ -97,7 +97,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | ---- | ------- | ----------- |
 | `-input` | | Name list, one per line (`-` = stdin); a leading `@` is stripped |
 | `-output` | | Results file (truncated unless `-append` or `-resume`) |
-| `-workers` | `500` | Parallel workers |
+| `-workers` | `50` | Parallel workers (up to 1000) |
 | `-conns` | `8` | TCP connections to fragment.com (HTTP/2 multiplexing) |
 | `-rate` | `0` | Global limit, requests per second (0 = unlimited) |
 | `-retries` / `-retry-delay` | `2` / `500ms` | Extra attempts per name and the pause between them |

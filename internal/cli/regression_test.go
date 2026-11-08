@@ -15,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cyberanchor/frgmnt/internal/checker"
 )
 
 // hitServer is a fake Fragment that counts requests per name.
@@ -493,5 +495,13 @@ func TestFilterResumeSkipsFilteredNames(t *testing.T) {
 	raw, _ := os.ReadFile(out)
 	if got := strings.TrimSpace(string(raw)); strings.Count(got, "\n") != 1 || strings.Contains(got, "taken") {
 		t.Errorf("results file %q, want the two free names only", got)
+	}
+}
+
+// The console started 500 workers by default, ten times the web panel's
+// 50: 500 requests at once from one IP with no rate limit.
+func TestDefaultWorkersMatchWeb(t *testing.T) {
+	if want := checker.DefaultConfig().Workers; defaultWorkers != want {
+		t.Errorf("console default workers = %d, web default = %d", defaultWorkers, want)
 	}
 }

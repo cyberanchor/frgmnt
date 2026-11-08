@@ -56,7 +56,9 @@ const Version = "3.1"
 var ProgName = "fragment_checker"
 
 const (
-	defaultWorkers         = 500
+	// defaultWorkers matches the web panel (checker.DefaultConfig). It used
+	// to be 500: 500 requests at once from one IP, with no rate limit.
+	defaultWorkers         = 50
 	defaultMaxConnsPerHost = 8 // HTTP/2 multiplex: a few sockets carry hundreds of streams
 	defaultTimeout         = 15 * time.Second
 	defaultCacheTTL        = 2 * time.Minute
@@ -877,7 +879,7 @@ func printUsage(fs *flag.FlagSet) {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Examples:")
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt\n", ProgName)
-	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -workers 500 -conns 8\n", ProgName)
+	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -workers 200 -conns 8\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -resume -append\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  cat names.txt | %s -input - -output results.txt -no-dedup\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -debug -workers 200 -rate 1000\n", ProgName)
