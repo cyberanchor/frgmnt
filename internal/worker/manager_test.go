@@ -240,3 +240,59 @@ func TestLargeListCompletes(t *testing.T) {
 		t.Errorf("status = %s, want done", w.Status())
 	}
 }
+
+// Stop stored every check that was in flight as "error (cancelled)" and
+// flagged the name done, so Resume never checked those names again.
+func TestStopThenResumeChecksInterruptedNames(t *testing.T) {
+	fake := newFakeFragment(t, 400*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "stopper", testConfig(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := testNames(200)
+	if _, err := h.m.SetInput(ctx, w.ID(), all); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1000 * time.Millisecond) // two waves done, 20 requests in flight
+	if err := h.m.Stop(w.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 15*time.Second) {
+		t.Fatal("worker did not stop")
+	}
+	checked, rows := persistedCounts(t, h.st, w.ID())
+	t.Logf("after Stop: %d result rows, %d names flagged checked", rows, checked)
+
+	fake.delay.Store(0)
+	if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 30*time.Second) {
+		t.Fatal("resume did not finish")
+	}
+	rs, err := h.st.ListResults(ctx, w.ID(), 0, 10000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	perName := map[string]int{}
+	for _, r := range rs {
+		perName[r.Username]++
+		if r.Error == "cancelled" {
+			t.Errorf("%s was stored as 'error (cancelled)'", r.Username)
+		}
+	}
+	missing := 0
+	for _, n := range all {
+		if perName[n] != 1 {
+			missing++
+		}
+	}
+	if missing > 0 {
+		t.Errorf("after Stop + Resume, %d of %d names have no result (or more than one)", missing, len(all))
+	}
+}

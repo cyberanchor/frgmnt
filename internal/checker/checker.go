@@ -226,7 +226,21 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 			start := time.Now()
 			r := c.CheckOne(ctx, name)
 			r.Took = time.Since(start)
+			if ctx.Err() != nil && r.Status == StatusError {
+				// Stop or shutdown cut this check short, so there is no
+				// verdict. Reporting it as an error used to store the name
+				// as done; dropping it keeps the name pending for Resume.
+				return
+			}
 			c.stats.record(r.Status)
+			// Deliver a finished verdict even if ctx was cancelled in the
+			// meantime, as long as out has room (select alone picks a
+			// random ready case).
+			select {
+			case out <- r:
+				continue
+			default:
+			}
 			select {
 			case <-ctx.Done():
 				return
