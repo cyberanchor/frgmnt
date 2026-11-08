@@ -31,16 +31,17 @@
 git clone https://github.com/cyberanchor/frgmnt && cd frgmnt
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
 
-# console: one name per line in, "@name | status" lines out
+# console: a list of names in, "@name | status" lines out
 ./frgmnt check -input names.txt -output results.txt -workers 200
 
-# web panel on http://127.0.0.1:8080
+# web panel on http://127.0.0.1:8080: create an access token, then open it
+./frgmnt token -data ./data
 ./frgmnt web
 ```
 
 Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
 `frgmnt 1.0.0 (cli 3.1, web 0.3.0)`; `./frgmnt help`, `./frgmnt check -h` and
-`./frgmnt web -h` list every flag. The old shorthands still work:
+`./frgmnt web -h` and `./frgmnt token -h` list every flag. The old shorthands still work:
 `./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
 
 ## Statuses
