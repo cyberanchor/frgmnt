@@ -1726,7 +1726,7 @@ func Main(args []string) int {
 	}
 
 	if *showVer {
-		fmt.Println("fragment_checker", Version)
+		fmt.Println(ProgName, Version)
 		return 0
 	}
 

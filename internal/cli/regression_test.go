@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -241,5 +242,24 @@ func TestStaleCacheOnlyForSoldAndTaken(t *testing.T) {
 	r := checkOne(context.Background(), "oldsold", client, newStats(), cfg)
 	if r.Status != StatusSold || !strings.Contains(r.Error, "stale cache") {
 		t.Errorf("stale sold with the network down = %+v, want sold marked as stale cache", r)
+	}
+}
+
+// `frgmnt check -version` printed a hard-coded "fragment_checker 3.1".
+func TestVersionUsesProgName(t *testing.T) {
+	defer func(old string) { ProgName = old }(ProgName)
+	ProgName = "frgmnt check"
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = w
+	code := Main([]string{"-version"})
+	os.Stdout = stdout
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	if code != 0 || strings.TrimSpace(string(out)) != "frgmnt check "+Version {
+		t.Errorf("-version printed %q (exit %d), want %q", out, code, "frgmnt check "+Version)
 	}
 }
