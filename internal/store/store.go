@@ -315,26 +315,49 @@ func (s *Store) IterPendingInputs(ctx context.Context, workerID string, fn func(
 	return s.iterInputs(ctx, workerID, true, fn)
 }
 
+// iterPageSize is how many input rows iterInputs reads per query.
+const iterPageSize = 500
+
+// iterInputs reads the inputs page by page and calls fn only after the
+// page's rows are closed. The database has a single connection: holding a
+// cursor open while fn blocks (the worker's producer waits for room in its
+// channel) used to lock out the result writer, and a list longer than the
+// channel buffers (~2,000 names) stalled the whole run.
 func (s *Store) iterInputs(ctx context.Context, workerID string, pendingOnly bool, fn func(name string) error) error {
-	q := `SELECT username FROM worker_inputs WHERE worker_id = ? ORDER BY seq ASC`
+	q := `SELECT seq, username FROM worker_inputs WHERE worker_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`
 	if pendingOnly {
-		q = `SELECT username FROM worker_inputs WHERE worker_id = ? AND checked = 0 ORDER BY seq ASC`
+		q = `SELECT seq, username FROM worker_inputs WHERE worker_id = ? AND checked = 0 AND seq > ? ORDER BY seq ASC LIMIT ?`
 	}
-	rows, err := s.db.QueryContext(ctx, q, workerID)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+	last := int64(-1)
+	page := make([]string, 0, iterPageSize)
+	for {
+		page = page[:0]
+		rows, err := s.db.QueryContext(ctx, q, workerID, last, iterPageSize)
+		if err != nil {
 			return err
 		}
-		if err := fn(name); err != nil {
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&last, &name); err != nil {
+				rows.Close()
+				return err
+			}
+			page = append(page, name)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
 			return err
 		}
+		for _, name := range page {
+			if err := fn(name); err != nil {
+				return err
+			}
+		}
+		if len(page) < iterPageSize {
+			return nil
+		}
 	}
-	return rows.Err()
 }
 
 // MarkInputChecked flags a username as processed so a future resume skips it.

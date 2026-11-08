@@ -193,3 +193,50 @@ func TestAbruptShutdownKeepsFlagsAndResultsConsistent(t *testing.T) {
 		t.Errorf("%d names flagged checked, %d result rows: Resume would skip names without a result", checked, rows)
 	}
 }
+
+// The producer kept the only SQLite connection busy with an open cursor
+// while it waited for room in the 1024-name input channel, and the result
+// writer needs that connection. A list longer than the channel buffers
+// (about 2,070 names) therefore stopped dead: 3,000 names hung at ~1,050
+// checked, batches were dropped on the 5 s write timeout, and every API call
+// that touched the database timed out too.
+func TestLargeListCompletes(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "large", testConfig(20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 3000
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(n)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The API must stay responsive while the run is going.
+	time.Sleep(300 * time.Millisecond)
+	apiCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	_, apiErr := h.st.CountByStatus(apiCtx, w.ID())
+	cancel()
+	if apiErr != nil {
+		t.Errorf("database query during the run: %v", apiErr)
+	}
+
+	if !waitNotRunning(w, 60*time.Second) {
+		_ = h.m.Stop(w.ID())
+		t.Fatalf("a %d-name list did not finish in 60s (checked %d)", n, w.Stats().Checked)
+	}
+	checked, rows := persistedCounts(t, h.st, w.ID())
+	t.Logf("%d names in %v: %d flagged checked, %d result rows, %d ERROR events",
+		n, time.Since(start).Round(time.Millisecond), checked, rows, h.errs.Load())
+	if rows != n || checked != n {
+		t.Errorf("persisted %d rows and %d flags, want %d (last error: %q)", rows, checked, n, h.lastError())
+	}
+	if w.Status() != StatusDone {
+		t.Errorf("status = %s, want done", w.Status())
+	}
+}
