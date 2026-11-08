@@ -376,6 +376,27 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 	return set, scanner.Err()
 }
 
+// addCheckedList adds the names of a <output>.checked list (one per line)
+// to set. A missing file is not an error.
+func addCheckedList(path string, set map[string]struct{}) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
+	for scanner.Scan() {
+		if name := strings.TrimSpace(scanner.Text()); name != "" {
+			set[name] = struct{}{}
+		}
+	}
+	return scanner.Err()
+}
+
 // -----------------------------------------------------------------------------
 // Filter parsing
 // -----------------------------------------------------------------------------
@@ -406,43 +427,66 @@ func parseFilter(raw string) (map[Status]bool, error) {
 // Output: one goroutine writes the results file and stdout
 // -----------------------------------------------------------------------------
 
+// outputs are the writers of one run. checked is nil without -filter.
+type outputs struct {
+	file    *bufio.Writer // the results file
+	stdout  *bufio.Writer
+	checked *bufio.Writer // <output>.checked: every name with a verdict
+}
+
+// flush flushes every writer and returns the first error of the files.
+func (o outputs) flush() error {
+	ferr := o.file.Flush()
+	var cerr error
+	if o.checked != nil {
+		cerr = o.checked.Flush()
+	}
+	serr := o.stdout.Flush()
+	switch {
+	case ferr != nil:
+		return fmt.Errorf("file flush: %w", ferr)
+	case cerr != nil:
+		return fmt.Errorf("checked-list flush: %w", cerr)
+	case serr != nil:
+		return fmt.Errorf("stdout flush: %w", serr)
+	}
+	return nil
+}
+
 // writeResults writes every result to the output file and stdout until
 // results is closed, flushing both every flushInterval so the file fills in
-// real time. It does not react to Ctrl+C on purpose: every result the
-// engine counted must land on disk. A failed final flush (disk full, I/O
-// error) is returned.
-func writeResults(results <-chan checker.Result, fileW, stdoutW *bufio.Writer, filter map[Status]bool, quiet bool, stats *Stats) error {
+// real time. With -filter it also lists every name that got a verdict in
+// <output>.checked, so -resume can skip the names the filter left out of
+// the results file. It does not react to Ctrl+C on purpose: every result
+// the engine counted must land on disk. A failed final flush (disk full,
+// I/O error) is returned.
+func writeResults(results <-chan checker.Result, out outputs, filter map[Status]bool, quiet bool, stats *Stats) error {
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 	const resetColor = "\033[0m"
 	for {
 		select {
 		case <-ticker.C:
-			_ = fileW.Flush()
-			_ = stdoutW.Flush()
+			_ = out.flush()
 		case r, ok := <-results:
 			if !ok {
-				ferr := fileW.Flush()
-				serr := stdoutW.Flush()
-				if ferr != nil {
-					return fmt.Errorf("file flush: %w", ferr)
-				}
-				if serr != nil {
-					return fmt.Errorf("stdout flush: %w", serr)
-				}
-				return nil
+				return out.flush()
 			}
 			stats.observe(r)
 			fileLine, stdoutLine, color := formatResult(r, filter, quiet)
 			if fileLine != "" {
-				_, _ = fileW.WriteString(fileLine)
-				_ = fileW.WriteByte('\n')
+				_, _ = out.file.WriteString(fileLine)
+				_ = out.file.WriteByte('\n')
+			}
+			if out.checked != nil && r.Status != StatusError {
+				_, _ = out.checked.WriteString(r.Username)
+				_ = out.checked.WriteByte('\n')
 			}
 			if stdoutLine != "" {
 				if color != "" {
-					_, _ = stdoutW.WriteString(color + stdoutLine + resetColor + "\n")
+					_, _ = out.stdout.WriteString(color + stdoutLine + resetColor + "\n")
 				} else {
-					_, _ = stdoutW.WriteString(stdoutLine + "\n")
+					_, _ = out.stdout.WriteString(stdoutLine + "\n")
 				}
 			}
 		}
@@ -618,11 +662,20 @@ func Main(args []string) int {
 	}
 
 	// --- Resume set ---
+	// With -filter the results file lacks the names the filter left out;
+	// <output>.checked lists every name that got a verdict.
+	checkedPath := *outputPath + ".checked"
 	var skip map[string]struct{}
 	if *resume {
 		s, err := loadResumeSet(*outputPath)
 		if err != nil {
 			log.Fatalf("Cannot read resume set from %s: %v", *outputPath, err)
+		}
+		if s == nil {
+			s = make(map[string]struct{})
+		}
+		if err := addCheckedList(checkedPath, s); err != nil {
+			log.Fatalf("Cannot read %s: %v", checkedPath, err)
 		}
 		skip = s
 		log.Printf("[resume] loaded %d already-processed names", len(skip))
@@ -639,8 +692,18 @@ func Main(args []string) int {
 	if err != nil {
 		log.Fatalf("Cannot open %s: %v", *outputPath, err)
 	}
-	fileW := bufio.NewWriterSize(outFile, 64*1024)
-	stdoutW := bufio.NewWriterSize(os.Stdout, 64*1024)
+	out := outputs{
+		file:   bufio.NewWriterSize(outFile, 64*1024),
+		stdout: bufio.NewWriterSize(os.Stdout, 64*1024),
+	}
+	var checkedFile *os.File
+	if filter != nil {
+		checkedFile, err = os.OpenFile(checkedPath, flags, 0o644)
+		if err != nil {
+			log.Fatalf("Cannot open %s: %v", checkedPath, err)
+		}
+		out.checked = bufio.NewWriterSize(checkedFile, 64*1024)
+	}
 
 	// --- Engine ---
 	// The same checker as the web panel: retries, the 302 / probe, the
@@ -711,7 +774,7 @@ func Main(args []string) int {
 
 	// --- Output writer (lives until close(results), independent of ctx) ---
 	writeDone := make(chan error, 1)
-	go func() { writeDone <- writeResults(results, fileW, stdoutW, filter, *quiet, stats) }()
+	go func() { writeDone <- writeResults(results, out, filter, *quiet, stats) }()
 
 	// --- Progress reporter ---
 	progCtx, progCancel := context.WithCancel(ctx)
@@ -771,10 +834,16 @@ func Main(args []string) int {
 		exitCode = 1
 	}
 
-	// --- Close output file ---
+	// --- Close output files ---
 	if err := outFile.Close(); err != nil {
 		log.Printf("[ERROR] closing output: %v", err)
 		exitCode = 1
+	}
+	if checkedFile != nil {
+		if err := checkedFile.Close(); err != nil {
+			log.Printf("[ERROR] closing %s: %v", checkedPath, err)
+			exitCode = 1
+		}
 	}
 
 	// --- Final summary ---

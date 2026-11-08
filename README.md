@@ -106,7 +106,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-readlimit` | `16384` | Body bytes scanned for the status (1 KiB–1 MiB) |
 | `-cache-dir` / `-no-cache` | `.fragment_cache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
-| `-filter` | | Write only these statuses, e.g. `free,auction` |
+| `-filter` | | Write only these statuses, e.g. `free,auction`; every name with a verdict is also listed in `<output>.checked`, so `-resume` skips the ones the filter left out |
 | `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again) |
 | `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
 | `-quiet` / `-debug` / `-trace` | | Less or more output on stdout and stderr |

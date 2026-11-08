@@ -457,3 +457,41 @@ func TestSIGINTWithIdleStdinReturns(t *testing.T) {
 		t.Errorf("results file after Ctrl+C: %q, want the 2 names checked before it", raw)
 	}
 }
+
+// With -filter only the chosen statuses reach the results file, and
+// -resume only knew the names in it: "-filter free -resume" checked every
+// taken (or sold, ...) name again on each run. The names with a verdict
+// are now listed in <output>.checked as well.
+func TestFilterResumeSkipsFilteredNames(t *testing.T) {
+	taken := `<html><body><h2><span class="tm-section-header-status tm-status-taken">Taken</span></h2>` +
+		`<button class="js-make-offer-btn">Make an offer</button></body></html>`
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		if strings.HasPrefix(name, "taken") {
+			fmt.Fprint(w, taken)
+			return
+		}
+		freeHandler(w, r, name)
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "free.txt")
+	if err := os.WriteFile(in, []byte("takenone\nfreeone\ntakentwo\nfreetwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "2", "-filter", "free"}
+	if code := Main(args); code != 0 {
+		t.Fatalf("first run exit=%d", code)
+	}
+	if code := Main(append(args, "-resume")); code != 0 {
+		t.Fatalf("resume exit=%d", code)
+	}
+	for _, n := range []string{"takenone", "freeone", "takentwo", "freetwo"} {
+		if c := srv.count(n); c != 1 {
+			t.Errorf("%s requested %d times over a run and a -resume, want 1", n, c)
+		}
+	}
+	raw, _ := os.ReadFile(out)
+	if got := strings.TrimSpace(string(raw)); strings.Count(got, "\n") != 1 || strings.Contains(got, "taken") {
+		t.Errorf("results file %q, want the two free names only", got)
+	}
+}
