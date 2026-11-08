@@ -193,3 +193,20 @@ func TestHugeReadLimitFlagIsClamped(t *testing.T) {
 		t.Errorf("exit=%d output=%q, want 0 and @alice | sold", code, raw)
 	}
 }
+
+// Results could not be written (here: ENOSPC from /dev/full), the error was
+// only logged and the exit code was still 0, so scripts took the run as done.
+func TestExitCodeOnOutputWriteFailure(t *testing.T) {
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("no /dev/full")
+	}
+	srv := newHitServer(t, freeHandler)
+	in := filepath.Join(t.TempDir(), "names.txt")
+	if err := os.WriteFile(in, []byte("alice\nbob\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := Main([]string{"-input", in, "-output", "/dev/full", "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "2"})
+	if code == 0 {
+		t.Error("results could not be written (ENOSPC) but the exit code is 0")
+	}
+}

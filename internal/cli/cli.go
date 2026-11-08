@@ -1901,19 +1901,24 @@ func Main(args []string) int {
 	progCancel()
 
 	// --- Close sink and wait for the final flush ---
+	// A failed write (disk full, I/O error) means results.txt is missing
+	// results: report it in the exit code, not only in the log.
+	exitCode := 0
 	close(sink)
 	if err := <-sinkDone; err != nil {
 		log.Printf("[ERROR] sink: %v", err)
+		exitCode = 1
 	}
 
 	// --- Close output file ---
 	if err := outFile.Close(); err != nil {
 		log.Printf("[ERROR] closing output: %v", err)
+		exitCode = 1
 	}
 
 	// --- Final summary ---
 	log.Println(stats.finalSummary())
-	return 0
+	return exitCode
 }
 
 // printUsage is installed as flag.Usage and is also called manually when
