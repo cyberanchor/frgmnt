@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -125,5 +126,28 @@ func TestResumeRechecksOldCancelledLines(t *testing.T) {
 	_, carol := set["carol"]
 	if !alice || bob || !carol {
 		t.Errorf("resume set = %v, want alice and carol, not bob", set)
+	}
+}
+
+// checkWith runs checkOne against a fake Fragment with the given handler.
+func checkWith(t *testing.T, retries int, h func(w http.ResponseWriter, r *http.Request, name string)) (Result, *hitServer) {
+	t.Helper()
+	srv := newHitServer(t, h)
+	old := fragmentURLTemplate
+	fragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() { fragmentURLTemplate = old })
+	client := newHTTPClient(httpConfig{maxConns: 1, timeout: time.Second})
+	r := checkOne(context.Background(), "alice", client, newStats(), checkConfig{retries: retries, retryDelay: time.Millisecond})
+	return r, srv
+}
+
+// The web engine treats a 200 Cloudflare interstitial as a retryable error;
+// the console engine reported it as a final "unknown" after one request.
+func TestChallengeIsRetriedAsError(t *testing.T) {
+	r, srv := checkWith(t, 2, func(w http.ResponseWriter, r *http.Request, name string) {
+		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><script>window._cf_chl_opt={}</script></html>`)
+	})
+	if r.Status != StatusError || srv.count("alice") != 3 {
+		t.Errorf("challenge page: status=%q after %d requests, want error after 3", r.Status, srv.count("alice"))
 	}
 }

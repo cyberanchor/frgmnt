@@ -1197,6 +1197,15 @@ func doRequest(ctx context.Context, name, reqURL string, client *http.Client, st
 		debugf("@%s body: %d bytes read (limit %d)", name, n, readLimit)
 
 		st, offset, found, confidence, evidence := parseStatusInfo(body)
+		if !found && looksLikeChallenge(body) {
+			// A Cloudflare interstitial says nothing about the name. Like
+			// the web engine: retry, and report an error if it persists
+			// (it used to end as a final "unknown" on the first attempt).
+			*bufPtr = buf
+			bodyBufPool.Put(bufPtr)
+			finish(StatusError, n)
+			return Result{name, StatusError, "cloudflare challenge"}, true, "cloudflare challenge"
+		}
 		if found && cfg.cache != nil {
 			cfg.cache.put(name, reqURL, st, confidence, evidence, body)
 		}
