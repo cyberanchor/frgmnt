@@ -1361,6 +1361,11 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 		if pipe < 0 {
 			continue
 		}
+		// Older versions wrote checks interrupted by Ctrl+C as
+		// "error (cancelled)"; those names were never checked.
+		if strings.TrimSpace(line[pipe+3:]) == string(StatusError)+" (cancelled)" {
+			continue
+		}
 		name := strings.ToLower(strings.TrimSpace(line[1:pipe]))
 		if name != "" {
 			set[name] = struct{}{}
@@ -1596,6 +1601,11 @@ func runWorker(
 				return
 			}
 			result := checkOne(ctx, name, client, stats, cfg)
+			if ctx.Err() != nil && result.Status == StatusError {
+				// Ctrl+C cut this check short: there is no verdict. Writing
+				// "error (cancelled)" made -resume skip the name for good.
+				return
+			}
 			stats.record(result.Status)
 
 			// Build output lines.
