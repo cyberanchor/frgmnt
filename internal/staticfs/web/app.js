@@ -100,10 +100,21 @@ const state = {
 //     local override yet. After that, the user is authoritative: pressing
 //     the toggle stores the new value locally and the server is updated
 //     when they press "Save" on the Settings tab.
+// localStorage throws when the browser blocks site storage (private mode,
+// blocked cookies). The theme is only a convenience, so treat that as "no
+// saved theme": the toggle used to throw and loadSettings showed an error
+// instead of applying the server theme.
+function storageGet(key) {
+    try { return localStorage.getItem(key); } catch { return null; }
+}
+function storageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch {}
+}
+
 function applyTheme(theme, source = "user") {
     const t = theme === "light" ? "light" : "dark";
     document.documentElement.dataset.theme = t;
-    if (source === "user") localStorage.setItem("fc.theme", t);
+    if (source === "user") storageSet("fc.theme", t);
 }
 
 $("#theme-toggle").addEventListener("click", () => {
@@ -114,8 +125,7 @@ $("#theme-toggle").addEventListener("click", () => {
 // A theme saved in this browser wins. Without one the page starts dark and
 // loadSettings() applies the theme from settings.json. Boot used to store
 // "dark" in localStorage right away, so the server theme never applied.
-let savedTheme = null;
-try { savedTheme = localStorage.getItem("fc.theme"); } catch {}
+const savedTheme = storageGet("fc.theme");
 applyTheme(savedTheme || "dark", savedTheme ? "user" : "server");
 
 /* -------------------------------------------------------------------------- */
@@ -647,7 +657,7 @@ async function loadSettings() {
         // Only seed the theme from the server when the user has not yet
         // expressed a local preference. After that, localStorage wins until
         // the user explicitly presses Save in the Settings tab.
-        if (state.settings.theme && !localStorage.getItem("fc.theme")) {
+        if (state.settings.theme && !storageGet("fc.theme")) {
             applyTheme(state.settings.theme, "server");
         }
     } catch (e) { toast("Load settings: " + e.message, "error"); }
