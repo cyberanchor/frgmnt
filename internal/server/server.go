@@ -6,6 +6,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,8 @@ type Server struct {
 	bus        *logbus.Bus
 	staticFS   fs.FS
 	keeper     *auth.Keeper // nil: no access tokens (tests)
+	tlsCert    string       // PEM files for HTTPS; "" = plain HTTP
+	tlsKey     string
 	mux        *http.ServeMux
 	handler    http.Handler // mux behind guard() and requireToken()
 }
@@ -51,6 +54,9 @@ type Options struct {
 	// for every request except the login page. The web mode always sets
 	// it; nil leaves the panel open (tests).
 	Auth *auth.Keeper
+	// TLSCert and TLSKey are PEM files; when set, Run serves HTTPS and
+	// reads the files again when they change (certificate renewals).
+	TLSCert, TLSKey string
 }
 
 // New assembles a Server but does NOT start listening.
@@ -63,6 +69,8 @@ func New(opt Options) *Server {
 		bus:        opt.Bus,
 		staticFS:   opt.StaticFS,
 		keeper:     opt.Auth,
+		tlsCert:    opt.TLSCert,
+		tlsKey:     opt.TLSKey,
 		mux:        http.NewServeMux(),
 	}
 	s.routes()
@@ -320,10 +328,30 @@ func (s *Server) Run(ctx context.Context) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		// SSE responses are long-lived; do NOT set a write deadline.
 	}
+	scheme := "HTTP"
+	if s.tlsCert != "" || s.tlsKey != "" {
+		reloader, err := newCertReloader(s.tlsCert, s.tlsKey, func(err error) {
+			s.bus.Publish(logbus.LevelWarn, "", "TLS certificate not reloaded, the old one stays in use: "+err.Error())
+		})
+		if err != nil {
+			return fmt.Errorf("TLS certificate: %w", err)
+		}
+		srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: reloader.getCertificate}
+		scheme = "HTTPS"
+	} else if !isLoopbackAddr(s.addr) {
+		s.bus.Publish(logbus.LevelWarn, "", "listening on "+s.addr+" without TLS: access tokens travel in clear text; "+
+			"use -tls-cert/-tls-key or a TLS reverse proxy")
+	}
 	errCh := make(chan error, 1)
 	go func() {
-		s.bus.Publish(logbus.LevelInfo, "", "HTTP server listening on "+s.addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.bus.Publish(logbus.LevelInfo, "", scheme+" server listening on "+s.addr)
+		var err error
+		if srv.TLSConfig != nil {
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}

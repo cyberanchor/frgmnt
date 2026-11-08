@@ -55,6 +55,8 @@ func Main(args []string) int {
 		noCache      = fs.Bool("no-cache", false, "disable the on-disk page cache")
 		baseURL      = fs.String("base-url", "", "Fragment base URL to check against (tests, mirrors); default https://fragment.com")
 		allowHosts   = fs.String("allow-host", "", "comma-separated host names the panel answers to besides localhost, e.g. the domain of a reverse proxy")
+		tlsCert      = fs.String("tls-cert", "", "PEM certificate (full chain) to serve HTTPS; reloaded when the file changes")
+		tlsKey       = fs.String("tls-key", "", "PEM private key for -tls-cert")
 		showVer      = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -69,6 +71,10 @@ func Main(args []string) int {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(os.Stderr, "-tls-cert and -tls-key go together")
+		return 2
+	}
 	if *baseURL != "" {
 		// Same as the console's -base-url: the web mode could not be
 		// pointed at a test server or mirror without a code change.
@@ -120,6 +126,8 @@ func Main(args []string) int {
 		Bus:        bus,
 		StaticFS:   staticSub,
 		Auth:       keeper,
+		TLSCert:    *tlsCert,
+		TLSKey:     *tlsKey,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -159,6 +159,7 @@ answers with a Cloudflare challenge (see above).
 | `-cache-dir` / `-no-cache` | `<data>/pagecache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
 | `-allow-host` | | Host names the panel answers to besides `localhost`, comma-separated: the domain of a reverse proxy in front of it |
+| `-tls-cert` / `-tls-key` | | PEM certificate (full chain) and key: serve HTTPS; the files are read again every 10 s, so renewals apply without a restart |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 | `-version` | | Print the version |
 
@@ -186,8 +187,19 @@ Two ways to reach the panel, both with a token:
 
 - **SSH**: keep the default `-addr 127.0.0.1:8080` and open
   `ssh -L 8080:127.0.0.1:8080 server`, then `http://localhost:8080`.
-- **A domain with a certificate**: put a TLS reverse proxy in front and name
-  the domain with `-allow-host panel.example.com`.
+- **A domain with a certificate**: either a TLS reverse proxy in front
+  (nginx, Caddy) with the default `-addr` and
+  `-allow-host panel.example.com`, or the panel serves HTTPS itself:
+
+  ```bash
+  ./frgmnt web -addr :8443 -allow-host panel.example.com \
+      -tls-cert /etc/frgmnt/fullchain.pem -tls-key /etc/frgmnt/privkey.pem
+  ```
+
+  The panel user must be able to read the key (Let's Encrypt keys are
+  root-only: copy them in a deploy hook). Port 443 needs root or
+  `setcap cap_net_bind_service=+ep ./frgmnt`. A panel on a public address
+  without TLS says in its log that tokens would travel in clear text.
 
 The panel also refuses state-changing requests that a browser marks as
 coming from another site (`Origin`, `Sec-Fetch-Site`), the login form
