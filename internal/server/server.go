@@ -600,6 +600,10 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if err := checkCacheDir(body.Config.CacheDir, ""); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		body.Config = mergeConfig(body.Config, def)
 		w2, err := s.mgr.Create(r.Context(), body.Name, body.Config)
 		if err != nil {
@@ -630,6 +634,18 @@ func defaultConfigFromSettings(s store.Settings) checker.Config {
 		def.Timeout = time.Duration(s.DefaultTimeout) * time.Second
 	}
 	return def
+}
+
+// checkCacheDir refuses a page-cache directory set through the API. The
+// directory comes from the panel's -cache-dir flag (default
+// <data>/pagecache); a per-worker cache_dir let anyone with access to the
+// API make the panel create directories and write files anywhere it may
+// write. A value a worker already has (set by an older version) may stay.
+func checkCacheDir(dir, current string) error {
+	if dir == "" || dir == current {
+		return nil
+	}
+	return errors.New("cache_dir cannot be set through the API; the page cache directory is set for the whole panel with -cache-dir")
 }
 
 // mergeConfig fills the fields that are zero ("not set") from def. The
@@ -731,6 +747,10 @@ func (s *Server) handleWorkerCRUD(w http.ResponseWriter, r *http.Request, id str
 			body.Name = existing.Name()
 		}
 		if err := body.Config.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := checkCacheDir(body.Config.CacheDir, existing.Config().CacheDir); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

@@ -644,3 +644,30 @@ func TestAccessTokenRequired(t *testing.T) {
 		t.Errorf("token after a key rotation: %d, want 401", rec.Code)
 	}
 }
+
+// cache_dir of a worker came straight from the API: anyone with access
+// could make the panel create directories and write cache files anywhere
+// it may write.
+func TestCacheDirNotSettableThroughAPI(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w","config":{"cache_dir":"/tmp/elsewhere"}}`, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("POST with cache_dir: %d %s, want 400", rec.Code, rec.Body.String())
+	}
+	rec = do(t, s, "POST", "/api/workers", "application/json", `{"name":"w"}`, nil)
+	id := decodeView(t, rec).ID
+	if rec := do(t, s, "PATCH", "/api/workers/"+id, "application/json", `{"config":{"cache_dir":"/root/.ssh"}}`, nil); rec.Code != http.StatusBadRequest {
+		t.Errorf("PATCH cache_dir: %d %s, want 400", rec.Code, rec.Body.String())
+	}
+
+	// A worker that already has one (from an older version) can still be edited.
+	cfg := checker.DefaultConfig()
+	cfg.CacheDir = t.TempDir()
+	old, err := s.mgr.Create(context.Background(), "old", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, s, "PATCH", "/api/workers/"+old.ID(), "application/json", `{"name":"renamed"}`, nil); rec.Code != http.StatusOK {
+		t.Errorf("PATCH name of a worker with a cache_dir: %d %s, want 200", rec.Code, rec.Body.String())
+	}
+}

@@ -230,6 +230,8 @@ Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
 `read_limit` up to 1 MiB, `retry_delay_ns` up to 1 minute, `timeout_ns`,
 `rl_wait_max_ns` and `block_cooldown_ns` up to 10 minutes. 0 or a missing
 field means the default; a negative or too large value is answered with 400.
+`cache_dir` cannot be set through the API: the page cache directory is set
+for the whole panel with `-cache-dir`.
 
 ```bash
 TOKEN=$(./frgmnt token -data ./data -name script 2>/dev/null)
