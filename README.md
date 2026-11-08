@@ -157,13 +157,16 @@ answers with a Cloudflare challenge (see above).
 | `-log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 | `-cache-dir` / `-no-cache` | `<data>/pagecache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
+| `-allow-host` | | Host names the panel answers to besides `localhost`, comma-separated: the domain of a reverse proxy in front of it |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 | `-version` | | Print the version |
 
 The panel has no login. It refuses state-changing requests that a browser
 marks as coming from another site (`Origin`, `Sec-Fetch-Site`), and while it
 listens on a loopback address it only answers to a loopback `Host`
-(`127.0.0.1`, `localhost`, `::1`, any port, so `ssh -L` works). Bind it to
+(`127.0.0.1`, `localhost`, `::1`, any port, so `ssh -L` works) or to a name
+given with `-allow-host` (for a reverse proxy with a domain; its `Origin`
+is accepted too, also when the proxy sends its own `Host`). Bind it to
 another address only on a network you trust.
 
 ### REST API

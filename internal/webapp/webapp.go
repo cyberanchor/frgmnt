@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -52,6 +53,7 @@ func Main(args []string) int {
 		cacheSoldTTL = fs.Duration("cache-sold-ttl", 7*24*time.Hour, "TTL for sold/bought pages; negative = never expire")
 		noCache      = fs.Bool("no-cache", false, "disable the on-disk page cache")
 		baseURL      = fs.String("base-url", "", "Fragment base URL to check against (tests, mirrors); default https://fragment.com")
+		allowHosts   = fs.String("allow-host", "", "comma-separated host names the panel answers to besides localhost, e.g. the domain of a reverse proxy")
 		showVer      = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -105,11 +107,12 @@ func Main(args []string) int {
 		log.Fatalf("embed sub-fs: %v", err)
 	}
 	srv := server.New(server.Options{
-		Addr:     *addr,
-		Manager:  mgr,
-		Store:    st,
-		Bus:      bus,
-		StaticFS: staticSub,
+		Addr:       *addr,
+		AllowHosts: splitHosts(*allowHosts),
+		Manager:    mgr,
+		Store:      st,
+		Bus:        bus,
+		StaticFS:   staticSub,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,6 +139,22 @@ func Main(args []string) int {
 	}
 	bus.Publish(logbus.LevelInfo, "", "server stopped cleanly")
 	return 0
+}
+
+// splitHosts turns "-allow-host a.example, B.example:443" into
+// [a.example b.example]: names only, the port does not matter.
+func splitHosts(raw string) []string {
+	var out []string
+	for _, h := range strings.Split(raw, ",") {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if host, _, err := net.SplitHostPort(h); err == nil {
+			h = host
+		}
+		if h = strings.Trim(h, "[]"); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // mirrorBusToStdout subscribes to every bus event and prints it to stderr

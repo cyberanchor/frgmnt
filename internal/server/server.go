@@ -24,33 +24,38 @@ import (
 
 // Server is the assembled HTTP application.
 type Server struct {
-	addr     string
-	mgr      *worker.Manager
-	store    *store.Store
-	bus      *logbus.Bus
-	staticFS fs.FS
-	mux      *http.ServeMux
-	handler  http.Handler // mux behind guard()
+	addr       string
+	allowHosts []string // extra Host / Origin names (a domain in front of the panel)
+	mgr        *worker.Manager
+	store      *store.Store
+	bus        *logbus.Bus
+	staticFS   fs.FS
+	mux        *http.ServeMux
+	handler    http.Handler // mux behind guard()
 }
 
 // Options bundles dependencies needed to assemble a Server.
 type Options struct {
-	Addr     string
-	Manager  *worker.Manager
-	Store    *store.Store
-	Bus      *logbus.Bus
-	StaticFS fs.FS // already rooted at the static files (no "web/" prefix)
+	Addr string
+	// AllowHosts are host names (no port) the panel answers to besides the
+	// loopback names, e.g. the domain of a reverse proxy in front of it.
+	AllowHosts []string
+	Manager    *worker.Manager
+	Store      *store.Store
+	Bus        *logbus.Bus
+	StaticFS   fs.FS // already rooted at the static files (no "web/" prefix)
 }
 
 // New assembles a Server but does NOT start listening.
 func New(opt Options) *Server {
 	s := &Server{
-		addr:     opt.Addr,
-		mgr:      opt.Manager,
-		store:    opt.Store,
-		bus:      opt.Bus,
-		staticFS: opt.StaticFS,
-		mux:      http.NewServeMux(),
+		addr:       opt.Addr,
+		allowHosts: opt.AllowHosts,
+		mgr:        opt.Manager,
+		store:      opt.Store,
+		bus:        opt.Bus,
+		staticFS:   opt.StaticFS,
+		mux:        http.NewServeMux(),
 	}
 	s.routes()
 	s.handler = s.guard(s.mux)
@@ -72,11 +77,15 @@ func (s *Server) Handler() http.Handler { return s.handler }
 //   - When the panel listens on a loopback address, the Host header must
 //     be a loopback name as well. This stops DNS rebinding, where a hostile
 //     domain resolves to 127.0.0.1 and its pages become "same-origin".
+//   - Names in AllowHosts (-allow-host) pass both checks: behind a reverse
+//     proxy the browser's Host and Origin are the proxy's domain, which
+//     used to get a 403. With AllowHosts set, the Host check also applies
+//     to a panel listening on a public address.
 func (s *Server) guard(next http.Handler) http.Handler {
-	loopbackOnly := isLoopbackAddr(s.addr)
+	checkHost := isLoopbackAddr(s.addr) || len(s.allowHosts) > 0
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if loopbackOnly && !isLoopbackHost(r.Host) {
-			writeError(w, http.StatusForbidden, "host "+r.Host+" is not allowed")
+		if checkHost && !s.hostAllowed(r.Host) {
+			writeError(w, http.StatusForbidden, "host "+r.Host+" is not allowed (add it with -allow-host)")
 			return
 		}
 		switch r.Method {
@@ -86,13 +95,43 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				writeError(w, http.StatusForbidden, "cross-site request blocked")
 				return
 			}
-			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) && !s.originAllowed(origin) {
 				writeError(w, http.StatusForbidden, "cross-origin request blocked")
 				return
 			}
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// hostAllowed reports whether a Host header names the panel: a loopback
+// name or one of AllowHosts (any port).
+func (s *Server) hostAllowed(hostport string) bool {
+	if isLoopbackHost(hostport) {
+		return true
+	}
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.TrimSuffix(host, ".")
+	for _, h := range s.allowHosts {
+		if strings.EqualFold(h, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// originAllowed reports whether an Origin is one of AllowHosts. Behind a
+// proxy that sends its own Host (nginx does by default), Origin is the
+// only place where the panel's domain shows.
+func (s *Server) originAllowed(origin string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || isLoopbackHost(u.Host) {
+		return false
+	}
+	return s.hostAllowed(u.Host)
 }
 
 // isLoopbackAddr reports whether a listen address only accepts local

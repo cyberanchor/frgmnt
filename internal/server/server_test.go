@@ -116,6 +116,11 @@ func resultNames(t *testing.T, st *store.Store, id string) []string {
 }
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
+	return newTestServerWith(t, nil)
+}
+
+// newTestServerWith builds a test server; edit can change the Options.
+func newTestServerWith(t *testing.T, edit func(*Options)) (*Server, *store.Store) {
 	t.Helper()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -125,7 +130,11 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	mgr := worker.New(st, bus)
 	mgr.ConfigureCache("", 0, 0, true)
 	t.Cleanup(func() { mgr.CloseAll(); bus.Close(); _ = st.Close() })
-	return New(Options{Addr: "127.0.0.1:0", Manager: mgr, Store: st, Bus: bus}), st
+	opt := Options{Addr: "127.0.0.1:0", Manager: mgr, Store: st, Bus: bus}
+	if edit != nil {
+		edit(&opt)
+	}
+	return New(opt), st
 }
 
 // do sends one request to the server's handler. ctype "" sends no
@@ -510,5 +519,45 @@ func TestAPIRoughEdges(t *testing.T) {
 	}
 	if rec := do(t, s, "GET", "/", "", "", nil); rec.Code != http.StatusOK {
 		t.Errorf("GET /: %d", rec.Code)
+	}
+}
+
+// Behind a reverse proxy with a domain and a certificate the browser sends
+// Host and Origin of that domain, and the loopback-only Host check
+// answered every request with 403. -allow-host names the domain.
+func TestAllowHostForReverseProxy(t *testing.T) {
+	s, _ := newTestServerWith(t, func(o *Options) { o.AllowHosts = []string{"panel.example.com"} })
+	cases := []struct {
+		method string
+		hdr    map[string]string
+		want   int
+	}{
+		{"GET", map[string]string{"Host": "panel.example.com"}, http.StatusOK},
+		{"GET", map[string]string{"Host": "PANEL.example.com:443"}, http.StatusOK},
+		{"GET", map[string]string{"Host": "localhost:8080"}, http.StatusOK}, // ssh -L still works
+		{"GET", map[string]string{"Host": "evil.example"}, http.StatusForbidden},
+		// nginx by default passes its own upstream Host; only Origin shows the domain
+		{"POST", map[string]string{"Host": "127.0.0.1:8080", "Origin": "https://panel.example.com"}, http.StatusCreated},
+		{"POST", map[string]string{"Host": "panel.example.com", "Origin": "https://panel.example.com"}, http.StatusCreated},
+		{"POST", map[string]string{"Host": "panel.example.com", "Origin": "https://evil.example"}, http.StatusForbidden},
+		{"POST", map[string]string{"Host": "127.0.0.1:8080", "Origin": "https://evil.example"}, http.StatusForbidden},
+	}
+	for _, c := range cases {
+		path, body, ctype := "/api/workers", "", ""
+		if c.method == "POST" {
+			body, ctype = `{"name":"w"}`, "application/json"
+		}
+		if rec := do(t, s, c.method, path, ctype, body, c.hdr); rec.Code != c.want {
+			t.Errorf("%s with %v -> %d %s, want %d", c.method, c.hdr, rec.Code, rec.Body.String(), c.want)
+		}
+	}
+
+	// On a public listener the list applies as well: an IP Host is refused.
+	pub, _ := newTestServerWith(t, func(o *Options) { o.Addr = "0.0.0.0:443"; o.AllowHosts = []string{"panel.example.com"} })
+	if rec := do(t, pub, "GET", "/api/workers", "", "", map[string]string{"Host": "203.0.113.5"}); rec.Code != http.StatusForbidden {
+		t.Errorf("public listener, Host 203.0.113.5 -> %d, want 403", rec.Code)
+	}
+	if rec := do(t, pub, "GET", "/api/workers", "", "", map[string]string{"Host": "panel.example.com"}); rec.Code != http.StatusOK {
+		t.Errorf("public listener, Host panel.example.com -> %d, want 200", rec.Code)
 	}
 }
