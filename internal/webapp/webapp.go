@@ -21,9 +21,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/server"
 	"github.com/cyberanchor/frgmnt/internal/staticfs"
@@ -49,6 +51,7 @@ func Main(args []string) int {
 		cacheTTL     = fs.Duration("cache-ttl", 2*time.Minute, "TTL for volatile pages (auction/available)")
 		cacheSoldTTL = fs.Duration("cache-sold-ttl", 7*24*time.Hour, "TTL for sold/bought pages; negative = never expire")
 		noCache      = fs.Bool("no-cache", false, "disable the on-disk page cache")
+		baseURL      = fs.String("base-url", "", "Fragment base URL to check against (tests, mirrors); default https://fragment.com")
 		showVer      = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -63,6 +66,11 @@ func Main(args []string) int {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	if *baseURL != "" {
+		// Same as the console's -base-url: the web mode could not be
+		// pointed at a test server or mirror without a code change.
+		checker.FragmentURLTemplate = strings.TrimRight(*baseURL, "/") + "/username/%s"
+	}
 
 	absData, err := filepath.Abs(*dataDir)
 	if err != nil {
@@ -120,6 +128,9 @@ func Main(args []string) int {
 	}()
 
 	bus.Publish(logbus.LevelInfo, "", ProgName+" v"+Version+" | data="+absData+" | log="+bus.Level().String())
+	if *baseURL != "" {
+		bus.Publish(logbus.LevelWarn, "", "checking against "+*baseURL+" instead of fragment.com (-base-url)")
+	}
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

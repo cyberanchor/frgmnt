@@ -31,6 +31,7 @@ go test ./...
 | `redirect_test.go` | `302 /?query=` → free; bare `302 /` retried with a cookie session; persistent redirect + blocked probe → **error, not reserved**; healthy probe → `reserved`. |
 | `cache_test.go` | Cache hit avoids a second request; cache disabled; volatile TTL expiry; sold entry served as an explicit stale fallback when the network dies. |
 | `cli_test.go` | End-to-end `cli.Main` run: flags, worker pool, parser and output file against a fake Fragment. |
+| `web_test.go` | End-to-end `webapp.Main` run with `-base-url`: create a worker, load names, start, wait for done, check the tile counters and the download over HTTP, stop with SIGINT, find the results in the data directory. |
 | `testdata/*.html` | Minimal real-world fixtures. Add a new fixture when Fragment introduces a layout. |
 
 ## Why some tests stay in `internal/`

@@ -156,6 +156,7 @@ answers with a Cloudflare challenge (see above).
 | `-log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 | `-cache-dir` / `-no-cache` | `<data>/pagecache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
+| `-base-url` | | Another Fragment base URL (tests, mirrors) |
 | `-version` | | Print the version |
 
 The panel has no login. It refuses state-changing requests that a browser
