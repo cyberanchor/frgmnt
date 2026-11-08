@@ -420,3 +420,40 @@ func TestImpossibleNamesAreNotReportedFree(t *testing.T) {
 		t.Errorf("kyqb (a real 4-character collectible): %q, want free", got["kyqb"])
 	}
 }
+
+// "-input -" on a pipe that stays open without data: Ctrl+C printed
+// "shutting down gracefully" and Main never returned, because it waited
+// for the producer, which sat in a read of stdin. A second Ctrl+C was
+// swallowed too, so only kill -9 ended it.
+func TestSIGINTWithIdleStdinReturns(t *testing.T) {
+	srv := newHitServer(t, freeHandler)
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close() // open and idle until the end of the test
+	if _, err := w.WriteString("alice\nbobby\n"); err != nil {
+		t.Fatal(err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	out := filepath.Join(t.TempDir(), "results.txt")
+	done := make(chan int, 1)
+	go func() {
+		done <- Main([]string{"-input", "-", "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "2"})
+	}()
+	time.Sleep(500 * time.Millisecond) // both names are checked; the read of stdin blocks
+	_ = syscall.Kill(os.Getpid(), syscall.SIGINT)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Main did not return within 5 s after Ctrl+C with an idle stdin")
+	}
+	raw, _ := os.ReadFile(out)
+	if got := strings.Count(string(raw), "| free"); got != 2 {
+		t.Errorf("results file after Ctrl+C: %q, want the 2 names checked before it", raw)
+	}
+}

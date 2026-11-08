@@ -696,7 +696,10 @@ func Main(args []string) int {
 	go func() {
 		select {
 		case sig := <-sigCh:
-			log.Printf("[INFO] received signal %s, shutting down gracefully…", sig)
+			// A second Ctrl+C quits at once (default signal handling); it
+			// used to be swallowed, so a stuck shutdown could not be ended.
+			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
+			log.Printf("[INFO] received signal %s, shutting down gracefully… (press Ctrl+C again to quit at once)", sig)
 			cancel()
 		case <-ctx.Done():
 		}
@@ -743,8 +746,16 @@ func Main(args []string) int {
 	}
 
 	// --- Wait for producer ---
-	if err := <-producerDone; err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("[WARN] producer error: %v", err)
+	// After Ctrl+C (or a block) nothing the producer reads would be checked,
+	// so do not wait for it: with -input - on an open pipe or terminal it
+	// sits in a read of stdin that only new input or EOF ends, and Main
+	// used to hang there after "shutting down gracefully".
+	select {
+	case err := <-producerDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("[WARN] producer error: %v", err)
+		}
+	case <-ctx.Done():
 	}
 
 	// --- Stop progress reporter ---
