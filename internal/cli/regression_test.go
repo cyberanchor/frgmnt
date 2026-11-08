@@ -210,3 +210,36 @@ func TestExitCodeOnOutputWriteFailure(t *testing.T) {
 		t.Error("results could not be written (ENOSPC) but the exit code is 0")
 	}
 }
+
+// With the network down, the console engine served any stale cache entry
+// (a days-old auction came back as "auction") and wrote it like a fresh
+// result, with nothing in the line saying it came from the cache.
+func TestStaleCacheOnlyForSoldAndTaken(t *testing.T) {
+	cache := newPageCache(t.TempDir(), time.Nanosecond, time.Nanosecond) // everything is stale at once
+	auction := []byte(cliPage("On auction", "avail", `<button class="js-place-bid-btn">Place bid</button>`))
+	sold := []byte(cliPage("Sold", "unavail", `<div>Purchased on 19 Nov 2022</div>`))
+	for name, body := range map[string][]byte{"oldauction": auction, "oldsold": sold} {
+		st, _, found, conf, ev := parseStatusInfo(body)
+		if !found {
+			t.Fatalf("fixture for %s did not parse", name)
+		}
+		cache.put(name, "https://fragment.com/username/"+name, st, conf, ev, body)
+	}
+	time.Sleep(time.Millisecond)
+
+	srv := httptest.NewServer(http.NotFoundHandler())
+	srv.Close() // network down
+	old := fragmentURLTemplate
+	fragmentURLTemplate = srv.URL + "/username/%s"
+	defer func() { fragmentURLTemplate = old }()
+	client := newHTTPClient(httpConfig{maxConns: 1, timeout: time.Second})
+	cfg := checkConfig{retries: 0, retryDelay: time.Millisecond, cache: cache}
+
+	if r := checkOne(context.Background(), "oldauction", client, newStats(), cfg); r.Status != StatusError {
+		t.Errorf("stale auction with the network down = %+v, want an error", r)
+	}
+	r := checkOne(context.Background(), "oldsold", client, newStats(), cfg)
+	if r.Status != StatusSold || !strings.Contains(r.Error, "stale cache") {
+		t.Errorf("stale sold with the network down = %+v, want sold marked as stale cache", r)
+	}
+}

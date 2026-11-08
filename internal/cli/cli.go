@@ -1003,7 +1003,11 @@ func checkOne(ctx context.Context, raw string, client *http.Client, stats *Stats
 			}
 			atomic.AddInt64(&stats.cacheStale, 1)
 			debugf("cache stale: %s -> %s; re-checking", name, st)
-			stale = &Result{name, st, ""}
+			// Same rule as the web mode: only a settled verdict is served
+			// if the network fails; an old auction or sale is likely over.
+			if st == StatusSold || st == StatusTaken {
+				stale = &Result{name, st, ""}
+			}
 		} else {
 			atomic.AddInt64(&stats.cacheMisses, 1)
 		}
@@ -1043,7 +1047,9 @@ func checkOne(ctx context.Context, raw string, client *http.Client, stats *Stats
 	}
 	if stale != nil {
 		debugf("network failed (%s); serving stale cache for %s", lastErr, name)
-		return *stale
+		res := *stale
+		res.Error = "network failed (" + lastErr + "); served stale cache"
+		return res
 	}
 	return Result{name, StatusError, "retries exhausted: " + lastErr}
 }
