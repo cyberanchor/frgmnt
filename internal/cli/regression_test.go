@@ -286,3 +286,30 @@ func TestFilterTypoKeepsOutputFile(t *testing.T) {
 		t.Errorf("results file after the failed run: %q, want it unchanged", got)
 	}
 }
+
+// -input and -output pointing at one file: opening the output truncated
+// the list before the first name was read, so the run checked 0 names,
+// exited with 0 and left an empty file.
+func TestSameInputAndOutputRefused(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	const list = "alice\nbobby\n"
+	if err := os.WriteFile(in, []byte(list), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(in, link); err != nil {
+		t.Fatal(err)
+	}
+	for _, out := range []string{in, filepath.Join(dir, ".", "names.txt"), link} {
+		for _, extra := range [][]string{nil, {"-resume"}, {"-append"}} {
+			args := append([]string{"-input", in, "-output", out, "-no-cache", "-base-url", "http://127.0.0.1:1"}, extra...)
+			if code := Main(args); code == 0 {
+				t.Errorf("-output %s %v: exit code 0, want an error", out, extra)
+			}
+			if got, _ := os.ReadFile(in); string(got) != list {
+				t.Fatalf("-output %s %v: the input list became %q", out, extra, got)
+			}
+		}
+	}
+}

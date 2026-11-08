@@ -1772,8 +1772,10 @@ func Main(args []string) int {
 
 	// --- Open input ---
 	var inReader io.Reader
+	var inInfo os.FileInfo
 	if *inputPath == "-" {
 		inReader = os.Stdin
+		inInfo, _ = os.Stdin.Stat()
 	} else {
 		f, err := os.Open(*inputPath)
 		if err != nil {
@@ -1781,6 +1783,16 @@ func Main(args []string) int {
 		}
 		defer f.Close()
 		inReader = f
+		inInfo, _ = f.Stat()
+	}
+	// Opening the output truncates it. When it is the input file (also via
+	// another path, a symlink or "-input - < file"), the list was gone before
+	// the first name was read: 0 names checked, exit code 0.
+	if inInfo != nil && inInfo.Mode().IsRegular() {
+		if outInfo, err := os.Stat(*outputPath); err == nil && os.SameFile(inInfo, outInfo) {
+			log.Printf("[ERROR] -input and -output are the same file (%s); write the results to another file", *outputPath)
+			return 2
+		}
 	}
 
 	// --- Resume set ---
