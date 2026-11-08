@@ -808,28 +808,60 @@ func ParseNames(blob string) (names []string, rejected int) {
 	return names, rejected
 }
 
-// ParseNamesReader streams names from r. Same semantics as ParseNames but
-// the input is consumed line by line so very large files use O(unique)
-// memory rather than O(total).
+// maxNameToken caps how much of one separator-free token ParseNamesReader
+// keeps; anything longer cannot be a valid name and is counted as rejected.
+const maxNameToken = 4096
+
+// ParseNamesReader streams names from r with the same rules as ParseNames.
+// It splits on the separators byte by byte instead of reading lines, so a
+// comma-separated export on a single multi-megabyte line works like one
+// name per line (the old line scanner failed on lines over 1 MiB), and
+// memory stays O(unique names) rather than O(file size).
 func ParseNamesReader(r io.Reader) (names []string, rejected int, err error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	br := bufio.NewReaderSize(r, 64*1024)
 	seen := make(map[string]struct{}, 256)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Each line can still contain multiple names separated by
-		// commas/spaces (paste-friendly).
-		batch, rej := ParseNames(line)
-		rejected += rej
-		for _, n := range batch {
-			if _, ok := seen[n]; ok {
-				continue
+	tok := make([]byte, 0, 64)
+	tooLong := false
+	emit := func() {
+		defer func() { tok, tooLong = tok[:0], false }()
+		if tooLong {
+			rejected++
+			return
+		}
+		name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(string(tok), "@")))
+		if name == "" {
+			return
+		}
+		if ValidateUsername(name) != nil {
+			rejected++
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	for {
+		b, rerr := br.ReadByte()
+		if rerr != nil {
+			emit()
+			if rerr == io.EOF {
+				return names, rejected, nil
 			}
-			seen[n] = struct{}{}
-			names = append(names, n)
+			return names, rejected, rerr
+		}
+		switch b {
+		case '\n', '\r', ' ', '\t', ',', ';': // the separators of ParseNames
+			emit()
+		default:
+			if len(tok) < maxNameToken {
+				tok = append(tok, b)
+			} else {
+				tooLong = true
+			}
 		}
 	}
-	return names, rejected, scanner.Err()
 }
 
 // probeHealthy requests a random username that should resolve to free/taken.

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -150,4 +152,46 @@ func TestStaleAuctionNotUsedAsFallback(t *testing.T) {
 	if r.Status != StatusError || r.Stale {
 		t.Errorf("3-day-old auction served as %q (stale=%v, err=%q), want an error", r.Status, r.Stale, r.Error)
 	}
+}
+
+// The textarea path (ParseNames) accepts any separator layout, but the file
+// upload path (ParseNamesReader) read lines with a 1 MiB limit: a
+// comma-separated export on one line gave 0 names and "token too long".
+func TestParseNamesReaderLongSingleLine(t *testing.T) {
+	parts := make([]string, 150000)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("user%06d", i)
+	}
+	blob := strings.Join(parts, ",") // ~1.6 MB, one line
+	a, _ := ParseNames(blob)
+	b, _, err := ParseNamesReader(strings.NewReader(blob))
+	if err != nil || len(b) != len(a) || len(a) != len(parts) {
+		t.Errorf("ParseNames found %d names; ParseNamesReader found %d, err=%v", len(a), len(b), err)
+	}
+}
+
+// ParseNamesReader must give exactly what ParseNames gives.
+func FuzzParseNamesReaderMatchesParseNames(f *testing.F) {
+	for _, seed := range []string{
+		"alice\nbob\r\ncarol", "@Alice, @alice;BOB\tdan", "  ", "a\vb c\u00a0d",
+		"bad-name ok_name x", strings.Repeat("a", 5000) + " b", "ab\xffcd ef", "@@x @ y",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, blob string) {
+		a, ra := ParseNames(blob)
+		b, rb, err := ParseNamesReader(strings.NewReader(blob))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(a) == 0 {
+			a = nil
+		}
+		if len(b) == 0 {
+			b = nil
+		}
+		if !reflect.DeepEqual(a, b) || ra != rb {
+			t.Errorf("ParseNames %q -> %v (rejected %d), ParseNamesReader -> %v (rejected %d)", blob, a, ra, b, rb)
+		}
+	})
 }
