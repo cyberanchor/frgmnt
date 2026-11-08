@@ -241,10 +241,22 @@ function buildTile(w) {
     return el;
 }
 
+// resultCount returns how many results the worker has stored.
+async function resultCount(id) {
+    const data = await api("GET", `/api/workers/${id}/results?limit=1`);
+    return Object.values((data && data.counts) || {}).reduce((a, b) => a + b, 0);
+}
+
 function wireTileActions(el) {
     const id = el.dataset.id;
     el.querySelector(".act-start").addEventListener("click", async () => {
         try {
+            // A fresh run deletes the worker's results first; Start sits next
+            // to Resume, so ask before a click wipes them.
+            const n = await resultCount(id);
+            const name = state.workers.get(id)?.name || id;
+            if (n > 0 && !confirm(`Start "${name}" from scratch?\n\nThis deletes its ${n} results. ` +
+                "Press Cancel and use Resume to continue instead.")) return;
             await api("POST", `/api/workers/${id}/start`);
             toast("Worker started (fresh run)", "ok");
         } catch (e) { toast(e.message, "error"); }
