@@ -169,7 +169,7 @@ another address only on a network you trust.
 | Method | Path | Description |
 | ------ | ---- | ----------- |
 | GET | `/api/health` | Liveness, worker count, log level |
-| GET / PUT | `/api/settings` | Global settings |
+| GET / PUT | `/api/settings` | Global settings; PUT changes only the fields it sends, out-of-range values get 400 |
 | GET / POST | `/api/workers` | List / create workers (`{"name": ..., "config": {...}}`) |
 | GET / PATCH / DELETE | `/api/workers/{id}` | One worker; PATCH changes only the fields it sends |
 | POST | `/api/workers/{id}/input` | Load names from `{"text": "..."}` |

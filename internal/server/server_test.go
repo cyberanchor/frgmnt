@@ -380,3 +380,53 @@ func TestBulkStartContinuesAndKeepsResults(t *testing.T) {
 		t.Errorf("fresh worker: %d results, want 5", len(got))
 	}
 }
+
+// PUT /api/settings decoded the body onto zero values: {"theme":"light"}
+// also set default_retries, default_rate_rps, default_workers and the rest
+// to 0 (or "").
+func TestSettingsPartialUpdateKeepsOtherFields(t *testing.T) {
+	s, st := newTestServer(t)
+	before := st.GetSettings()
+	rec := do(t, s, "PUT", "/api/settings", "application/json", `{"theme":"light"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT theme: %d %s", rec.Code, rec.Body.String())
+	}
+	after := st.GetSettings()
+	want := before
+	want.Theme = "light"
+	if after != want {
+		t.Errorf("after PUT {theme: light}:\n got  %+v\n want %+v", after, want)
+	}
+}
+
+// Settings were not validated: default_rate_rps -5 was saved, and from
+// then on every POST /api/workers failed with 400.
+func TestSettingsRejectsOutOfRange(t *testing.T) {
+	s, st := newTestServer(t)
+	before := st.GetSettings()
+	for _, body := range []string{
+		`{"default_rate_rps":-5}`, `{"default_retries":11}`, `{"default_workers":0}`,
+		`{"default_workers":100000}`, `{"default_timeout_s":0}`, `{"theme":"blue"}`,
+		`{"log_level":"loud"}`, `{"history_limit_max":-1}`,
+	} {
+		if rec := do(t, s, "PUT", "/api/settings", "application/json", body, nil); rec.Code != http.StatusBadRequest {
+			t.Errorf("PUT %s -> %d %s, want 400", body, rec.Code, rec.Body.String())
+		}
+	}
+	if got := st.GetSettings(); got != before {
+		t.Errorf("rejected PUTs changed the settings: %+v", got)
+	}
+	if rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w"}`, nil); rec.Code != http.StatusCreated {
+		t.Errorf("POST /api/workers after the rejected PUTs: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// A bad value written into settings.json by hand must not block new workers.
+	bad := before
+	bad.DefaultRateRPS = -5
+	if err := st.PutSettings(bad); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w2"}`, nil); rec.Code != http.StatusCreated {
+		t.Errorf("POST /api/workers with default_rate_rps -5 in settings.json: %d %s", rec.Code, rec.Body.String())
+	}
+}

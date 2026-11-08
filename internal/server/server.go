@@ -253,8 +253,15 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.GetSettings())
 	case http.MethodPut:
-		var v store.Settings
+		// Decode onto the current settings: a PUT with some fields changes
+		// only those. It used to decode onto zero values, so {"theme":
+		// "light"} also set default_retries, default_rate_rps, ... to 0.
+		v := s.store.GetSettings()
 		if err := readJSON(r, &v); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := validateSettings(v); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -269,6 +276,38 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	default:
 		methodNotAllowed(w, "GET, PUT")
 	}
+}
+
+// validateSettings rejects values a new worker could not use. Without it,
+// default_rate_rps -5 was saved, and every later POST /api/workers failed
+// with 400 because the defaults it starts from were out of range.
+func validateSettings(v store.Settings) error {
+	check := func(name string, val, lo, hi int) error {
+		if val < lo || val > hi {
+			return fmt.Errorf("%s must be between %d and %d, got %d", name, lo, hi, val)
+		}
+		return nil
+	}
+	if v.Theme != "light" && v.Theme != "dark" {
+		return fmt.Errorf(`theme must be "light" or "dark", got %q`, v.Theme)
+	}
+	switch v.LogLevel {
+	case "error", "warn", "info", "debug", "trace":
+	default:
+		return fmt.Errorf("log_level must be error, warn, info, debug or trace, got %q", v.LogLevel)
+	}
+	for _, err := range []error{
+		check("default_workers", v.DefaultWorkers, 1, checker.MaxWorkers),
+		check("default_rate_rps", v.DefaultRateRPS, 0, checker.MaxRateRPS),
+		check("default_retries", v.DefaultRetries, 0, checker.MaxRetries),
+		check("default_timeout_s", v.DefaultTimeout, 1, 600),
+		check("history_limit_max", v.HistoryLimitMax, 1, 100000),
+	} {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -342,13 +381,18 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// defaultConfigFromSettings returns the config a new worker starts from.
+// Values out of range (settings.json can be edited by hand) are ignored,
+// so they cannot make every worker creation fail.
 func defaultConfigFromSettings(s store.Settings) checker.Config {
 	def := checker.DefaultConfig()
-	if s.DefaultWorkers > 0 {
+	if s.DefaultWorkers > 0 && s.DefaultWorkers <= checker.MaxWorkers {
 		def.Workers = s.DefaultWorkers
 	}
-	def.RateRPS = s.DefaultRateRPS
-	if s.DefaultRetries >= 0 {
+	if s.DefaultRateRPS >= 0 && s.DefaultRateRPS <= checker.MaxRateRPS {
+		def.RateRPS = s.DefaultRateRPS
+	}
+	if s.DefaultRetries >= 0 && s.DefaultRetries <= checker.MaxRetries {
 		def.Retries = s.DefaultRetries
 	}
 	if s.DefaultTimeout > 0 {
