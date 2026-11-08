@@ -111,7 +111,12 @@ $("#theme-toggle").addEventListener("click", () => {
     applyTheme(cur === "dark" ? "light" : "dark", "user");
 });
 
-applyTheme(localStorage.getItem("fc.theme") || "dark", "user");
+// A theme saved in this browser wins. Without one the page starts dark and
+// loadSettings() applies the theme from settings.json. Boot used to store
+// "dark" in localStorage right away, so the server theme never applied.
+let savedTheme = null;
+try { savedTheme = localStorage.getItem("fc.theme"); } catch {}
+applyTheme(savedTheme || "dark", savedTheme ? "user" : "server");
 
 /* -------------------------------------------------------------------------- */
 /*  Tabs                                                                      */
