@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
+    <title>fragment_checker · access</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%237c5cff'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='18' font-weight='bold' text-anchor='middle' fill='white'%3Ef%3C/text%3E%3C/svg%3E" />
+    <!-- Self-contained on purpose: /static/ is only served after login. -->
+    <style>
+        :root {
+            --bg: #0b0e14; --bg-elev: #131720; --bg-input: #0f131c; --border: #232a37;
+            --text: #e5e9f0; --text-muted: #8a93a3; --primary: #7c5cff; --primary-strong: #6d4fe7;
+            --danger: #ef4444;
+            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+        }
+        @media (prefers-color-scheme: light) {
+            :root { --bg: #f6f7fb; --bg-elev: #ffffff; --bg-input: #ffffff; --border: #e3e6ee;
+                    --text: #1d2330; --text-muted: #5b6475; }
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            padding: 16px; background: var(--bg); color: var(--text); font-family: var(--font-sans);
+        }
+        main {
+            width: 100%; max-width: 420px; background: var(--bg-elev); border: 1px solid var(--border);
+            border-radius: 12px; padding: 28px 24px;
+        }
+        .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+        .logo {
+            width: 30px; height: 30px; border-radius: 7px; background: var(--primary); color: #fff;
+            display: flex; align-items: center; justify-content: center; font-family: var(--font-mono);
+            font-weight: 700;
+        }
+        h1 { font-size: 17px; margin: 0; }
+        p { color: var(--text-muted); font-size: 14px; line-height: 1.5; margin: 0 0 16px; }
+        label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 6px; }
+        input {
+            width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+            background: var(--bg-input); color: var(--text); font-family: var(--font-mono); font-size: 13px;
+        }
+        input:focus { outline: 2px solid var(--primary); outline-offset: 1px; }
+        button {
+            width: 100%; margin-top: 14px; padding: 10px 12px; border: 0; border-radius: 8px;
+            background: var(--primary); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+        }
+        button:hover { background: var(--primary-strong); }
+        .error {
+            color: var(--danger); border: 1px solid var(--danger); border-radius: 8px;
+            padding: 8px 10px; font-size: 13px; margin-bottom: 14px;
+        }
+        code { font-family: var(--font-mono); font-size: 12px; }
+    </style>
+</head>
+<body>
+    <main>
+        <div class="brand"><span class="logo">f</span><h1>fragment_checker</h1></div>
+        <p>This panel needs an access token. Create one on the server with
+            <code>frgmnt token -data &lt;data dir&gt;</code> and paste it here.</p>
+        <!--error-->
+        <form method="post" action="/login" autocomplete="off">
+            <label for="token">Access token</label>
+            <input type="password" id="token" name="token" required autofocus spellcheck="false" />
+            <button type="submit">Enter</button>
+        </form>
+    </main>
+</body>
+</html>

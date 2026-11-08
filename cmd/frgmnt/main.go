@@ -37,6 +37,9 @@ func run(args []string) int {
 	case "check", "cli":
 		cli.ProgName = "frgmnt check"
 		return cli.Main(args[1:])
+	case "token":
+		webapp.ProgName = "frgmnt"
+		return webapp.TokenMain(args[1:])
 	case "version", "-version", "--version":
 		fmt.Printf("frgmnt %s (cli %s, web %s)\n", version, cli.Version, webapp.Version)
 		return 0
@@ -77,6 +80,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  frgmnt check [flags]   Console checker: names.txt -> results.txt")
 	fmt.Fprintln(w, "  frgmnt web   [flags]   Web panel: REST + SSE + embedded UI")
+	fmt.Fprintln(w, "  frgmnt token [flags]   Issue an access token for the web panel")
 	fmt.Fprintln(w, "  frgmnt -input ...      Legacy shorthand for \"check\"")
 	fmt.Fprintln(w, "  frgmnt -addr ...       Shorthand for \"web\" (auto-detected)")
 	fmt.Fprintln(w, "  frgmnt version         Print binary and component versions")
@@ -85,6 +89,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  frgmnt check -input names.txt -output results.txt -workers 200")
 	fmt.Fprintln(w, "  frgmnt web -addr 127.0.0.1:8080 -data ./data")
+	fmt.Fprintln(w, "  frgmnt token -data ./data -ttl 720h -name laptop")
 	fmt.Fprintln(w, "  frgmnt web -no-cache")
 	fmt.Fprintln(w, "  frgmnt -input names.txt -output results.txt")
 	fmt.Fprintln(w)

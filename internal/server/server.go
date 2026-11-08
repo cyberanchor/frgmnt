@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cyberanchor/frgmnt/internal/auth"
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
@@ -30,8 +32,9 @@ type Server struct {
 	store      *store.Store
 	bus        *logbus.Bus
 	staticFS   fs.FS
+	keeper     *auth.Keeper // nil: no access tokens (tests)
 	mux        *http.ServeMux
-	handler    http.Handler // mux behind guard()
+	handler    http.Handler // mux behind guard() and requireToken()
 }
 
 // Options bundles dependencies needed to assemble a Server.
@@ -44,6 +47,10 @@ type Options struct {
 	Store      *store.Store
 	Bus        *logbus.Bus
 	StaticFS   fs.FS // already rooted at the static files (no "web/" prefix)
+	// Auth, when set, requires an access token (a JWT signed with its key)
+	// for every request except the login page. The web mode always sets
+	// it; nil leaves the panel open (tests).
+	Auth *auth.Keeper
 }
 
 // New assembles a Server but does NOT start listening.
@@ -55,11 +62,146 @@ func New(opt Options) *Server {
 		store:      opt.Store,
 		bus:        opt.Bus,
 		staticFS:   opt.StaticFS,
+		keeper:     opt.Auth,
 		mux:        http.NewServeMux(),
 	}
 	s.routes()
-	s.handler = s.guard(s.mux)
+	s.handler = s.guard(s.requireToken(s.mux))
 	return s
+}
+
+// -----------------------------------------------------------------------------
+// Access tokens
+// -----------------------------------------------------------------------------
+
+// cookieName holds the token after a login in the browser.
+const cookieName = "frgmnt_token"
+
+// requireToken lets a request through only with a valid access token, from
+// "Authorization: Bearer <token>" (scripts, curl) or from the cookie the
+// login page sets (the panel, its EventSource streams and downloads).
+// Without one the API answers 401 and the UI redirects to /login. The
+// panel had no login at all: anyone who could reach it could use it.
+func (s *Server) requireToken(next http.Handler) http.Handler {
+	if s.keeper == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/login":
+			s.handleLogin(w, r)
+			return
+		case "/logout":
+			s.handleLogout(w, r)
+			return
+		}
+		if tok := tokenFrom(r); tok != "" {
+			if _, err := s.keeper.Verify(tok); err == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="frgmnt"`)
+			writeError(w, http.StatusUnauthorized, "access token required: log in at /login or send Authorization: Bearer <token>")
+			return
+		}
+		http.Redirect(w, r, "/login", http.StatusSeeOther)
+	})
+}
+
+func tokenFrom(r *http.Request) string {
+	if h := r.Header.Get("Authorization"); len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	if c, err := r.Cookie(cookieName); err == nil {
+		return c.Value
+	}
+	return ""
+}
+
+// secureRequest reports whether the browser talks HTTPS to the panel,
+// directly or through a TLS reverse proxy.
+func secureRequest(r *http.Request) bool {
+	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+}
+
+// clientAddr is the peer address for log lines, with X-Forwarded-For when a
+// proxy sets it.
+func clientAddr(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return r.RemoteAddr + " (X-Forwarded-For " + xff + ")"
+	}
+	return r.RemoteAddr
+}
+
+// minimalLogin is used when the static files have no login.html (tests).
+const minimalLogin = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>access</title></head><body>
+<!--error--><form method="post" action="/login"><input type="password" name="token" required>
+<button type="submit">Enter</button></form></body></html>`
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		if tok := tokenFrom(r); tok != "" {
+			if _, err := s.keeper.Verify(tok); err == nil {
+				http.Redirect(w, r, "/", http.StatusSeeOther)
+				return
+			}
+		}
+		page := []byte(minimalLogin)
+		if s.staticFS != nil {
+			if data, err := fs.ReadFile(s.staticFS, "login.html"); err == nil {
+				page = data
+			}
+		}
+		if r.URL.Query().Get("failed") != "" {
+			page = bytes.Replace(page, []byte("<!--error-->"), []byte(`<div class="error">That token is not valid: `+
+				`it is mistyped, expired, or its key was rotated.</div>`), 1)
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
+		_, _ = w.Write(page)
+	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+		tok := ""
+		if err := r.ParseForm(); err == nil {
+			tok = strings.TrimSpace(r.PostForm.Get("token"))
+		}
+		c, err := s.keeper.Verify(tok)
+		if err != nil {
+			s.bus.Publish(logbus.LevelWarn, "", "login refused ("+err.Error()+") from "+clientAddr(r))
+			http.Redirect(w, r, "/login?failed=1", http.StatusSeeOther)
+			return
+		}
+		ck := &http.Cookie{Name: cookieName, Value: tok, Path: "/", HttpOnly: true,
+			SameSite: http.SameSiteLaxMode, Secure: secureRequest(r)}
+		if exp := c.ExpiresAt(); !exp.IsZero() {
+			ck.Expires = exp
+		} else {
+			ck.MaxAge = 365 * 24 * 3600
+		}
+		http.SetCookie(w, ck)
+		name := c.Name
+		if name == "" {
+			name = c.ID
+		}
+		s.bus.Publish(logbus.LevelInfo, "", "login with token "+strconv.Quote(name)+" from "+clientAddr(r))
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
+		SameSite: http.SameSiteLaxMode, Secure: secureRequest(r)})
+	http.Redirect(w, r, "/login", http.StatusSeeOther)
 }
 
 // Handler returns the underlying http.Handler (useful for tests).

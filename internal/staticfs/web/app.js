@@ -50,6 +50,11 @@ async function api(method, url, body) {
         }
     }
     const res = await fetch(url, opts);
+    if (res.status === 401) {
+        // No valid access token (expired, or the key was rotated): log in again.
+        location.href = "/login";
+        throw new Error("access token required");
+    }
     const text = await res.text();
     let data = null;
     try { data = text ? JSON.parse(text) : null; } catch { data = text; }
@@ -116,6 +121,11 @@ function applyTheme(theme, source = "user") {
     document.documentElement.dataset.theme = t;
     if (source === "user") storageSet("fc.theme", t);
 }
+
+$("#logout").addEventListener("click", async () => {
+    try { await fetch("/logout", { method: "POST" }); } catch {}
+    location.href = "/login";
+});
 
 $("#theme-toggle").addEventListener("click", () => {
     const cur = document.documentElement.dataset.theme;

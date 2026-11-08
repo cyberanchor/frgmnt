@@ -13,6 +13,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/cyberanchor/frgmnt/internal/auth"
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
@@ -559,5 +560,87 @@ func TestAllowHostForReverseProxy(t *testing.T) {
 	}
 	if rec := do(t, pub, "GET", "/api/workers", "", "", map[string]string{"Host": "panel.example.com"}); rec.Code != http.StatusOK {
 		t.Errorf("public listener, Host panel.example.com -> %d, want 200", rec.Code)
+	}
+}
+
+// The panel had no login: anyone who could reach it (through ssh -L or a
+// domain) could create, start and delete workers and read every result.
+// Now every request needs an access token, except the login page.
+func TestAccessTokenRequired(t *testing.T) {
+	keeper, _, err := auth.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	static := fstest.MapFS{"index.html": {Data: []byte("<html>panel</html>")}, "app.js": {Data: []byte("1")}}
+	s, _ := newTestServerWith(t, func(o *Options) { o.Auth = keeper; o.StaticFS = static })
+	good, _, _ := keeper.Issue("laptop", time.Hour)
+	bearer := func(tok string) map[string]string { return map[string]string{"Authorization": "Bearer " + tok} }
+
+	rec := do(t, s, "GET", "/api/workers", "", "", nil)
+	if rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") == "" {
+		t.Errorf("API without a token: %d, WWW-Authenticate %q; want 401 with the header", rec.Code, rec.Header().Get("WWW-Authenticate"))
+	}
+	for _, path := range []string{"/", "/static/app.js"} {
+		if rec := do(t, s, "GET", path, "", "", nil); rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+			t.Errorf("GET %s without a token: %d -> %q, want a redirect to /login", path, rec.Code, rec.Header().Get("Location"))
+		}
+	}
+	if rec := do(t, s, "GET", "/login", "", "", nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `name="token"`) {
+		t.Errorf("GET /login: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, s, "GET", "/api/workers", "", "", bearer(good)); rec.Code != http.StatusOK {
+		t.Errorf("Bearer with a valid token: %d", rec.Code)
+	}
+	if rec := do(t, s, "GET", "/api/workers", "", "", bearer(good+"x")); rec.Code != http.StatusUnauthorized {
+		t.Errorf("Bearer with a forged token: %d, want 401", rec.Code)
+	}
+
+	// Login form: a valid token sets an HttpOnly cookie that opens the panel.
+	rec = do(t, s, "POST", "/login", "application/x-www-form-urlencoded", "token="+good, nil)
+	cookies := rec.Result().Cookies()
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" || len(cookies) != 1 {
+		t.Fatalf("POST /login: %d -> %q, cookies %v", rec.Code, rec.Header().Get("Location"), cookies)
+	}
+	ck := cookies[0]
+	if ck.Name != cookieName || !ck.HttpOnly || ck.SameSite != http.SameSiteLaxMode || ck.Secure || ck.Value != good {
+		t.Errorf("cookie %+v, want HttpOnly, SameSite=Lax, not Secure over plain HTTP", ck)
+	}
+	withCookie := map[string]string{"Cookie": cookieName + "=" + ck.Value}
+	if rec := do(t, s, "GET", "/", "", "", withCookie); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "panel") {
+		t.Errorf("GET / with the cookie: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, s, "GET", "/login", "", "", withCookie); rec.Code != http.StatusSeeOther {
+		t.Errorf("GET /login while logged in: %d, want a redirect to /", rec.Code)
+	}
+	rec = do(t, s, "POST", "/login", "application/x-www-form-urlencoded", "token="+good, map[string]string{"X-Forwarded-Proto": "https"})
+	if c := rec.Result().Cookies(); len(c) != 1 || !c[0].Secure {
+		t.Errorf("login behind a TLS proxy: cookie %v, want Secure", c)
+	}
+
+	// A wrong token: back to the form with an error, no cookie.
+	rec = do(t, s, "POST", "/login", "application/x-www-form-urlencoded", "token=nope", nil)
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login?failed=1" || len(rec.Result().Cookies()) != 0 {
+		t.Errorf("POST /login with a wrong token: %d -> %q, cookies %v", rec.Code, rec.Header().Get("Location"), rec.Result().Cookies())
+	}
+	if rec := do(t, s, "GET", "/login?failed=1", "", "", nil); !strings.Contains(rec.Body.String(), "not valid") {
+		t.Errorf("GET /login?failed=1 shows no error: %s", rec.Body.String())
+	}
+	// Another site cannot log the browser in (login CSRF).
+	rec = do(t, s, "POST", "/login", "application/x-www-form-urlencoded", "token="+good, map[string]string{"Origin": "https://evil.example"})
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("cross-site POST /login: %d, want 403", rec.Code)
+	}
+
+	rec = do(t, s, "POST", "/logout", "", "", withCookie)
+	if c := rec.Result().Cookies(); rec.Code != http.StatusSeeOther || len(c) != 1 || c[0].MaxAge >= 0 {
+		t.Errorf("POST /logout: %d, cookies %v; want the cookie removed", rec.Code, c)
+	}
+
+	// Rotating the key revokes the token.
+	if err := keeper.Rotate(); err != nil {
+		t.Fatal(err)
+	}
+	if rec := do(t, s, "GET", "/api/workers", "", "", bearer(good)); rec.Code != http.StatusUnauthorized {
+		t.Errorf("token after a key rotation: %d, want 401", rec.Code)
 	}
 }

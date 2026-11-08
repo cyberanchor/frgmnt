@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cyberanchor/frgmnt/internal/auth"
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/server"
@@ -102,6 +103,11 @@ func Main(args []string) int {
 		log.Fatalf("load workers: %v", err)
 	}
 
+	keeper, created, err := auth.Open(absData)
+	if err != nil {
+		log.Fatalf("access tokens: %v", err)
+	}
+
 	staticSub, err := staticfs.Sub()
 	if err != nil {
 		log.Fatalf("embed sub-fs: %v", err)
@@ -113,6 +119,7 @@ func Main(args []string) int {
 		Store:      st,
 		Bus:        bus,
 		StaticFS:   staticSub,
+		Auth:       keeper,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -134,6 +141,11 @@ func Main(args []string) int {
 	if *baseURL != "" {
 		bus.Publish(logbus.LevelWarn, "", "checking against "+*baseURL+" instead of fragment.com (-base-url)")
 	}
+	keyNote := "access tokens are signed with " + keeper.Path()
+	if created {
+		keyNote = "a new access key was created in " + keeper.Path()
+	}
+	bus.Publish(logbus.LevelInfo, "", keyNote+"; issue a token with: frgmnt token -data "+absData)
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server error: %v", err)
 	}

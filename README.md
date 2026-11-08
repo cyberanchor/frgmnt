@@ -124,6 +124,7 @@ answers with a Cloudflare challenge (see above).
 ## Web panel
 
 ```bash
+./frgmnt token -data ./data                    # prints an access token (valid 30 days)
 ./frgmnt web                                   # http://127.0.0.1:8080, data in ./data
 ./frgmnt web -addr 127.0.0.1:9090 -data ./var -log-level debug
 ```
@@ -161,13 +162,39 @@ answers with a Cloudflare challenge (see above).
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 | `-version` | | Print the version |
 
-The panel has no login. It refuses state-changing requests that a browser
-marks as coming from another site (`Origin`, `Sec-Fetch-Site`), and while it
-listens on a loopback address it only answers to a loopback `Host`
-(`127.0.0.1`, `localhost`, `::1`, any port, so `ssh -L` works) or to a name
-given with `-allow-host` (for a reverse proxy with a domain; its `Origin`
-is accepted too, also when the proxy sends its own `Host`). Bind it to
-another address only on a network you trust.
+### Access
+
+Every request needs an **access token**: a JWT signed (HS256) with the key in
+`<data>/auth.key`, which the panel creates on its first start (mode 0600).
+There are no users or passwords; whoever holds a valid token gets in.
+
+```bash
+./frgmnt token -data ./data                          # 30 days
+./frgmnt token -data ./data -ttl 0 -name laptop      # never expires
+./frgmnt token -data ./data -rotate                  # new key: every older token stops working
+```
+
+The token goes on the login page (`/login`), which keeps it in an HttpOnly
+cookie (`Secure` over HTTPS, also behind a TLS proxy that sets
+`X-Forwarded-Proto`), or into the header `Authorization: Bearer <token>` of
+API calls. Without it the API answers 401 and the pages redirect to
+`/login`. Logging out (the button in the top bar) only removes the cookie;
+to revoke tokens, rotate the key, which a running panel picks up within a
+second.
+
+Two ways to reach the panel, both with a token:
+
+- **SSH**: keep the default `-addr 127.0.0.1:8080` and open
+  `ssh -L 8080:127.0.0.1:8080 server`, then `http://localhost:8080`.
+- **A domain with a certificate**: put a TLS reverse proxy in front and name
+  the domain with `-allow-host panel.example.com`.
+
+The panel also refuses state-changing requests that a browser marks as
+coming from another site (`Origin`, `Sec-Fetch-Site`), the login form
+included, and while it listens on a loopback address it only answers to a
+loopback `Host` (`127.0.0.1`, `localhost`, `::1`, any port, so `ssh -L`
+works) or to a name given with `-allow-host` (its `Origin` is accepted too,
+also when the proxy sends its own `Host`).
 
 ### REST API
 
@@ -193,9 +220,11 @@ Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
 field means the default; a negative or too large value is answered with 400.
 
 ```bash
-curl -s -X POST localhost:8080/api/workers -d '{"name":"w1","config":{"workers":100,"retries":1}}'
-curl -s -X POST localhost:8080/api/workers/<id>/input -d '{"text":"durov, @pavel\nwallet"}'
-curl -s -X POST localhost:8080/api/workers/<id>/start
+TOKEN=$(./frgmnt token -data ./data -name script 2>/dev/null)
+A="Authorization: Bearer $TOKEN"
+curl -s -H "$A" -X POST localhost:8080/api/workers -d '{"name":"w1","config":{"workers":100,"retries":1}}'
+curl -s -H "$A" -X POST localhost:8080/api/workers/<id>/input -d '{"text":"durov, @pavel\nwallet"}'
+curl -s -H "$A" -X POST localhost:8080/api/workers/<id>/start
 ```
 
 ### Data layout
@@ -204,6 +233,7 @@ curl -s -X POST localhost:8080/api/workers/<id>/start
 data/
   data.db          # SQLite (WAL): workers, inputs with checked flags, results
   settings.json    # global settings, editable by hand
+  auth.key         # the key that signs access tokens (mode 0600); replace it with "frgmnt token -rotate"
   pagecache/       # gzipped Fragment pages + JSON metadata, two-level shards
 ```
 
@@ -253,7 +283,8 @@ make clean-cache  # drops .fragment_cache and data/pagecache
 cmd/frgmnt/          unified binary: check | web | version
 cmd/server/          web-only entry point (fragment_checker_web)
 internal/cli/        console mode: flags, input, -resume, -filter, results file, summary
-internal/webapp/     web mode bootstrap and shutdown
+internal/webapp/     web mode bootstrap and shutdown, the token command
+internal/auth/       access tokens: the key in <data>/auth.key, issuing and checking JWTs
 internal/checker/    the engine of both modes: HTTP, retries, cooldown, parser, page cache
 internal/worker/     worker tiles: lifecycle, input producer, result writer
 internal/server/     REST + SSE, request guard

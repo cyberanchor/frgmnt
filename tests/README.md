@@ -45,6 +45,7 @@ internal/checker/checker_test.go
 internal/checker/cache_test.go
 internal/checker/regression_test.go
 internal/cli/regression_test.go
+internal/auth/auth_test.go
 internal/logbus/logbus_test.go
 internal/server/server_test.go
 internal/store/store_test.go
