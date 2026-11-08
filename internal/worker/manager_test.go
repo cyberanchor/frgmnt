@@ -413,3 +413,69 @@ func TestDeleteWaitsForTheRun(t *testing.T) {
 		t.Errorf("ERROR events after Delete: %d (last %q)", h.errs.Load(), h.lastError())
 	}
 }
+
+// A worker blocked by Cloudflare (every answer HTTP 403 with
+// cf-mitigated: challenge) went through the whole list in seconds, stored
+// an error for every name, flagged them all checked and ended "done", so
+// Resume had nothing left to do. Now the run stops with status error, and
+// Resume checks every name without a verdict, the errors included.
+func TestBlockedRunStopsAndResumeRechecks(t *testing.T) {
+	var blocked atomic.Bool
+	blocked.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if blocked.Load() {
+			w.Header().Set("Cf-Mitigated", "challenge")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	}))
+	old := checker.FragmentURLTemplate
+	checker.FragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() { checker.FragmentURLTemplate = old; srv.Close() })
+
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "blocked", testConfig(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(300)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("blocked run did not stop")
+	}
+	if st := w.Status(); st != StatusError {
+		t.Errorf("status after the block: %s, want error", st)
+	}
+	if !strings.Contains(h.lastError(), "Cloudflare challenge") {
+		t.Errorf("last error log: %q, want the Cloudflare block explained", h.lastError())
+	}
+	checked, rows := persistedCounts(t, h.st, w.ID())
+	if checked >= 300 || rows >= 300 {
+		t.Errorf("blocked run: %d names checked, %d result rows; want it to stop early", checked, rows)
+	}
+	if n, _ := h.m.Pending(ctx, w.ID()); n != 300 {
+		t.Errorf("Pending after the block = %d, want 300 (errors count as pending)", n)
+	}
+
+	blocked.Store(false)
+	if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 20*time.Second) {
+		t.Fatal("resume did not finish")
+	}
+	counts, err := h.st.CountByStatus(ctx, w.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.Status() != StatusDone || counts["free"] != 300 || counts["error"] != 0 {
+		t.Errorf("after Resume: status %s, counts %v; want done with 300 free and no errors", w.Status(), counts)
+	}
+}

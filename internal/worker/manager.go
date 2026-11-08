@@ -283,12 +283,21 @@ func (m *Manager) Start(ctx context.Context, id string, opt StartOptions) error 
 	return nil
 }
 
-// Pending returns how many names a Resume of the worker would check.
+// Pending returns how many names a Resume of the worker would check: the
+// unchecked ones and the ones whose result is an error.
 func (m *Manager) Pending(ctx context.Context, id string) (int64, error) {
 	if _, err := m.Get(id); err != nil {
 		return 0, err
 	}
-	return m.store.PendingInputCount(ctx, id)
+	pending, err := m.store.PendingInputCount(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	counts, err := m.store.CountByStatus(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	return pending + counts[string(checker.StatusError)], nil
 }
 
 // Stop cancels the run loop. Safe on a non-running worker (no-op).
@@ -518,6 +527,12 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 
 	var queued int64
 	if resume {
+		// Errors are not verdicts: check those names again too.
+		if n, err := m.store.RequeueErrors(ctx, w.id); err != nil {
+			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("requeue errors: %v", err))
+		} else if n > 0 {
+			m.bus.Publish(logbus.LevelInfo, w.id, fmt.Sprintf("resume: %d names that ended with an error are checked again", n))
+		}
 		pending, err := m.store.PendingInputCount(ctx, w.id)
 		if err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("pending count: %v", err))
@@ -576,6 +591,11 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	go m.persister(ctx, w, out, batchDone)
 
 	chk.Run(ctx, in, out)
+	blocked := chk.Blocked()
+	if blocked {
+		// Run gave up early; the producer still waits to hand over a name.
+		w.stop()
+	}
 	close(out)
 	<-batchDone
 
@@ -590,6 +610,14 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	w.lastStats = final
 	w.mu.Unlock()
 
+	if blocked {
+		m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf(
+			"stopped: Fragment answered %d requests in a row with a Cloudflare challenge "+
+				"(HTTP 403, cf-mitigated: challenge), so it blocks this IP. The names without a verdict "+
+				"stay pending: press Resume later.", checker.ChallengeLimit))
+		w.setStatus(StatusError)
+		return
+	}
 	if ctx.Err() != nil {
 		m.bus.Publish(logbus.LevelInfo, w.id, "stopped (cancelled)")
 		w.setStatus(StatusReady)

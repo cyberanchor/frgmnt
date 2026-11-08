@@ -109,11 +109,14 @@ func TestSIGINTThenResumeChecksInterruptedNames(t *testing.T) {
 	}
 }
 
-// A results file written by an older version may already contain
-// "error (cancelled)" lines; -resume must check those names again.
-func TestResumeRechecksOldCancelledLines(t *testing.T) {
+// -resume skipped every name in the results file, also the ones that only
+// have an error: "error (cancelled)" lines of older versions, and every
+// "error (HTTP 403)" of a run that Cloudflare blocked. An error is not a
+// verdict, so those names must be checked again.
+func TestResumeRechecksErrorLines(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "results.txt")
-	body := "@alice | free\n@bob | error (cancelled)\n@carol | error (HTTP 403)\n"
+	body := "@alice | free\n@bob | error (cancelled)\n@carol | error (HTTP 403)\n" +
+		"@dave | error (cloudflare challenge (HTTP 403))\n@dave | taken\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -121,11 +124,64 @@ func TestResumeRechecksOldCancelledLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, alice := set["alice"]
-	_, bob := set["bob"]
-	_, carol := set["carol"]
-	if !alice || bob || !carol {
-		t.Errorf("resume set = %v, want alice and carol, not bob", set)
+	for name, want := range map[string]bool{"alice": true, "bob": false, "carol": false, "dave": true} {
+		if _, got := set[name]; got != want {
+			t.Errorf("%s in the resume set: %v, want %v (set %v)", name, got, want, set)
+		}
+	}
+}
+
+// A blocked run (every answer a Cloudflare challenge) went through the
+// whole list in seconds, wrote an error for every name and exited with 0.
+// Now it stops after checker.ChallengeLimit challenges in a row, exits
+// with 3, and -resume later checks every name without a verdict.
+func TestBlockedRunExitCodeAndResume(t *testing.T) {
+	var blocked atomic.Bool
+	blocked.Store(true)
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		if blocked.Load() {
+			w.Header().Set("Cf-Mitigated", "challenge")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		freeHandler(w, r, name)
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "name%03d\n", i)
+	}
+	if err := os.WriteFile(in, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "4", "-retries", "0"}
+	if code := Main(args); code != 3 {
+		t.Errorf("blocked run: exit code %d, want 3", code)
+	}
+	raw, _ := os.ReadFile(out)
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) >= 200 {
+		t.Errorf("blocked run wrote %d lines, want it to stop early", len(lines))
+	}
+
+	blocked.Store(false)
+	if code := Main(append(args, "-resume")); code != 0 {
+		t.Errorf("resume: exit code %d, want 0", code)
+	}
+	raw, _ = os.ReadFile(out)
+	free := map[string]int{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if name, status, ok := strings.Cut(line, " | "); ok && status == "free" {
+			free[name]++
+		}
+	}
+	for i := 0; i < 200; i++ {
+		if n := free[fmt.Sprintf("@name%03d", i)]; n != 1 {
+			t.Errorf("name%03d has %d free lines after -resume, want 1", i, n)
+		}
 	}
 }
 

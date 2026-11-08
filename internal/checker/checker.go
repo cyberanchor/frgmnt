@@ -42,6 +42,11 @@ const (
 
 	// DefaultReadLimit is the body size scanned for the status marker.
 	DefaultReadLimit = 16384
+
+	// ChallengeLimit is how many Cloudflare challenges in a row, with no
+	// other answer in between, make Run give up: Fragment is then blocking
+	// this client, and every further request would fail the same way.
+	ChallengeLimit = 10
 )
 
 // Status is the resolved availability state of a Fragment username.
@@ -84,6 +89,11 @@ type Result struct {
 	// Offset is where the status marker starts in a page fetched from the
 	// network (0 otherwise); the console uses it to suggest a -readlimit.
 	Offset int `json:"offset,omitempty"`
+
+	// notSent marks a check that never sent its request because the
+	// client was found blocked first. Run drops it: the name stays
+	// unchecked, like one cut short by a cancel.
+	notSent bool
 }
 
 // Config is the per-Checker tunables surface. Zero values get sensible
@@ -185,6 +195,10 @@ type Stats struct {
 	CacheHits   int64 `json:"cache_hits"`
 	CacheStale  int64 `json:"cache_stale"`
 	CacheMisses int64 `json:"cache_misses"`
+
+	// Challenges counts Cloudflare challenge answers (HTTP 403 with
+	// cf-mitigated: challenge, or a "Just a moment..." page).
+	Challenges int64 `json:"challenges"`
 }
 
 // Checker performs concurrent Fragment lookups against a single Config.
@@ -201,8 +215,37 @@ type Checker struct {
 	// suspicious bare redirect to "/".
 	blockUntil atomic.Int64
 
+	// challengeRun counts challenge answers since the last other answer;
+	// blocked is set when it reaches ChallengeLimit.
+	challengeRun atomic.Int64
+	blocked      atomic.Bool
+
+	// Until the first outcome that is not a challenge (an answer or a
+	// network error), requests go out one at a time through scout. A
+	// client that is already blocked then learns it after ChallengeLimit
+	// requests instead of sending one per worker at once.
+	opened atomic.Bool
+	scout  chan struct{}
+
 	log Logger // optional detail for the console's -debug and -trace
 }
+
+// Blocked reports whether Run gave up because Fragment kept answering with
+// a Cloudflare challenge. The names Run did not get to are left unread in
+// its input channel; callers stop their producer and keep them pending.
+func (c *Checker) Blocked() bool { return c.blocked.Load() }
+
+// noteChallenge counts a Cloudflare challenge answer.
+func (c *Checker) noteChallenge() {
+	atomic.AddInt64(&c.stats.challenges, 1)
+	if c.challengeRun.Add(1) >= ChallengeLimit && c.blocked.CompareAndSwap(false, true) {
+		c.warnf("Fragment answered %d requests in a row with a Cloudflare challenge: this client is blocked, stopping", ChallengeLimit)
+	}
+}
+
+// noteAnswer records an answer that is not a challenge: the block, if any,
+// was not complete.
+func (c *Checker) noteAnswer() { c.challengeRun.Store(0) }
 
 // New returns a Checker ready to Run. Pass DefaultConfig() and adjust as needed.
 func New(cfg Config) *Checker {
@@ -213,6 +256,7 @@ func New(cfg Config) *Checker {
 		limiter: newRateLimiter(cfg.RateRPS),
 		stats:   newLiveStats(),
 		cache:   newPageCache(cfg.CacheDir, cfg.CacheTTL, cfg.CacheSoldTTL),
+		scout:   make(chan struct{}, 1),
 	}
 	c.pool.New = func() any {
 		b := make([]byte, cfg.ReadLimit)
@@ -255,6 +299,9 @@ func (c *Checker) Run(ctx context.Context, in <-chan string, out chan<- Result) 
 
 func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Result) {
 	for {
+		if c.blocked.Load() {
+			return // every request gets a challenge; leave the rest pending
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -273,6 +320,9 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 				// verdict. Reporting it as an error used to store the name
 				// as done; dropping it keeps the name pending for Resume.
 				return
+			}
+			if r.notSent {
+				return // blocked before the request went out: keep it pending
 			}
 			c.stats.record(r.Status)
 			// Deliver a finished verdict even if ctx was cancelled in the
@@ -343,12 +393,18 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 	var lastRes Result
 	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
-			atomic.AddInt64(&c.stats.retries, 1)
+			if c.blocked.Load() {
+				break // no point in retrying: every answer is a challenge
+			}
 			select {
 			case <-ctx.Done():
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}
 			case <-time.After(c.cfg.RetryDelay):
 			}
+			if c.blocked.Load() {
+				break // found blocked during the pause
+			}
+			atomic.AddInt64(&c.stats.retries, 1)
 		}
 		res, retry, errStr := c.doRequest(ctx, name, reqURL)
 		if !retry {
@@ -383,10 +439,30 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 	return Result{Username: name, Status: StatusError, Error: "retries exhausted: " + lastErr}
 }
 
-func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, bool, string) {
+func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
 	if err := c.waitBlock(ctx); err != nil {
 		return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
 	}
+	if !c.opened.Load() {
+		select {
+		case c.scout <- struct{}{}:
+			defer func() { <-c.scout }()
+		case <-ctx.Done():
+			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
+		}
+		if c.blocked.Load() {
+			msg := "not sent: Fragment blocks this client (Cloudflare challenge)"
+			return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
+		}
+	}
+	// Runs before the scout slot is released: a waiting request sees the
+	// gate open and goes ahead.
+	challenged := false
+	defer func() {
+		if !challenged && ctx.Err() == nil {
+			c.opened.Store(true)
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
 		return Result{Username: name, Status: StatusError, Error: err.Error()}, false, err.Error()
@@ -441,8 +517,16 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 		}
 	}
 
+	// Cloudflare marks the answers it replaces with a challenge (HTTP 403
+	// today) with this header. They say nothing about the name.
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Cf-Mitigated")), "challenge") {
+		challenged = true
+		return c.challengeResult(name, resp.StatusCode, tr)
+	}
+
 	switch resp.StatusCode {
 	case 301, 302, 303, 307, 308:
+		c.noteAnswer()
 		loc := resp.Header.Get("Location")
 		c.debugf("@%s REDIRECT -> %s", name, loc)
 		switch {
@@ -504,10 +588,13 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 		if pi.Challenge {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
+			challenged = true
+			c.noteChallenge()
 			tr.summary(StatusError, n)
 			return Result{Username: name, Status: StatusError, Error: "cloudflare challenge",
 				Evidence: pi.Evidence}, true, "cloudflare challenge"
 		}
+		c.noteAnswer()
 		if c.cache != nil && pi.Found {
 			// Best-effort: never let a read-only cache directory fail a check.
 			_ = c.cache.put(name, reqURL, pi, body)
@@ -537,12 +624,32 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 			Confidence: pi.Confidence, Evidence: pi.Evidence}, false, ""
 
 	default:
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable {
+			// A proxy may drop cf-mitigated; the page itself still shows.
+			head, _ := io.ReadAll(io.LimitReader(bodyReader, 8<<10))
+			if looksLikeChallenge(head) {
+				challenged = true
+				return c.challengeResult(name, resp.StatusCode, tr)
+			}
+		}
+		c.noteAnswer()
 		c.debugf("@%s unexpected HTTP %d", name, resp.StatusCode)
 		tr.summary(StatusError, 0)
 		s := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		retryable := resp.StatusCode >= 500 && resp.StatusCode <= 599
 		return Result{Username: name, Status: StatusError, Error: s}, retryable, s
 	}
+}
+
+// challengeResult is the answer to a Cloudflare challenge: an error that is
+// retried like the 200 interstitial, and counted toward ChallengeLimit.
+func (c *Checker) challengeResult(name string, code int, tr *requestTrace) (Result, bool, string) {
+	c.noteChallenge()
+	c.debugf("@%s Cloudflare challenge (HTTP %d)", name, code)
+	tr.summary(StatusError, 0)
+	msg := fmt.Sprintf("cloudflare challenge (HTTP %d)", code)
+	return Result{Username: name, Status: StatusError, Error: msg,
+		Evidence: "cf-mitigated: challenge"}, true, msg
 }
 
 // -----------------------------------------------------------------------------
@@ -734,6 +841,7 @@ type liveStats struct {
 	cacheHits   int64
 	cacheStale  int64
 	cacheMisses int64
+	challenges  int64
 }
 
 func newLiveStats() *liveStats { return &liveStats{} }
@@ -780,6 +888,7 @@ func (s *liveStats) snapshot() Stats {
 		CacheHits:   atomic.LoadInt64(&s.cacheHits),
 		CacheStale:  atomic.LoadInt64(&s.cacheStale),
 		CacheMisses: atomic.LoadInt64(&s.cacheMisses),
+		Challenges:  atomic.LoadInt64(&s.challenges),
 	}
 }
 

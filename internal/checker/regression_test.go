@@ -11,6 +11,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -206,4 +207,124 @@ func TestCheckerCloseTwiceDoesNotPanic(t *testing.T) {
 		}
 	}()
 	c.Close()
+}
+
+// runNames runs a Checker over names and returns what it emitted and the
+// names it left unread.
+func runNames(t *testing.T, cfg Config, names []string) (c *Checker, results []Result, unread int) {
+	t.Helper()
+	c = New(cfg)
+	t.Cleanup(c.Close)
+	in := make(chan string, len(names))
+	for _, n := range names {
+		in <- n
+	}
+	close(in)
+	out := make(chan Result, len(names))
+	c.Run(context.Background(), in, out)
+	close(out)
+	for r := range out {
+		results = append(results, r)
+	}
+	return c, results, len(in)
+}
+
+func seq(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("%s%03d", prefix, i)
+	}
+	return out
+}
+
+// Since 2026-11-08 Fragment answers every /username/ request from this
+// client with HTTP 403 and "cf-mitigated: challenge". That was a plain
+// "HTTP 403" error and the run went on: 300 names "done" in two seconds,
+// every one an error, and Resume treated them as checked.
+func TestCloudflareBlockStopsRun(t *testing.T) {
+	var hits atomic.Int64
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Cf-Mitigated", "challenge")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head></html>`)
+	})
+	cfg := DefaultConfig()
+	cfg.Workers = 4
+	cfg.Retries = 2
+	cfg.RetryDelay = time.Millisecond
+	c, results, unread := runNames(t, cfg, seq("name", 300))
+	if !c.Blocked() {
+		t.Fatal("Blocked() = false after 300 challenges")
+	}
+	// Until a first answer that is not a challenge, requests go out one at
+	// a time, so a client that is blocked from the start sends exactly
+	// ChallengeLimit of them (it used to send one per worker at once).
+	if h := hits.Load(); h != ChallengeLimit {
+		t.Errorf("%d requests, want %d", h, ChallengeLimit)
+	}
+	// Only names that got a challenge come back (as errors); the ones never
+	// sent stay in the input for a later resume.
+	if len(results) == 0 || len(results) > ChallengeLimit || unread+len(results) >= 300 && unread == 0 {
+		t.Errorf("results=%d unread=%d: the run did not stop early", len(results), unread)
+	}
+	for _, r := range results {
+		if r.Status != StatusError || !strings.Contains(r.Error, "cloudflare challenge (HTTP 403)") {
+			t.Errorf("%s: %s (%s), want an error naming the challenge", r.Username, r.Status, r.Error)
+		}
+	}
+	if got := c.Snapshot().Challenges; got != hits.Load() {
+		t.Errorf("Stats.Challenges = %d, want %d", got, hits.Load())
+	}
+}
+
+// A challenge now and then is not a block: the count of challenges in a
+// row starts over with every other answer.
+func TestChallengeRunResetsOnAnswer(t *testing.T) {
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		if strings.HasPrefix(name, "chal") {
+			w.Header().Set("Cf-Mitigated", "challenge")
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	var names []string
+	for i := 0; i < 15; i++ {
+		names = append(names, fmt.Sprintf("chal%03d", i), fmt.Sprintf("free%03d", i))
+	}
+	cfg := DefaultConfig()
+	cfg.Workers = 1
+	cfg.Retries = 2 // three challenges in a row per "chal" name, below the limit
+	cfg.RetryDelay = time.Millisecond
+	c, results, unread := runNames(t, cfg, names)
+	if c.Blocked() || unread != 0 || len(results) != len(names) {
+		t.Errorf("blocked=%v results=%d unread=%d, want every name checked", c.Blocked(), len(results), unread)
+	}
+}
+
+// A proxy in front of Fragment may drop the cf-mitigated header; the
+// challenge page in a 403 or 503 still gives it away. A plain 403 is not
+// a challenge.
+func TestChallengePageWithoutHeader(t *testing.T) {
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		if strings.HasSuffix(r.URL.Path, "chal") {
+			fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><script>window._cf_chl_opt={}</script></html>`)
+		}
+	})
+	cfg := DefaultConfig()
+	cfg.Retries = 0
+	c := New(cfg)
+	defer c.Close()
+	if r := c.CheckOne(context.Background(), "pagechal"); !strings.Contains(r.Error, "cloudflare challenge (HTTP 403)") {
+		t.Errorf("403 with a challenge page: %+v", r)
+	}
+	if r := c.CheckOne(context.Background(), "plain"); r.Error != "HTTP 403" {
+		t.Errorf("plain 403: %+v, want HTTP 403", r)
+	}
+	if got := c.Snapshot().Challenges; got != 1 {
+		t.Errorf("Stats.Challenges = %d, want 1", got)
+	}
 }

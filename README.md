@@ -68,6 +68,12 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
   retried with the same cookie session, and a random free name is probed.
   Only a healthy probe gives `reserved`; otherwise the result is an error,
   never a false `reserved`.
+- **Cloudflare challenge**: an answer with `cf-mitigated: challenge` (HTTP 403)
+  or a "Just a moment..." page says nothing about the name and is an error.
+  After 10 of them in a row, with no other answer in between, Fragment is
+  blocking this IP: the run stops instead of burning through the list. The
+  console exits with code 3, a web worker ends with status `error`, and the
+  names without a verdict stay for `-resume` / Resume.
 - **Listings lag**: search pages can still show a name that was delisted. The
   username page is the source of truth.
 
@@ -75,7 +81,7 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
 
 ```bash
 ./frgmnt check -input names.txt -output results.txt                  # 500 workers, 8 connections
-./frgmnt check -input names.txt -output results.txt -resume          # skip names already in results.txt
+./frgmnt check -input names.txt -output results.txt -resume          # skip names with a verdict in results.txt
 cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 ```
 
@@ -93,15 +99,19 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-cache-dir` / `-no-cache` | `.fragment_cache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
 | `-filter` | | Write only these statuses, e.g. `free,auction` |
-| `-append` / `-resume` | | Append to the output; `-resume` also skips names already in it |
+| `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again) |
 | `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
 | `-quiet` / `-debug` / `-trace` | | Less or more output on stdout and stderr |
 | `-insecure` | | Skip TLS verification (debugging only) |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 
 Ctrl+C stops gracefully: finished results are flushed, checks that were cut
-short are not written, so `-resume` checks them again. The exit code is 1 when
-the results file could not be written.
+short are not written, so `-resume` checks them again.
+
+Exit codes: `0` done; `1` the results file could not be written, or every
+checked name ended with an error; `2` bad flags (unknown `-filter` status,
+`-input` and `-output` being the same file); `3` stopped because Fragment
+answers with a Cloudflare challenge (see above).
 
 ## Web panel
 
@@ -112,7 +122,8 @@ the results file could not be written.
 
 - **Worker tiles**: independent checker sessions, each with its own config,
   input list, progress bar and status breakdown. Start runs from scratch,
-  Resume continues from the first unchecked name. Start all starts new
+  Resume continues from the first unchecked name and checks names that
+  ended with an error again. Start all starts new
   workers and continues stopped ones (it never deletes results; finished
   workers are left as they are), Stop all stops every running one.
 - **Input**: paste names or upload a file; commas, spaces, tabs, semicolons and

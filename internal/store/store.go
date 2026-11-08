@@ -388,6 +388,32 @@ func (s *Store) ResetInputsChecked(ctx context.Context, workerID string) error {
 	return err
 }
 
+// RequeueErrors makes the names whose result is an error pending again and
+// deletes those results, in one transaction, so a resume checks them again:
+// an error (a network failure, a Cloudflare challenge) is not a verdict.
+// It returns how many names were requeued.
+func (s *Store) RequeueErrors(ctx context.Context, workerID string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE worker_inputs SET checked = 0
+		 WHERE worker_id = ? AND username IN
+		     (SELECT username FROM results WHERE worker_id = ? AND status = 'error')`,
+		workerID, workerID,
+	); err != nil {
+		return 0, err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM results WHERE worker_id = ? AND status = 'error'`, workerID)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, tx.Commit()
+}
+
 // PendingInputCount returns how many usernames remain unchecked.
 func (s *Store) PendingInputCount(ctx context.Context, workerID string) (int64, error) {
 	var n int64

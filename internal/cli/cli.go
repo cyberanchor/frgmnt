@@ -253,6 +253,9 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Rate-limits: %d | Retries: %d",
 		e.ConnNew, e.ConnReuse, e.RateLimit, e.Retries)
 	line += fmt.Sprintf("\n  Page cache: hits=%d, stale=%d, misses=%d", e.CacheHits, e.CacheStale, e.CacheMisses)
+	if e.Challenges > 0 {
+		line += fmt.Sprintf("\n  Cloudflare challenges: %d", e.Challenges)
+	}
 	if logLevel >= LevelDebug {
 		if fc := atomic.LoadInt64(&s.freeCount); fc > 0 {
 			avg := float64(atomic.LoadInt64(&s.freeSumUs)) / float64(fc) / 1000
@@ -334,8 +337,9 @@ func produceUsernames(
 // -----------------------------------------------------------------------------
 
 // loadResumeSet reads the existing output file and returns the set of
-// usernames already present there. Returns nil, nil when the file does
-// not exist (first run is allowed).
+// usernames that already have a verdict there (lines with an error do not
+// count). Returns nil, nil when the file does not exist (first run is
+// allowed).
 func loadResumeSet(path string) (map[string]struct{}, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -357,9 +361,11 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 		if pipe < 0 {
 			continue
 		}
-		// Older versions wrote checks interrupted by Ctrl+C as
-		// "error (cancelled)"; those names were never checked.
-		if strings.TrimSpace(line[pipe+3:]) == string(StatusError)+" (cancelled)" {
+		// An error is not a verdict (a network failure, a Cloudflare
+		// challenge, or a check that older versions wrote as "error
+		// (cancelled)" on Ctrl+C): -resume checks the name again. A name
+		// with a verdict on any line is done.
+		if strings.HasPrefix(strings.TrimSpace(line[pipe+3:]), string(StatusError)) {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(line[1:pipe]))
@@ -726,13 +732,20 @@ func Main(args []string) int {
 		producerDone <- err
 	}()
 
-	// --- Wait for producer (or cancellation) ---
+	// --- Wait for the checks ---
+	// Run returns when the list is done, on Ctrl+C, or when it gives up
+	// because Fragment answers every request with a Cloudflare challenge.
+	// In the last case the producer still waits to hand over a name.
+	<-runDone
+	blocked := chk.Blocked()
+	if blocked {
+		cancel()
+	}
+
+	// --- Wait for producer ---
 	if err := <-producerDone; err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("[WARN] producer error: %v", err)
 	}
-
-	// --- Wait for the checks ---
-	<-runDone
 
 	// --- Stop progress reporter ---
 	progCancel()
@@ -754,7 +767,23 @@ func Main(args []string) int {
 	}
 
 	// --- Final summary ---
-	log.Println(stats.finalSummary(chk.Snapshot(), eff.ReadLimit))
+	final := chk.Snapshot()
+	log.Println(stats.finalSummary(final, eff.ReadLimit))
+	switch {
+	case blocked:
+		log.Printf("[ERROR] Fragment answered %d requests in a row with a Cloudflare challenge "+
+			"(HTTP 403, cf-mitigated: challenge), so it blocks this IP and the run stopped. "+
+			"Names without a verdict (errors and the rest of the list) are checked again by a later run with -resume.",
+			checker.ChallengeLimit)
+		if exitCode == 0 {
+			exitCode = 3
+		}
+	case final.Checked > 0 && final.Errors == final.Checked:
+		log.Printf("[ERROR] every checked name ended with an error")
+		if exitCode == 0 {
+			exitCode = 1
+		}
+	}
 	return exitCode
 }
 
