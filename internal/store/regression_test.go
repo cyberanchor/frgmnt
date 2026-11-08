@@ -4,6 +4,8 @@ package store
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -86,5 +88,53 @@ func TestCheckedFlagUpdateUsesIndex(t *testing.T) {
 	}
 	if p := strings.Join(plan, " / "); !strings.Contains(p, "idx_inputs_user") {
 		t.Errorf("checked-flag update does not use idx_inputs_user: %s", p)
+	}
+}
+
+// Settings documents default_retries as 0..10, but loading the file
+// replaced a stored 0 with the default 2, so "no retries" did not survive a
+// restart.
+func TestSettingsZeroRetriesSurvivesReload(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := s.GetSettings()
+	v.DefaultRetries = 0
+	if err := s.PutSettings(v); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if got := s2.GetSettings().DefaultRetries; got != 0 {
+		t.Errorf("default_retries after restart = %d, want 0", got)
+	}
+}
+
+// A settings file from an older version without some keys still gets the
+// defaults for them.
+func TestSettingsMissingKeysGetDefaults(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"theme":"light"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	got, def := s.GetSettings(), DefaultSettings()
+	def.Theme = "light"
+	if got != def {
+		t.Errorf("settings = %+v, want %+v", got, def)
 	}
 }

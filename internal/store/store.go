@@ -579,12 +579,15 @@ func (s *Store) loadSettings() error {
 	if err != nil {
 		return err
 	}
-	var loaded Settings
+	// Decode onto the defaults, so fields missing from the file keep them.
+	// default_retries and default_rate_rps can legitimately be 0 (no
+	// retries, no rate limit), so a 0 in the file is kept as it is.
+	def := DefaultSettings()
+	loaded := def
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		return err
 	}
-	// Backfill any missing fields with defaults.
-	def := DefaultSettings()
+	// Values that cannot be empty or zero fall back to the defaults.
 	if loaded.Theme == "" {
 		loaded.Theme = def.Theme
 	}
@@ -593,9 +596,6 @@ func (s *Store) loadSettings() error {
 	}
 	if loaded.DefaultWorkers == 0 {
 		loaded.DefaultWorkers = def.DefaultWorkers
-	}
-	if loaded.DefaultRetries == 0 {
-		loaded.DefaultRetries = def.DefaultRetries
 	}
 	if loaded.DefaultTimeout == 0 {
 		loaded.DefaultTimeout = def.DefaultTimeout
