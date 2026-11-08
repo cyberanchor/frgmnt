@@ -105,6 +105,9 @@ const (
 	// scannerBufMax is the maximum line size accepted by the input scanner.
 	scannerBufMax = 1 << 20
 
+	// maxReadLimit caps -readlimit; the status markers sit in the first ~8 KB.
+	maxReadLimit = 1 << 20
+
 	// HTML markers used by the tag-based status parser (v2.3+).
 	//
 	//   statusMarker      — status badge in the section header
@@ -1008,6 +1011,9 @@ func checkOne(ctx context.Context, raw string, client *http.Client, stats *Stats
 
 	reqURL := fmt.Sprintf(fragmentURLTemplate, url.PathEscape(name))
 
+	if cfg.retries < 0 {
+		cfg.retries = 0 // a negative count used to skip the request entirely
+	}
 	var lastErr string
 	var lastRes Result
 	for attempt := 0; attempt <= cfg.retries; attempt++ {
@@ -1738,8 +1744,14 @@ func Main(args []string) int {
 	if *maxConns < 1 {
 		*maxConns = 1
 	}
+	if *retries < 0 {
+		*retries = 0
+	}
 	if *readLimitF < 1024 {
 		*readLimitF = 1024
+	}
+	if *readLimitF > maxReadLimit {
+		*readLimitF = maxReadLimit // huge values panicked in make([]byte, n)
 	}
 	readLimit = *readLimitF
 
