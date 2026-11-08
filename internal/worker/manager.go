@@ -232,12 +232,19 @@ func (m *Manager) SetInput(ctx context.Context, id string, names []string) (int6
 		return 0, err
 	}
 	m.refreshProgress(ctx, w)
-	if len(names) > 0 {
-		w.setStatus(StatusReady)
-	} else {
+	switch checked := w.checkedCount(); {
+	case len(names) == 0:
 		w.setStatus(StatusIdle)
+	case checked >= int64(len(names)):
+		w.setStatus(StatusDone) // every name already has a result
+	default:
+		w.setStatus(StatusReady)
 	}
-	m.bus.Publish(logbus.LevelInfo, id, fmt.Sprintf("input loaded: %d usernames", len(names)))
+	msg := fmt.Sprintf("input loaded: %d usernames", len(names))
+	if checked := w.checkedCount(); checked > 0 {
+		msg += fmt.Sprintf(" (%d already have a result and are kept)", checked)
+	}
+	m.bus.Publish(logbus.LevelInfo, id, msg)
 	return int64(len(names)), nil
 }
 
@@ -324,6 +331,9 @@ func (m *Manager) ClearResults(ctx context.Context, id string) error {
 		return err
 	}
 	m.refreshProgress(ctx, w)
+	if w.Total() > 0 {
+		w.setStatus(StatusReady) // nothing is checked any more
+	}
 	m.bus.Publish(logbus.LevelInfo, id, "results cleared")
 	return nil
 }
@@ -618,9 +628,6 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	} else {
 		if err := m.store.ClearResults(ctx, w.id); err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("clear results: %v", err))
-		}
-		if err := m.store.ResetInputsChecked(ctx, w.id); err != nil {
-			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("reset checked: %v", err))
 		}
 		queued = total
 		m.bus.Publish(logbus.LevelInfo, w.id, fmt.Sprintf(

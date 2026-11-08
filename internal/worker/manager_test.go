@@ -551,3 +551,81 @@ func TestProgressSurvivesRestart(t *testing.T) {
 			w2.Status(), st.Checked, st.Total, st.Free)
 	}
 }
+
+// Loading a new list into a worker kept the results of the old one, so a
+// Resume mixed both lists (and the download listed names that are not in
+// the list any more).
+func TestNewListThenResumeChecksOnlyNewNames(t *testing.T) {
+	f := newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "lists", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), []string{"name1", "name2", "name3", "name4", "name5"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitNotRunning(w, 10*time.Second)
+	if _, err := h.m.SetInput(ctx, w.ID(), []string{"name4", "name5", "name6", "name7"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitNotRunning(w, 10*time.Second)
+	rs, err := h.st.ListResults(ctx, w.ID(), 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range rs {
+		got[r.Username] = true
+	}
+	if len(rs) != 4 || !got["name4"] || !got["name5"] || !got["name6"] || !got["name7"] {
+		t.Errorf("results after a new list and Resume: %v, want name4..name7 once each", got)
+	}
+	for _, n := range []string{"name4", "name5"} {
+		if c := f.hitsFor(n); c != 1 {
+			t.Errorf("%s (kept from the old list) requested %d times, want 1", n, c)
+		}
+	}
+	if st := w.Stats(); w.Status() != StatusDone || st.Checked != 4 || st.Total != 4 {
+		t.Errorf("status %s, %d/%d, want done 4/4", w.Status(), st.Checked, st.Total)
+	}
+}
+
+// Clear then Resume: "resume: nothing left to do", and the worker stayed
+// without any results.
+func TestClearThenResumeChecksAgain(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "clear", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(6)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	waitNotRunning(w, 10*time.Second)
+	if err := h.m.ClearResults(ctx, w.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if st := w.Stats(); w.Status() != StatusReady || st.Checked != 0 {
+		t.Errorf("after Clear: status %s, checked %d; want ready, 0", w.Status(), st.Checked)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	waitNotRunning(w, 10*time.Second)
+	if _, rows := persistedCounts(t, h.st, w.ID()); rows != 6 {
+		t.Errorf("after Clear and Resume: %d results, want 6", rows)
+	}
+}

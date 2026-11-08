@@ -273,7 +273,11 @@ var ErrNotFound = errors.New("not found")
 // -----------------------------------------------------------------------------
 
 // ReplaceInputs atomically replaces the input list for a worker. The seq
-// column preserves the upload order.
+// column preserves the upload order. Results of names that are in the new
+// list are kept and those names count as checked, so a resume checks only
+// the new ones; results of names that are no longer in the list are
+// deleted. The old results used to stay as they were: a resume after a new
+// list mixed both lists in the results and in the download.
 func (s *Store) ReplaceInputs(ctx context.Context, workerID string, names []string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -292,6 +296,20 @@ func (s *Store) ReplaceInputs(ctx context.Context, workerID string, names []stri
 		if _, err := stmt.ExecContext(ctx, workerID, i, n); err != nil {
 			return err
 		}
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM results WHERE worker_id = ? AND username NOT IN
+		     (SELECT username FROM worker_inputs WHERE worker_id = ?)`,
+		workerID, workerID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username IN
+		     (SELECT username FROM results WHERE worker_id = ?)`,
+		workerID, workerID,
+	); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE workers SET total = ?, updated_at = ? WHERE id = ?`,
@@ -510,11 +528,23 @@ func (s *Store) insertResults(ctx context.Context, rs []Result, markChecked bool
 	return tx.Commit()
 }
 
-// ClearResults removes every result for a worker. Called when the worker
-// is started fresh (i.e. without resume).
+// ClearResults removes every result for a worker and makes every name
+// pending again, in one transaction, so the next run (fresh or resume)
+// checks the whole list. Clearing used to keep the "checked" flags: Resume
+// after Clear said "nothing left to do" and the worker had no results.
 func (s *Store) ClearResults(ctx context.Context, workerID string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM results WHERE worker_id = ?`, workerID)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM results WHERE worker_id = ?`, workerID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE worker_inputs SET checked = 0 WHERE worker_id = ?`, workerID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ListResults returns up to limit results for a worker. When afterID is

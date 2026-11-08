@@ -178,3 +178,58 @@ INSERT INTO worker_inputs VALUES ('w1',0,'alice');`
 		t.Errorf("pending after migration = %v, want [alice]", got)
 	}
 }
+
+// A new list kept every result of the old one: a resume mixed both lists
+// in the results and in the download. Now the results of names that are
+// still in the list are kept (and count as checked); the rest are deleted.
+func TestReplaceInputsKeepsResultsOfNamesInTheNewList(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateWorker(ctx, Worker{ID: "w", Name: "w", ConfigJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceInputs(ctx, "w", []string{"alpha", "bravo", "charlie"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordResults(ctx, []Result{
+		{WorkerID: "w", Username: "alpha", Status: "free"},
+		{WorkerID: "w", Username: "bravo", Status: "taken"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceInputs(ctx, "w", []string{"bravo", "charlie", "delta"}); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := s.ListResults(ctx, "w", 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs) != 1 || rs[0].Username != "bravo" {
+		t.Errorf("results after the new list: %+v, want only bravo", rs)
+	}
+	if got := pendingNames(t, s, "w"); !equalStrSlice(got, []string{"charlie", "delta"}) {
+		t.Errorf("pending after the new list: %v, want [charlie delta]", got)
+	}
+}
+
+// Clear deleted the results but kept the "checked" flags, so Resume after
+// Clear said "nothing left to do" and the worker stayed without results.
+func TestClearResultsMakesNamesPending(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateWorker(ctx, Worker{ID: "w", Name: "w", ConfigJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceInputs(ctx, "w", []string{"alpha", "bravo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordResults(ctx, []Result{{WorkerID: "w", Username: "alpha", Status: "free"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearResults(ctx, "w"); err != nil {
+		t.Fatal(err)
+	}
+	if got := pendingNames(t, s, "w"); !equalStrSlice(got, []string{"alpha", "bravo"}) {
+		t.Errorf("pending after Clear: %v, want both names", got)
+	}
+}

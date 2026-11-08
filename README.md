@@ -135,7 +135,9 @@ answers with a Cloudflare challenge (see above).
   workers and continues stopped ones (it never deletes results; finished
   workers are left as they are), Stop all stops every running one.
 - **Input**: paste names or upload a file; commas, spaces, tabs, semicolons and
-  new lines all separate names, a leading `@` is stripped.
+  new lines all separate names, a leading `@` is stripped. A new list keeps
+  the results of the names that are in it (Resume checks only the new ones)
+  and deletes the others; the panel asks first when there are results.
 - **Results**: filter chips per status, plain-text download, confidence,
   evidence and cache marks.
 - **Settings**: defaults for new workers (workers, rate, retries, timeout),
@@ -172,7 +174,7 @@ another address only on a network you trust.
 | GET / PATCH / DELETE | `/api/workers/{id}` | One worker; PATCH changes only the fields it sends |
 | POST | `/api/workers/{id}/input` | Load names from `{"text": "..."}` |
 | POST | `/api/workers/{id}/input/upload` | Multipart upload, field `file` |
-| POST | `/api/workers/{id}/start` · `/stop` · `/clear` | Run (`?resume=true` keeps results), cancel, clear results |
+| POST | `/api/workers/{id}/start` · `/stop` · `/clear` | Run (`?resume=true` keeps results), cancel, clear results (every name is checked again by the next run) |
 | POST | `/api/workers-bulk/start` · `/stop` | Continue every worker with unchecked names (never from scratch), stop every running one |
 | GET | `/api/workers/{id}/results` | `?after=ID&limit=N`, with counts per status |
 | GET | `/api/workers/{id}/results/download` | Plain-text results |

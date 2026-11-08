@@ -585,10 +585,20 @@ function maybeRequestNotificationPermission() {
     }
 }
 
+// confirmNewList asks before a new list replaces one that has results:
+// the results of names that are not in the new list are deleted.
+async function confirmNewList(id) {
+    const n = await resultCount(id);
+    return n === 0 || confirm(`This worker has ${n} results.\n\n` +
+        "Results of names that are also in the new list are kept, the others are deleted " +
+        "(download them first if you need them). Load the new list?");
+}
+
 $("#details-load-text").addEventListener("click", async () => {
     if (!detailsCurrentId) return;
     const text = $("#details-textarea").value;
     try {
+        if (!(await confirmNewList(detailsCurrentId))) return;
         const res = await api("POST", `/api/workers/${detailsCurrentId}/input`, { text });
         $("#details-input-info").textContent =
             `Accepted ${res.accepted}, rejected ${res.rejected}`;
@@ -604,6 +614,7 @@ $("#details-file").addEventListener("change", async (ev) => {
     const fd = new FormData();
     fd.append("file", f);
     try {
+        if (!(await confirmNewList(detailsCurrentId))) return;
         const res = await api("POST", `/api/workers/${detailsCurrentId}/input/upload`, fd);
         $("#details-input-info").textContent =
             `Uploaded ${f.name}: accepted ${res.accepted}, rejected ${res.rejected}`;
