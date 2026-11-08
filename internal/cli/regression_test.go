@@ -3,7 +3,6 @@
 package cli
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -130,26 +129,32 @@ func TestResumeRechecksOldCancelledLines(t *testing.T) {
 	}
 }
 
-// checkWith runs checkOne against a fake Fragment with the given handler.
-func checkWith(t *testing.T, retries int, h func(w http.ResponseWriter, r *http.Request, name string)) (Result, *hitServer) {
+// runOne checks the single name "alice" with Main against a fake Fragment
+// and returns the line written for it.
+func runOne(t *testing.T, h func(w http.ResponseWriter, r *http.Request, name string), args ...string) (string, *hitServer) {
 	t.Helper()
 	srv := newHitServer(t, h)
-	old := fragmentURLTemplate
-	fragmentURLTemplate = srv.URL + "/username/%s"
-	t.Cleanup(func() { fragmentURLTemplate = old })
-	client := newHTTPClient(httpConfig{maxConns: 1, timeout: time.Second})
-	r := checkOne(context.Background(), "alice", client, newStats(), checkConfig{retries: retries, retryDelay: time.Millisecond})
-	return r, srv
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	if err := os.WriteFile(in, []byte("alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "1", "-retry-delay", "1ms"}
+	Main(append(base, args...))
+	raw, _ := os.ReadFile(out)
+	return strings.TrimSpace(string(raw)), srv
 }
 
 // The web engine treats a 200 Cloudflare interstitial as a retryable error;
 // the console engine reported it as a final "unknown" after one request.
 func TestChallengeIsRetriedAsError(t *testing.T) {
-	r, srv := checkWith(t, 2, func(w http.ResponseWriter, r *http.Request, name string) {
+	line, srv := runOne(t, func(w http.ResponseWriter, r *http.Request, name string) {
 		fmt.Fprint(w, `<html><head><title>Just a moment...</title></head><script>window._cf_chl_opt={}</script></html>`)
-	})
-	if r.Status != StatusError || srv.count("alice") != 3 {
-		t.Errorf("challenge page: status=%q after %d requests, want error after 3", r.Status, srv.count("alice"))
+	}, "-retries", "2")
+	if !strings.HasPrefix(line, "@alice | error") || srv.count("alice") != 3 {
+		t.Errorf("challenge page: %q after %d requests, want an error after 3", line, srv.count("alice"))
 	}
 }
 
@@ -157,11 +162,11 @@ func TestChallengeIsRetriedAsError(t *testing.T) {
 // engine only of 301/302, so a 307 to /?query= (free) became "HTTP 307".
 func TestRedirectCodesLikeWeb(t *testing.T) {
 	for _, code := range []int{http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
-		r, _ := checkWith(t, 0, func(w http.ResponseWriter, r *http.Request, name string) {
+		line, _ := runOne(t, func(w http.ResponseWriter, r *http.Request, name string) {
 			http.Redirect(w, r, "/?query="+name, code)
-		})
-		if r.Status != StatusFree {
-			t.Errorf("%d -> /?query=: got %q (%s), want free", code, r.Status, r.Error)
+		}, "-retries", "0")
+		if line != "@alice | free" {
+			t.Errorf("%d -> /?query=: got %q, want @alice | free", code, line)
 		}
 	}
 }
@@ -169,9 +174,9 @@ func TestRedirectCodesLikeWeb(t *testing.T) {
 // -retries was not validated: with -1 the attempt loop never ran, no request
 // was made and every name became "error (retries exhausted: )".
 func TestNegativeRetriesStillMakesARequest(t *testing.T) {
-	r, srv := checkWith(t, -1, freeHandler)
-	if srv.count("alice") != 1 || r.Status != StatusFree {
-		t.Errorf("retries=-1: %d requests, result %+v; want 1 request and free", srv.count("alice"), r)
+	line, srv := runOne(t, freeHandler, "-retries", "-1")
+	if srv.count("alice") != 1 || line != "@alice | free" {
+		t.Errorf("retries=-1: %d requests, line %q; want 1 request and free", srv.count("alice"), line)
 	}
 }
 
@@ -180,7 +185,6 @@ func TestHugeReadLimitFlagIsClamped(t *testing.T) {
 	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
 		fmt.Fprint(w, `<span class="tm-section-header-status tm-status-unavail">Sold</span>`)
 	})
-	defer func(old int) { readLimit = old }(readLimit)
 	dir := t.TempDir()
 	in := filepath.Join(dir, "names.txt")
 	out := filepath.Join(dir, "results.txt")
@@ -216,32 +220,45 @@ func TestExitCodeOnOutputWriteFailure(t *testing.T) {
 // (a days-old auction came back as "auction") and wrote it like a fresh
 // result, with nothing in the line saying it came from the cache.
 func TestStaleCacheOnlyForSoldAndTaken(t *testing.T) {
-	cache := newPageCache(t.TempDir(), time.Nanosecond, time.Nanosecond) // everything is stale at once
-	auction := []byte(cliPage("On auction", "avail", `<button class="js-place-bid-btn">Place bid</button>`))
-	sold := []byte(cliPage("Sold", "unavail", `<div>Purchased on 19 Nov 2022</div>`))
-	for name, body := range map[string][]byte{"oldauction": auction, "oldsold": sold} {
-		st, _, found, conf, ev := parseStatusInfo(body)
-		if !found {
-			t.Fatalf("fixture for %s did not parse", name)
-		}
-		cache.put(name, "https://fragment.com/username/"+name, st, conf, ev, body)
+	page := func(label, class, extra string) string {
+		return `<html><body><h2><span class="tm-section-header-status tm-status-` + class + `">` +
+			label + `</span></h2>` + extra + `</body></html>`
 	}
-	time.Sleep(time.Millisecond)
-
-	srv := httptest.NewServer(http.NotFoundHandler())
+	pages := map[string]string{
+		"oldauction": page("On auction", "avail", `<button class="js-place-bid-btn">Place bid</button>`),
+		"oldsold":    page("Sold", "unavail", `<div>Purchased on 19 Nov 2022</div>`),
+	}
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		fmt.Fprint(w, pages[name])
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	cacheDir := filepath.Join(dir, "cache")
+	if err := os.WriteFile(in, []byte("oldauction\noldsold\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Every entry is stale at once.
+	args := []string{"-input", in, "-output", out, "-cache-dir", cacheDir, "-quiet", "-workers", "1",
+		"-retries", "0", "-cache-ttl", "1ns", "-cache-sold-ttl", "1ns"}
+	if code := Main(append(args, "-base-url", srv.URL)); code != 0 {
+		t.Fatalf("first run (fills the cache) exit=%d", code)
+	}
 	srv.Close() // network down
-	old := fragmentURLTemplate
-	fragmentURLTemplate = srv.URL + "/username/%s"
-	defer func() { fragmentURLTemplate = old }()
-	client := newHTTPClient(httpConfig{maxConns: 1, timeout: time.Second})
-	cfg := checkConfig{retries: 0, retryDelay: time.Millisecond, cache: cache}
-
-	if r := checkOne(context.Background(), "oldauction", client, newStats(), cfg); r.Status != StatusError {
-		t.Errorf("stale auction with the network down = %+v, want an error", r)
+	time.Sleep(time.Millisecond)
+	Main(append(args, "-base-url", srv.URL))
+	raw, _ := os.ReadFile(out)
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if name, rest, ok := strings.Cut(line, " | "); ok {
+			got[name] = rest
+		}
 	}
-	r := checkOne(context.Background(), "oldsold", client, newStats(), cfg)
-	if r.Status != StatusSold || !strings.Contains(r.Error, "stale cache") {
-		t.Errorf("stale sold with the network down = %+v, want sold marked as stale cache", r)
+	if !strings.HasPrefix(got["@oldauction"], "error") {
+		t.Errorf("stale auction with the network down = %q, want an error", got["@oldauction"])
+	}
+	if s := got["@oldsold"]; !strings.HasPrefix(s, "sold") || !strings.Contains(s, "stale cache") {
+		t.Errorf("stale sold with the network down = %q, want sold marked as stale cache", s)
 	}
 }
 

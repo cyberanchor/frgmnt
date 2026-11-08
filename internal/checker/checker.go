@@ -80,6 +80,10 @@ type Result struct {
 	Evidence   string `json:"evidence,omitempty"`
 	Cached     bool   `json:"cached,omitempty"`
 	Stale      bool   `json:"stale,omitempty"`
+
+	// Offset is where the status marker starts in a page fetched from the
+	// network (0 otherwise); the console uses it to suggest a -readlimit.
+	Offset int `json:"offset,omitempty"`
 }
 
 // Config is the per-Checker tunables surface. Zero values get sensible
@@ -196,6 +200,8 @@ type Checker struct {
 	// blockUntil is a unix-nano deadline shared by all workers after a
 	// suspicious bare redirect to "/".
 	blockUntil atomic.Int64
+
+	log Logger // optional detail for the console's -debug and -trace
 }
 
 // New returns a Checker ready to Run. Pass DefaultConfig() and adjust as needed.
@@ -314,9 +320,11 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			}
 			if c.cache.fresh(st, ent.FetchedAt) {
 				atomic.AddInt64(&c.stats.cacheHits, 1)
+				c.debugf("cache hit: %s -> %s (confidence=%d; %s)", name, st, conf, ev)
 				return res
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
+			c.debugf("cache stale: %s -> %s; re-checking", name, st)
 			// Only settled verdicts are served after a network failure: a
 			// sold or taken name rarely changes, while an auction or a sale
 			// seen days ago is likely over.
@@ -355,6 +363,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 		// redirected to "/", the whole client is being limited and we must
 		// not report a false "reserved".
 		if c.probeHealthy(ctx) {
+			c.debugf("@%s: redirect to / persisted after %d attempts; probe healthy -> reserved", name, c.cfg.Retries+1)
 			lastRes.Evidence = fmt.Sprintf("redirect=/ after %d attempts; probe healthy -> reserved", c.cfg.Retries+1)
 			lastRes.Confidence = 60
 			return lastRes
@@ -364,6 +373,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			Evidence: "redirect=/; probe blocked"}
 	}
 	if stale != nil {
+		c.debugf("network failed (%s); serving stale cache for %s", lastErr, name)
 		res := *stale
 		res.Confidence = 30
 		res.Evidence = "stale-cache; " + res.Evidence
@@ -386,18 +396,13 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			if info.Reused {
-				atomic.AddInt64(&c.stats.connReuse, 1)
-			} else {
-				atomic.AddInt64(&c.stats.connNew, 1)
-			}
-		},
-	}))
+	start := time.Now()
+	ct, tr := c.clientTrace(name, start)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), ct))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
+		c.debugf("@%s REQUEST FAILED: %v (%.0fms)", name, err, ms(time.Since(start)))
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if ctx.Err() != nil {
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
@@ -410,23 +415,39 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 	defer drainBody(resp.Body)
 
 	var bodyReader io.Reader = resp.Body
-	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	switch ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); ce {
 	case "gzip":
 		gz, gzErr := gzip.NewReader(resp.Body)
 		if gzErr != nil {
+			c.debugf("@%s gzip error: %v", name, gzErr)
 			return Result{Username: name, Status: StatusError, Error: "gzip: " + gzErr.Error()}, false, gzErr.Error()
 		}
 		defer gz.Close()
 		bodyReader = gz
 	case "", "identity":
 		// no decompression needed
+	default:
+		// Accept-Encoding asks for gzip only. Read the raw bytes; the parser
+		// will most likely find no marker and report unknown.
+		c.debugf("@%s unexpected Content-Encoding: %q — reading raw", name, ce)
+	}
+
+	c.debugf("@%s HTTP %d | CE: %s | CT: %s | Server: %s | CF-Ray: %s", name, resp.StatusCode,
+		resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"),
+		resp.Header.Get("Server"), resp.Header.Get("Cf-Ray"))
+	if c.log.Tracef != nil {
+		for k, vals := range resp.Header {
+			c.tracef("@%s  header  %s: %s", name, k, strings.Join(vals, "; "))
+		}
 	}
 
 	switch resp.StatusCode {
 	case 301, 302, 303, 307, 308:
 		loc := resp.Header.Get("Location")
+		c.debugf("@%s REDIRECT -> %s", name, loc)
 		switch {
 		case strings.Contains(loc, "?query="):
+			tr.summary(StatusFree, 0)
 			return Result{Username: name, Status: StatusFree, Confidence: 95,
 				Evidence: "redirect=" + loc}, false, ""
 		case isReservedRedirect(loc):
@@ -437,16 +458,19 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 			return Result{Username: name, Status: StatusReserved, Confidence: 35,
 				Evidence: "redirect=/ (reserved or throttled)"}, true, "redirect to /"
 		default:
+			tr.summary(StatusUnknown, 0)
 			return Result{Username: name, Status: StatusUnknown, Confidence: 20,
 				Evidence: "unexpected redirect=" + loc}, false, ""
 		}
 
 	case 429:
 		atomic.AddInt64(&c.stats.rateLimit, 1)
-		wait := parseRetryAfter(resp.Header.Get("Retry-After"), c.cfg.RetryDelay)
+		ra := resp.Header.Get("Retry-After")
+		wait := parseRetryAfter(ra, c.cfg.RetryDelay)
 		if wait > c.cfg.RLWaitMax {
 			wait = c.cfg.RLWaitMax
 		}
+		c.warnf("@%s 429 Retry-After=%q sleeping=%v", name, ra, wait)
 		drainBody(resp.Body)
 		resp.Body.Close()
 		select {
@@ -472,12 +496,15 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 		if readErr != nil {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
+			tr.summary(StatusError, n)
 			return Result{Username: name, Status: StatusError, Error: readErr.Error()}, isRetriableNet(readErr), readErr.Error()
 		}
+		c.debugf("@%s body: %d bytes read (limit %d)", name, n, c.cfg.ReadLimit)
 		pi := ParseStatusDetailed(body)
 		if pi.Challenge {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
+			tr.summary(StatusError, n)
 			return Result{Username: name, Status: StatusError, Error: "cloudflare challenge",
 				Evidence: pi.Evidence}, true, "cloudflare challenge"
 		}
@@ -485,16 +512,33 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (Result, b
 			// Best-effort: never let a read-only cache directory fail a check.
 			_ = c.cache.put(name, reqURL, pi, body)
 		}
+		if !pi.Found {
+			c.debugf("@%s STATUS NOT FOUND in %d bytes (increase -readlimit)", name, n)
+			if c.log.Tracef != nil && n > 0 {
+				preview := string(body)
+				if len(preview) > 300 {
+					preview = preview[:300] + "…"
+				}
+				c.tracef("@%s body preview:\n%s", name, preview)
+			}
+		} else {
+			c.debugf("@%s parsed -> %s (confidence=%d; %s; offset: %d bytes, %.1f%% of readLimit)",
+				name, pi.Status, pi.Confidence, pi.Evidence, pi.Offset, float64(pi.Offset)/float64(c.cfg.ReadLimit)*100)
+		}
 		*bufPtr = buf
 		c.pool.Put(bufPtr)
 		if !pi.Found {
+			tr.summary(StatusUnknown, n)
 			return Result{Username: name, Status: StatusUnknown,
 				Confidence: pi.Confidence, Evidence: pi.Evidence}, false, ""
 		}
-		return Result{Username: name, Status: pi.Status,
+		tr.summary(pi.Status, n)
+		return Result{Username: name, Status: pi.Status, Offset: pi.Offset,
 			Confidence: pi.Confidence, Evidence: pi.Evidence}, false, ""
 
 	default:
+		c.debugf("@%s unexpected HTTP %d", name, resp.StatusCode)
+		tr.summary(StatusError, 0)
 		s := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		retryable := resp.StatusCode >= 500 && resp.StatusCode <= 599
 		return Result{Username: name, Status: StatusError, Error: s}, retryable, s

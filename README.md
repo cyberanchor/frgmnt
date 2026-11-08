@@ -224,9 +224,9 @@ make clean-cache  # drops .fragment_cache and data/pagecache
 ```
 cmd/frgmnt/          unified binary: check | web | version
 cmd/server/          web-only entry point (fragment_checker_web)
-internal/cli/        console checker: flags, worker pool, parser, page cache
+internal/cli/        console mode: flags, input, -resume, -filter, results file, summary
 internal/webapp/     web mode bootstrap and shutdown
-internal/checker/    web engine: HTTP, retries, cooldown, parser, page cache
+internal/checker/    the engine of both modes: HTTP, retries, cooldown, parser, page cache
 internal/worker/     worker tiles: lifecycle, input producer, result writer
 internal/server/     REST + SSE, request guard
 internal/store/      SQLite schema, migrations, settings.json
