@@ -1,0 +1,20 @@
+# Go
+/frgmnt
+/fragment_checker_web
+*.exe
+*.test
+*.out
+*.prof
+
+# Runtime data
+/data/
+*.db
+*.db-wal
+*.db-shm
+settings.json
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

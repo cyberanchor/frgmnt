@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: vet + test + build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.21.x", "1.22.x"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go${{ matrix.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go${{ matrix.go }}-
+
+      - name: Verify formatting
+        run: |
+          gofmt_out=$(gofmt -l .)
+          if [ -n "$gofmt_out" ]; then
+            echo "::error::gofmt would reformat:"
+            echo "$gofmt_out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race -count=1 ./...
+
+      - name: separate black-box unit suite
+        run: go test ./tests/... -v
+
+      - name: go build (release flags)
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+              -o frgmnt ./cmd/frgmnt
+          ./frgmnt version
+          ./frgmnt check -h >/dev/null 2>&1
+          ./frgmnt web -h >/dev/null 2>&1
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
+              -o fragment_checker_web ./cmd/server
+          ./fragment_checker_web -version

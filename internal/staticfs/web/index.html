@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fragment_checker · panel</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%237c5cff'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='18' font-weight='bold' text-anchor='middle' fill='white'%3Ef%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo">f</span>
+            <span class="title">fragment_checker</span>
+            <span class="ver" id="version-tag">web · v0.2</span>
+        </div>
+        <nav class="tabs">
+            <button class="tab active" data-tab="workers">Workers</button>
+            <button class="tab" data-tab="settings">Settings</button>
+            <button class="tab" data-tab="logs">Logs</button>
+            <button class="tab" data-tab="console">Debug Console</button>
+        </nav>
+        <div class="topbar-right">
+            <span class="health-dot" id="health-dot" title="Server health"></span>
+            <button class="icon-btn" id="theme-toggle" title="Toggle theme">
+                <span class="theme-icon-light">&#9728;</span>
+                <span class="theme-icon-dark">&#9789;</span>
+            </button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Workers tab -->
+        <section class="panel active" id="tab-workers">
+            <div class="panel-head">
+                <h2>Workers</h2>
+                <div class="actions">
+                    <button class="btn" id="bulk-start" title="Start every idle worker">▶ Start all</button>
+                    <button class="btn" id="bulk-stop" title="Stop every running worker">■ Stop all</button>
+                    <button class="btn primary" id="add-worker">+ New worker</button>
+                </div>
+            </div>
+            <div class="workers-grid" id="workers-grid">
+                <!-- worker tiles inserted here -->
+            </div>
+            <div class="empty-state hidden" id="workers-empty">
+                <h3>No workers yet</h3>
+                <p>Create your first worker to start checking usernames.</p>
+                <button class="btn primary" id="add-worker-empty">+ New worker</button>
+            </div>
+        </section>
+
+        <!-- Settings tab -->
+        <section class="panel" id="tab-settings">
+            <div class="panel-head">
+                <h2>Global settings</h2>
+                <div class="actions">
+                    <button class="btn" id="settings-reset">Reset</button>
+                    <button class="btn primary" id="settings-save">Save</button>
+                </div>
+            </div>
+            <div class="settings-grid">
+                <label class="field">
+                    <span class="field-label">Theme</span>
+                    <select id="set-theme">
+                        <option value="dark">Dark</option>
+                        <option value="light">Light</option>
+                    </select>
+                </label>
+                <label class="field">
+                    <span class="field-label">Log level</span>
+                    <select id="set-log-level">
+                        <option value="error">error</option>
+                        <option value="warn">warn</option>
+                        <option value="info">info</option>
+                        <option value="debug">debug</option>
+                        <option value="trace">trace</option>
+                    </select>
+                </label>
+                <label class="field">
+                    <span class="field-label">Default workers</span>
+                    <input type="number" id="set-default-workers" min="1" max="1000" />
+                </label>
+                <label class="field">
+                    <span class="field-label">Default rate (req/s, 0 = unlimited)</span>
+                    <input type="number" id="set-default-rate" min="0" max="100000" />
+                </label>
+                <label class="field">
+                    <span class="field-label">Default retries</span>
+                    <input type="number" id="set-default-retries" min="0" max="10" />
+                </label>
+                <label class="field">
+                    <span class="field-label">Default timeout (s)</span>
+                    <input type="number" id="set-default-timeout" min="1" max="120" />
+                </label>
+                <label class="field">
+                    <span class="field-label">UI history limit</span>
+                    <input type="number" id="set-history-limit" min="50" max="10000" />
+                </label>
+            </div>
+        </section>
+
+        <!-- Logs tab -->
+        <section class="panel" id="tab-logs">
+            <div class="panel-head">
+                <h2>Logs</h2>
+                <div class="actions">
+                    <select id="logs-topic-filter">
+                        <option value="">All topics</option>
+                    </select>
+                    <button class="btn" id="logs-clear">Clear view</button>
+                    <button class="btn" id="logs-pause">Pause</button>
+                </div>
+            </div>
+            <div class="logs-view" id="logs-view"></div>
+        </section>
+
+        <!-- Console tab -->
+        <section class="panel" id="tab-console">
+            <div class="panel-head">
+                <h2>Debug console</h2>
+                <div class="actions">
+                    <button class="btn" id="console-clear">Clear</button>
+                </div>
+            </div>
+            <div class="console-grid">
+                <div class="console-output" id="console-output"></div>
+                <form class="console-form" id="console-form">
+                    <input type="text" id="console-input" placeholder="GET /api/health  (try: GET /api/workers, PUT /api/settings {...})" autocomplete="off" />
+                    <button class="btn primary" type="submit">Send</button>
+                </form>
+                <details class="console-help">
+                    <summary>Commands</summary>
+                    <ul>
+                        <li><code>GET /api/health</code></li>
+                        <li><code>GET /api/workers</code></li>
+                        <li><code>GET /api/workers/&lt;id&gt;</code></li>
+                        <li><code>POST /api/workers {"name":"...","config":{...}}</code></li>
+                        <li><code>POST /api/workers/&lt;id&gt;/input {"text":"durov, pavel"}</code></li>
+                        <li><code>POST /api/workers/&lt;id&gt;/start</code></li>
+                        <li><code>POST /api/workers/&lt;id&gt;/stop</code></li>
+                        <li><code>DELETE /api/workers/&lt;id&gt;</code></li>
+                        <li><code>GET /api/settings</code> · <code>PUT /api/settings {...}</code></li>
+                        <li><code>GET /api/logs?limit=50&amp;topic=&lt;id&gt;</code></li>
+                    </ul>
+                </details>
+            </div>
+        </section>
+    </main>
+
+    <!-- Worker editor modal -->
+    <div class="modal" id="worker-modal" hidden>
+        <div class="modal-backdrop" data-close></div>
+        <div class="modal-body">
+            <header class="modal-head">
+                <h3 id="worker-modal-title">New worker</h3>
+                <button class="icon-btn" data-close>&times;</button>
+            </header>
+            <form id="worker-form" class="modal-form">
+                <input type="hidden" id="worker-form-id" />
+                <label class="field">
+                    <span class="field-label">Name</span>
+                    <input type="text" id="worker-name" required maxlength="60" placeholder="e.g. crawl-batch-1" />
+                </label>
+                <div class="row">
+                    <label class="field">
+                        <span class="field-label">Workers</span>
+                        <input type="number" id="worker-workers" min="1" max="1000" required />
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Max conns</span>
+                        <input type="number" id="worker-conns" min="1" max="64" required />
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Rate (req/s)</span>
+                        <input type="number" id="worker-rate" min="0" max="100000" />
+                    </label>
+                </div>
+                <div class="row">
+                    <label class="field">
+                        <span class="field-label">Retries</span>
+                        <input type="number" id="worker-retries" min="0" max="10" />
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Retry delay (ms)</span>
+                        <input type="number" id="worker-retry-delay" min="0" max="60000" />
+                    </label>
+                    <label class="field">
+                        <span class="field-label">Timeout (s)</span>
+                        <input type="number" id="worker-timeout" min="1" max="120" />
+                    </label>
+                </div>
+                <label class="field">
+                    <span class="field-label">User-Agent (optional)</span>
+                    <input type="text" id="worker-ua" placeholder="Mozilla/5.0 …" />
+                </label>
+                <footer class="modal-foot">
+                    <button type="button" class="btn" data-close>Cancel</button>
+                    <button type="submit" class="btn primary" id="worker-form-submit">Save</button>
+                </footer>
+            </form>
+        </div>
+    </div>
+
+    <!-- Worker details modal: input loader + results -->
+    <div class="modal" id="details-modal" hidden>
+        <div class="modal-backdrop" data-close></div>
+        <div class="modal-body wide">
+            <header class="modal-head">
+                <h3 id="details-title">Worker</h3>
+                <button class="icon-btn" data-close>&times;</button>
+            </header>
+            <div class="details-body">
+                <div class="details-left">
+                    <h4>Input</h4>
+                    <textarea id="details-textarea" rows="10" placeholder="Paste usernames here, one per line or separated by commas / spaces…"></textarea>
+                    <div class="row">
+                        <label class="btn upload">
+                            <input type="file" id="details-file" hidden accept=".txt,.csv,text/plain" />
+                            Upload file
+                        </label>
+                        <button class="btn primary" id="details-load-text">Load from text</button>
+                        <span class="muted" id="details-input-info"></span>
+                    </div>
+                </div>
+                <div class="details-right">
+                    <h4>Results <span id="details-counts" class="muted"></span></h4>
+                    <div class="filter-chips" id="details-filters">
+                        <button class="chip active" data-filter="all">all</button>
+                        <button class="chip free"      data-filter="free">free</button>
+                        <button class="chip taken"     data-filter="taken">taken</button>
+                        <button class="chip sold"      data-filter="sold">sold</button>
+                        <button class="chip reserved"  data-filter="reserved">reserved</button>
+                        <button class="chip auction"   data-filter="auction">auction</button>
+                        <button class="chip available" data-filter="available">available</button>
+                        <button class="chip error"     data-filter="error">error</button>
+                    </div>
+                    <div class="results-list" id="details-results"></div>
+                    <div class="row">
+                        <a class="btn" id="details-download" target="_blank">Download .txt</a>
+                        <button class="btn" id="details-clear">Clear results</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toasts" id="toasts"></div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

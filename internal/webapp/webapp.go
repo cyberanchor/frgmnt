@@ -1,0 +1,139 @@
+// Binary fragment_checker_web is a single-binary Fragment.com username
+// checker with an embedded web panel. It bundles a SQLite store, a small
+// REST API, Server-Sent Events for live progress, and a static frontend.
+//
+// Usage:
+//
+//	fragment_checker_web                                  # default: :8080, ./data
+//	fragment_checker_web -addr 127.0.0.1:9090 -data ./var
+//	fragment_checker_web -log-level debug
+//
+// All web traffic is plain HTTP and binds to 127.0.0.1 by default. Override
+// with -addr to expose it on a LAN interface — at your own risk.
+package webapp
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/logbus"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/server"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/staticfs"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/store"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/worker"
+)
+
+// version is the human-readable release tag.
+const Version = "0.3.0"
+
+// ProgName is used in logs and -version; the unified binary sets it to
+// "frgmnt web".
+var ProgName = "fragment_checker_web"
+
+func Main(args []string) int {
+	fs := flag.NewFlagSet(ProgName, flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	var (
+		addr         = fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
+		dataDir      = fs.String("data", "./data", "directory for SQLite DB and settings.json")
+		logLevel     = fs.String("log-level", "info", "log level: error, warn, info, debug, trace")
+		cacheDir     = fs.String("cache-dir", "", "page cache directory (default <data>/pagecache)")
+		cacheTTL     = fs.Duration("cache-ttl", 2*time.Minute, "TTL for volatile pages (auction/available)")
+		cacheSoldTTL = fs.Duration("cache-sold-ttl", 7*24*time.Hour, "TTL for sold/bought pages; negative = never expire")
+		noCache      = fs.Bool("no-cache", false, "disable the on-disk page cache")
+		showVer      = fs.Bool("version", false, "print version and exit")
+	)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if *showVer {
+		fmt.Println(ProgName, Version)
+		return 0
+	}
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	absData, err := filepath.Abs(*dataDir)
+	if err != nil {
+		log.Fatalf("resolve data dir: %v", err)
+	}
+
+	level := logbus.ParseLevel(*logLevel)
+	bus := logbus.New(2000, level)
+	defer bus.Close()
+
+	// Mirror every published entry to stdout so the operator can tail it.
+	go mirrorBusToStdout(bus)
+
+	st, err := store.Open(absData)
+	if err != nil {
+		log.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	// CLI -log-level wins at boot. The persisted setting only changes
+	// the level at runtime (via PUT /api/settings) so the operator can
+	// always recover a chatty/quiet boot regardless of stored state.
+
+	mgr := worker.New(st, bus)
+	mgr.ConfigureCache(*cacheDir, *cacheTTL, *cacheSoldTTL, *noCache)
+	if err := mgr.Load(context.Background()); err != nil {
+		log.Fatalf("load workers: %v", err)
+	}
+
+	staticSub, err := staticfs.Sub()
+	if err != nil {
+		log.Fatalf("embed sub-fs: %v", err)
+	}
+	srv := server.New(server.Options{
+		Addr:     *addr,
+		Manager:  mgr,
+		Store:    st,
+		Bus:      bus,
+		StaticFS: staticSub,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		s := <-sigCh
+		bus.Publish(logbus.LevelInfo, "", "received "+s.String()+", shutting down…")
+		mgr.CloseAll()
+		cancel()
+	}()
+
+	bus.Publish(logbus.LevelInfo, "", ProgName+" v"+Version+" | data="+absData+" | log="+bus.Level().String())
+	if err := srv.Run(ctx); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+	bus.Publish(logbus.LevelInfo, "", "server stopped cleanly")
+	return 0
+}
+
+// mirrorBusToStdout subscribes to every bus event and prints it to stderr
+// for operator visibility. The subscription is unbounded (no cancel) on
+// purpose — the bus is closed at shutdown which closes our channel.
+func mirrorBusToStdout(bus *logbus.Bus) {
+	ch, _ := bus.Subscribe("", 1024)
+	for e := range ch {
+		topic := ""
+		if e.Topic != "" {
+			topic = " [" + e.Topic[:min(8, len(e.Topic))] + "]"
+		}
+		fmt.Fprintf(os.Stderr, "%s %s%s %s\n",
+			e.Time.Format("15:04:05.000"), e.Level, topic, e.Message)
+	}
+}

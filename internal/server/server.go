@@ -1,0 +1,750 @@
+// Package server wires HTTP, REST, SSE, and the embedded UI together.
+// The router uses only the standard library and a small mux helper so the
+// dependency surface stays at one (modernc.org/sqlite).
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/logbus"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/store"
+	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/worker"
+)
+
+// Server is the assembled HTTP application.
+type Server struct {
+	addr     string
+	mgr      *worker.Manager
+	store    *store.Store
+	bus      *logbus.Bus
+	staticFS fs.FS
+	mux      *http.ServeMux
+}
+
+// Options bundles dependencies needed to assemble a Server.
+type Options struct {
+	Addr     string
+	Manager  *worker.Manager
+	Store    *store.Store
+	Bus      *logbus.Bus
+	StaticFS fs.FS // already rooted at the static files (no "web/" prefix)
+}
+
+// New assembles a Server but does NOT start listening.
+func New(opt Options) *Server {
+	s := &Server{
+		addr:     opt.Addr,
+		mgr:      opt.Manager,
+		store:    opt.Store,
+		bus:      opt.Bus,
+		staticFS: opt.StaticFS,
+		mux:      http.NewServeMux(),
+	}
+	s.routes()
+	return s
+}
+
+// Handler returns the underlying http.Handler (useful for tests).
+func (s *Server) Handler() http.Handler { return s.mux }
+
+// Run blocks until ctx is cancelled. It performs a graceful shutdown when
+// the context is done.
+func (s *Server) Run(ctx context.Context) error {
+	srv := &http.Server{
+		Addr:              s.addr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		// SSE responses are long-lived; do NOT set a write deadline.
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		s.bus.Publish(logbus.LevelInfo, "", "HTTP server listening on "+s.addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		return nil
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Routing
+// -----------------------------------------------------------------------------
+
+func (s *Server) routes() {
+	// API
+	s.mux.HandleFunc("/api/health", s.handleHealth)
+	s.mux.HandleFunc("/api/settings", s.handleSettings)
+	s.mux.HandleFunc("/api/workers", s.handleWorkersCollection)
+	s.mux.HandleFunc("/api/workers/", s.handleWorkerItem)
+	s.mux.HandleFunc("/api/workers-bulk/start", s.handleBulkStart)
+	s.mux.HandleFunc("/api/workers-bulk/stop", s.handleBulkStop)
+	s.mux.HandleFunc("/api/logs", s.handleLogs)
+	s.mux.HandleFunc("/api/logs/stream", s.handleLogStream)
+
+	// Static UI (embedded). The provided FS is already rooted at the
+	// asset directory; no fs.Sub here.
+	if s.staticFS != nil {
+		fileServer := http.FileServer(http.FS(s.staticFS))
+		s.mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
+		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			// fs.ReadFile (not http.ServeFileFS) keeps the module
+			// buildable on Go 1.21, which the README/CI still target.
+			data, err := fs.ReadFile(s.staticFS, "index.html")
+			if err != nil {
+				http.Error(w, "index.html not found", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			_, _ = w.Write(data)
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	if v != nil {
+		_ = json.NewEncoder(w).Encode(v)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+func readJSON(r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(nil, r.Body, 50<<20) // 50 MB cap
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+func methodNotAllowed(w http.ResponseWriter, allowed string) {
+	w.Header().Set("Allow", allowed)
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+}
+
+// -----------------------------------------------------------------------------
+// /api/health
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"time":      time.Now(),
+		"workers":   len(s.mgr.List()),
+		"log_level": s.bus.Level().String(),
+	})
+}
+
+// -----------------------------------------------------------------------------
+// /api/settings
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.GetSettings())
+	case http.MethodPut:
+		var v store.Settings
+		if err := readJSON(r, &v); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.store.PutSettings(v); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Apply the new log level live.
+		s.bus.SetLevel(logbus.ParseLevel(v.LogLevel))
+		s.bus.Publish(logbus.LevelInfo, "", "settings updated (log_level="+v.LogLevel+", theme="+v.Theme+")")
+		writeJSON(w, http.StatusOK, v)
+	default:
+		methodNotAllowed(w, "GET, PUT")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// /api/workers (collection)
+// -----------------------------------------------------------------------------
+
+type workerView struct {
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
+	Status    string         `json:"status"`
+	Config    checker.Config `json:"config"`
+	Total     int64          `json:"total"`
+	Stats     checker.Stats  `json:"stats"`
+	CreatedAt time.Time      `json:"created_at"`
+	StartedAt time.Time      `json:"started_at,omitempty"`
+}
+
+func toView(w *worker.Worker) workerView {
+	return workerView{
+		ID:        w.ID(),
+		Name:      w.Name(),
+		Status:    string(w.Status()),
+		Config:    w.Config(),
+		Total:     w.Total(),
+		Stats:     w.Stats(),
+		CreatedAt: w.CreatedAt(),
+		StartedAt: w.StartedAt(),
+	}
+}
+
+func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		items := s.mgr.List()
+		out := make([]workerView, 0, len(items))
+		for _, it := range items {
+			out = append(out, toView(it))
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var body struct {
+			Name   string         `json:"name"`
+			Config checker.Config `json:"config"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if strings.TrimSpace(body.Name) == "" {
+			writeError(w, http.StatusBadRequest, "name is required")
+			return
+		}
+		// Apply defaults onto zero fields.
+		body.Config = mergeConfig(body.Config, defaultConfigFromSettings(s.store.GetSettings()))
+		w2, err := s.mgr.Create(r.Context(), body.Name, body.Config)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, toView(w2))
+	default:
+		methodNotAllowed(w, "GET, POST")
+	}
+}
+
+func defaultConfigFromSettings(s store.Settings) checker.Config {
+	def := checker.DefaultConfig()
+	if s.DefaultWorkers > 0 {
+		def.Workers = s.DefaultWorkers
+	}
+	def.RateRPS = s.DefaultRateRPS
+	if s.DefaultRetries >= 0 {
+		def.Retries = s.DefaultRetries
+	}
+	if s.DefaultTimeout > 0 {
+		def.Timeout = time.Duration(s.DefaultTimeout) * time.Second
+	}
+	return def
+}
+
+func mergeConfig(in, def checker.Config) checker.Config {
+	if in.Workers <= 0 {
+		in.Workers = def.Workers
+	}
+	if in.MaxConns <= 0 {
+		in.MaxConns = def.MaxConns
+	}
+	if in.RetryDelay <= 0 {
+		in.RetryDelay = def.RetryDelay
+	}
+	if in.RLWaitMax <= 0 {
+		in.RLWaitMax = def.RLWaitMax
+	}
+	if in.Timeout <= 0 {
+		in.Timeout = def.Timeout
+	}
+	if in.ReadLimit <= 0 {
+		in.ReadLimit = def.ReadLimit
+	}
+	if in.UserAgent == "" {
+		in.UserAgent = def.UserAgent
+	}
+	return in
+}
+
+// -----------------------------------------------------------------------------
+// /api/workers/{id}/... (item + actions)
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleWorkerItem(w http.ResponseWriter, r *http.Request) {
+	// /api/workers/{id}[/action]
+	rest := strings.TrimPrefix(r.URL.Path, "/api/workers/")
+	if rest == "" {
+		writeError(w, http.StatusNotFound, "missing worker id")
+		return
+	}
+	parts := strings.SplitN(rest, "/", 2)
+	id := parts[0]
+	action := ""
+	if len(parts) == 2 {
+		action = parts[1]
+	}
+
+	switch action {
+	case "":
+		s.handleWorkerCRUD(w, r, id)
+	case "input":
+		s.handleWorkerInput(w, r, id)
+	case "input/upload":
+		s.handleWorkerInputUpload(w, r, id)
+	case "start":
+		s.handleWorkerStart(w, r, id)
+	case "stop":
+		s.handleWorkerStop(w, r, id)
+	case "clear":
+		s.handleWorkerClear(w, r, id)
+	case "results":
+		s.handleWorkerResults(w, r, id)
+	case "results/download":
+		s.handleWorkerResultsDownload(w, r, id)
+	case "events":
+		s.handleWorkerEvents(w, r, id)
+	default:
+		writeError(w, http.StatusNotFound, "unknown action: "+action)
+	}
+}
+
+func (s *Server) handleWorkerCRUD(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		w2, err := s.mgr.Get(id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, toView(w2))
+	case http.MethodPatch, http.MethodPut:
+		var body struct {
+			Name   string         `json:"name"`
+			Config checker.Config `json:"config"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		existing, err := s.mgr.Get(id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if body.Name == "" {
+			body.Name = existing.Name()
+		}
+		body.Config = mergeConfig(body.Config, existing.Config())
+		w2, err := s.mgr.Update(r.Context(), id, body.Name, body.Config)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, toView(w2))
+	case http.MethodDelete:
+		if err := s.mgr.Delete(r.Context(), id); err != nil {
+			if errors.Is(err, worker.ErrNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		methodNotAllowed(w, "GET, PATCH, DELETE")
+	}
+}
+
+func (s *Server) handleWorkerInput(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var body struct {
+		Text string `json:"text"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	names, rejected := checker.ParseNames(body.Text)
+	n, err := s.mgr.SetInput(r.Context(), id, names)
+	if err != nil {
+		if errors.Is(err, worker.ErrWorkerBusy) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": n,
+		"rejected": rejected,
+	})
+}
+
+func (s *Server) handleWorkerInputUpload(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB cap
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		writeError(w, http.StatusBadRequest, "parse multipart: "+err.Error())
+		return
+	}
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "missing file: "+err.Error())
+		return
+	}
+	defer file.Close()
+	names, rejected, err := checker.ParseNamesReader(file)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "parse file: "+err.Error())
+		return
+	}
+	n, err := s.mgr.SetInput(r.Context(), id, names)
+	if err != nil {
+		if errors.Is(err, worker.ErrWorkerBusy) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accepted": n,
+		"rejected": rejected,
+	})
+}
+
+func (s *Server) handleWorkerStart(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	resume := r.URL.Query().Get("resume") == "true" || r.URL.Query().Get("resume") == "1"
+	if err := s.mgr.Start(r.Context(), id, worker.StartOptions{Resume: resume}); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, worker.ErrNotFound) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, worker.ErrNotReady) || errors.Is(err, worker.ErrWorkerBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	w2, _ := s.mgr.Get(id)
+	writeJSON(w, http.StatusOK, toView(w2))
+}
+
+func (s *Server) handleBulkStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	resume := r.URL.Query().Get("resume") == "true" || r.URL.Query().Get("resume") == "1"
+	started := 0
+	skipped := 0
+	for _, item := range s.mgr.List() {
+		status := item.Status()
+		if status != "ready" && status != "done" && status != "error" {
+			skipped++
+			continue
+		}
+		if err := s.mgr.Start(r.Context(), item.ID(), worker.StartOptions{Resume: resume}); err != nil {
+			skipped++
+			continue
+		}
+		started++
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"started": started, "skipped": skipped})
+}
+
+func (s *Server) handleBulkStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	stopped := 0
+	for _, item := range s.mgr.List() {
+		if item.Status() != "running" {
+			continue
+		}
+		if err := s.mgr.Stop(item.ID()); err == nil {
+			stopped++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"stopped": stopped})
+}
+
+func (s *Server) handleWorkerStop(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	if err := s.mgr.Stop(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w2, _ := s.mgr.Get(id)
+	writeJSON(w, http.StatusOK, toView(w2))
+}
+
+func (s *Server) handleWorkerClear(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	if err := s.mgr.ClearResults(r.Context(), id); err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, worker.ErrWorkerBusy) {
+			status = http.StatusConflict
+		} else if errors.Is(err, worker.ErrNotFound) {
+			status = http.StatusNotFound
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleWorkerResults(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 200
+	}
+	rs, err := s.store.ListResults(r.Context(), id, after, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	counts, _ := s.store.CountByStatus(r.Context(), id)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"results": rs,
+		"counts":  counts,
+	})
+}
+
+func (s *Server) handleWorkerResultsDownload(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	w2, err := s.mgr.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s-results.txt"`, safeFilename(w2.Name())))
+	const batch = 1000
+	var after int64
+	for {
+		rs, err := s.store.ListResults(r.Context(), id, after, batch)
+		if err != nil {
+			fmt.Fprintf(w, "# error: %v\n", err)
+			return
+		}
+		if len(rs) == 0 {
+			return
+		}
+		for _, row := range rs {
+			if row.Error != "" {
+				fmt.Fprintf(w, "@%s | %s (%s)\n", row.Username, row.Status, row.Error)
+			} else {
+				fmt.Fprintf(w, "@%s | %s\n", row.Username, row.Status)
+			}
+			if row.ID > after {
+				after = row.ID
+			}
+		}
+	}
+}
+
+func safeFilename(s string) string {
+	out := make([]rune, 0, len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_':
+			out = append(out, r)
+		case r == ' ':
+			out = append(out, '_')
+		}
+	}
+	if len(out) == 0 {
+		return "worker"
+	}
+	return string(out)
+}
+
+// -----------------------------------------------------------------------------
+// SSE: per-worker events
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleWorkerEvents(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	if _, err := s.mgr.Get(id); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	events, cancel := s.bus.Subscribe(id, 256)
+	defer cancel()
+
+	// Send a hello so EventSource fires `open`.
+	fmt.Fprintf(w, "event: hello\ndata: {\"worker_id\":\"%s\"}\n\n", id)
+	flusher.Flush()
+
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+	pollTicker := time.NewTicker(1 * time.Second)
+	defer pollTicker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e, ok := <-events:
+			if !ok {
+				return
+			}
+			payload, _ := json.Marshal(e)
+			fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload)
+			flusher.Flush()
+		case <-pollTicker.C:
+			// Periodic stats push so the UI tile is always up-to-date even
+			// when no log events are flowing (e.g. between batches).
+			if w2, err := s.mgr.Get(id); err == nil {
+				stats := w2.Stats()
+				payload, _ := json.Marshal(map[string]any{
+					"status": string(w2.Status()),
+					"total":  w2.Total(),
+					"stats":  stats,
+				})
+				fmt.Fprintf(w, "event: stats\ndata: %s\n\n", payload)
+				flusher.Flush()
+			}
+		case <-keepalive.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// /api/logs and /api/logs/stream
+// -----------------------------------------------------------------------------
+
+func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		limit = 200
+	}
+	topic := r.URL.Query().Get("topic")
+	entries := s.bus.Recent(limit, topic)
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) handleLogStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, "GET")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	topic := r.URL.Query().Get("topic")
+	events, cancel := s.bus.Subscribe(topic, 256)
+	defer cancel()
+
+	fmt.Fprintf(w, "event: hello\ndata: {}\n\n")
+	flusher.Flush()
+
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e, ok := <-events:
+			if !ok {
+				return
+			}
+			payload, _ := json.Marshal(e)
+			fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload)
+			flusher.Flush()
+		case <-keepalive.C:
+			fmt.Fprintf(w, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
