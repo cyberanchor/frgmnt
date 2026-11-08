@@ -4,9 +4,11 @@ package checker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -111,5 +113,41 @@ func TestWaitBlockHonoursExtendedCooldown(t *testing.T) {
 	c.triggerBlock() // another worker saw "302 /": deadline = start + ~310ms
 	if got := <-done; got < 250*time.Millisecond {
 		t.Errorf("waitBlock returned after %v, but the shared cooldown was extended to ~310ms", got.Round(time.Millisecond))
+	}
+}
+
+// README: "A stale sold/taken entry is used as a fallback when the network
+// fails." The code served any stale status, so a three-day-old auction (or
+// "for sale") came back as the current answer when Fragment was unreachable.
+func TestStaleAuctionNotUsedAsFallback(t *testing.T) {
+	srv := withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<h2><span class="tm-section-header-status tm-status-avail">On auction</span></h2>`+
+			`<time class="tm-countdown-timer">2 days</time><button class="js-place-bid-btn">Place bid</button>`)
+	})
+	c := New(Config{CacheDir: t.TempDir(), Retries: 0, RetryDelay: time.Millisecond, Timeout: time.Second})
+	defer c.Close()
+	if r := c.CheckOne(context.Background(), "oldauction"); r.Status != StatusAuction {
+		t.Fatalf("first check = %+v", r)
+	}
+	// Age the entry by three days.
+	_, meta := c.cache.paths("oldauction")
+	raw, err := os.ReadFile(meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ent cacheEntry
+	if err := json.Unmarshal(raw, &ent); err != nil {
+		t.Fatal(err)
+	}
+	ent.FetchedAt = time.Now().Add(-72 * time.Hour)
+	raw, _ = json.Marshal(ent)
+	if err := os.WriteFile(meta, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.Close() // network down
+	r := c.CheckOne(context.Background(), "oldauction")
+	if r.Status != StatusError || r.Stale {
+		t.Errorf("3-day-old auction served as %q (stale=%v, err=%q), want an error", r.Status, r.Stale, r.Error)
 	}
 }

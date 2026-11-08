@@ -316,8 +316,13 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 				return res
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
-			res.Stale = true
-			stale = &res
+			// Only settled verdicts are served after a network failure: a
+			// sold or taken name rarely changes, while an auction or a sale
+			// seen days ago is likely over.
+			if st == StatusSold || st == StatusTaken {
+				res.Stale = true
+				stale = &res
+			}
 		} else {
 			atomic.AddInt64(&c.stats.cacheMisses, 1)
 		}
