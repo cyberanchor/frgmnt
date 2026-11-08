@@ -205,7 +205,9 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
+	// Let the run save its last batch before the rows go away.
 	w.stop()
+	w.wait(stopTimeout)
 	if err := m.store.DeleteWorker(ctx, id); err != nil {
 		return err
 	}
@@ -264,15 +266,20 @@ func (m *Manager) Start(ctx context.Context, id string, opt StartOptions) error 
 	// Use a context derived from the manager-level background context,
 	// not the request context, so the worker survives request completion.
 	wCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	now := time.Now()
 	w.mu.Lock()
 	w.cancel = cancel
+	w.done = done
 	w.startedAt = now
 	w.resume = opt.Resume
 	w.mu.Unlock()
 	_ = m.store.SetWorkerStartedAt(context.Background(), w.id, now)
 
-	go m.run(wCtx, w)
+	go func() {
+		defer close(done)
+		m.run(wCtx, w)
+	}()
 	return nil
 }
 
@@ -302,12 +309,29 @@ func (m *Manager) ClearResults(ctx context.Context, id string) error {
 	return nil
 }
 
-// CloseAll cancels every worker and is invoked on graceful shutdown.
+// stopTimeout bounds how long Delete and CloseAll wait for a cancelled run
+// to save its last results.
+const stopTimeout = 10 * time.Second
+
+// CloseAll cancels every worker and waits for the runs to save their last
+// results. It is invoked on graceful shutdown, before the database is
+// closed: returning right after the cancel let the caller close the
+// database under the result writer, and the tail of every run was lost.
 func (m *Manager) CloseAll() {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	ws := make([]*Worker, 0, len(m.workers))
 	for _, w := range m.workers {
+		ws = append(ws, w)
+	}
+	m.mu.RUnlock()
+	for _, w := range ws {
 		w.stop()
+	}
+	deadline := time.Now().Add(stopTimeout)
+	for _, w := range ws {
+		if !w.wait(time.Until(deadline)) {
+			m.bus.Publish(logbus.LevelWarn, w.id, "shutdown: the run did not finish in time")
+		}
 	}
 }
 
@@ -330,6 +354,7 @@ type Worker struct {
 	startedAt time.Time
 	resume    bool // set by Start; consumed by run
 	cancel    context.CancelFunc
+	done      chan struct{}    // closed when the current run returns; nil before the first Start
 	chk       *checker.Checker // non-nil while running
 	lastStats checker.Stats    // cached snapshot from the most recent run
 
@@ -399,6 +424,33 @@ func (w *Worker) stop() {
 	cancel := w.cancel
 	w.mu.RUnlock()
 	cancel()
+}
+
+// wait blocks until the current run (if any) has returned, at most d.
+// It reports whether the run is over.
+func (w *Worker) wait(d time.Duration) bool {
+	w.mu.RLock()
+	done := w.done
+	w.mu.RUnlock()
+	if done == nil {
+		return true
+	}
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	if d <= 0 {
+		return false
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 func (w *Worker) setStatus(s Status) {

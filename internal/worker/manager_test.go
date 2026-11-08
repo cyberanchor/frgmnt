@@ -319,3 +319,97 @@ func TestStartStopConcurrentNoRace(t *testing.T) {
 	_ = h.m.Stop(w.ID())
 	waitNotRunning(w, 10*time.Second)
 }
+
+// On SIGINT/SIGTERM the web mode calls CloseAll and then closes the
+// database. CloseAll only cancelled the runs and returned at once, so the
+// result writer's last flush hit a closed database ("persist: sql: database
+// is closed") and the last results of every run were lost.
+func TestCloseAllWaitsForRunningWorkers(t *testing.T) {
+	newFakeFragment(t, 100*time.Millisecond)
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := logbus.New(1000, logbus.LevelInfo)
+	var errs atomic.Int64
+	var lastErr atomic.Value
+	ch, unsubscribe := bus.Subscribe("", 1024)
+	defer unsubscribe()
+	go func() {
+		for e := range ch {
+			if e.Level == "ERROR" {
+				errs.Add(1)
+				lastErr.Store(e.Message)
+			}
+		}
+	}()
+	m := New(st, bus)
+	m.ConfigureCache("", 0, 0, true)
+	ctx := context.Background()
+	w, err := m.Create(ctx, "shutdown", testConfig(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetInput(ctx, w.ID(), testNames(400)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1200 * time.Millisecond)
+
+	m.CloseAll()
+	stillRunning := w.Status() == StatusRunning
+	verdicts := w.Stats().Checked
+	_ = st.Close()                     // the deferred Close in webapp.Main
+	time.Sleep(300 * time.Millisecond) // a late writer would fail now
+	waitNotRunning(w, 10*time.Second)
+
+	st2, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	checked, rows := persistedCounts(t, st2, w.ID())
+	last, _ := lastErr.Load().(string)
+	t.Logf("CloseAll: running=%v, %d verdicts, %d rows saved, %d flags, %d ERROR events (last %q)",
+		stillRunning, verdicts, rows, checked, errs.Load(), last)
+	if stillRunning {
+		t.Error("CloseAll returned while the worker was still running")
+	}
+	if rows != verdicts || checked != rows {
+		t.Errorf("%d verdicts, but %d rows and %d flags saved", verdicts, rows, checked)
+	}
+	if errs.Load() > 0 {
+		t.Errorf("%d ERROR events during shutdown (last %q)", errs.Load(), last)
+	}
+}
+
+// Delete removed the rows while the cancelled run was still writing.
+func TestDeleteWaitsForTheRun(t *testing.T) {
+	newFakeFragment(t, 100*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "doomed", testConfig(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(400)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(700 * time.Millisecond)
+	if err := h.m.Delete(ctx, w.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if w.Status() == StatusRunning {
+		t.Error("Delete returned while the run was still going")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if h.errs.Load() > 0 {
+		t.Errorf("ERROR events after Delete: %d (last %q)", h.errs.Load(), h.lastError())
+	}
+}

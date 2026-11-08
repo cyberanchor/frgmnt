@@ -110,7 +110,11 @@ func Main(args []string) int {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		s := <-sigCh
+		// A second Ctrl+C quits at once instead of being ignored.
+		signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 		bus.Publish(logbus.LevelInfo, "", "received "+s.String()+", shutting down…")
+		// CloseAll waits until every run has saved its last results, so
+		// the deferred st.Close() cannot cut them off.
 		mgr.CloseAll()
 		cancel()
 	}()
