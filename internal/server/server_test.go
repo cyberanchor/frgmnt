@@ -167,6 +167,14 @@ func TestRejectsOutOfRangeConfig(t *testing.T) {
 		`{"rate_rps":4611686018427387904}`,
 		`{"workers":100000000}`,
 		`{"retries":-1}`,
+		// Negative values were silently replaced by the defaults
+		// (workers -1 became 50) instead of being rejected.
+		`{"workers":-1}`,
+		`{"max_conns":-3}`,
+		`{"read_limit":-1}`,
+		`{"timeout_ns":-1}`,
+		`{"retry_delay_ns":-1}`,
+		`{"timeout_ns":3600000000000}`,
 	}
 	for _, cfg := range bad {
 		rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w","config":`+cfg+`}`, nil)
@@ -428,5 +436,18 @@ func TestSettingsRejectsOutOfRange(t *testing.T) {
 	}
 	if rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w2"}`, nil); rec.Code != http.StatusCreated {
 		t.Errorf("POST /api/workers with default_rate_rps -5 in settings.json: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 0 still means "use the default".
+func TestZeroConfigValuesUseDefaults(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w","config":{"workers":0,"timeout_ns":0}}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	cfg := decodeView(t, rec).Config
+	if def := checker.DefaultConfig(); cfg.Workers != def.Workers || cfg.Timeout != def.Timeout {
+		t.Errorf("workers=0 timeout=0 became %d / %v, want the defaults %d / %v", cfg.Workers, cfg.Timeout, def.Workers, def.Timeout)
 	}
 }

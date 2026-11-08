@@ -183,7 +183,9 @@ another address only on a network you trust.
 
 Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
 `max_conns` up to 1000, `rate_rps` up to 1000, `retries` up to 10,
-`read_limit` up to 1 MiB; anything else is answered with 400.
+`read_limit` up to 1 MiB, `retry_delay_ns` up to 1 minute, `timeout_ns`,
+`rl_wait_max_ns` and `block_cooldown_ns` up to 10 minutes. 0 or a missing
+field means the default; a negative or too large value is answered with 400.
 
 ```bash
 curl -s -X POST localhost:8080/api/workers -d '{"name":"w1","config":{"workers":100,"retries":1}}'

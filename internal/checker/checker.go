@@ -136,9 +136,17 @@ const (
 )
 
 // Validate reports values that are out of range. Zero means "use the
-// default" for the counts, so only negative and too large values fail.
+// default" for the counts and durations, so only negative and too large
+// values fail. The cache TTLs are not checked: a negative one has a
+// meaning (do not cache / never expire).
 func (c Config) Validate() error {
 	check := func(name string, v, max int) error {
+		if v < 0 || v > max {
+			return fmt.Errorf("%s must be between 0 and %d, got %d", name, max, v)
+		}
+		return nil
+	}
+	checkDur := func(name string, v, max time.Duration) error {
 		if v < 0 || v > max {
 			return fmt.Errorf("%s must be between 0 and %d, got %d", name, max, v)
 		}
@@ -150,6 +158,10 @@ func (c Config) Validate() error {
 		check("rate_rps", c.RateRPS, MaxRateRPS),
 		check("retries", c.Retries, MaxRetries),
 		check("read_limit", c.ReadLimit, MaxReadLimit),
+		checkDur("retry_delay_ns", c.RetryDelay, time.Minute),
+		checkDur("rl_wait_max_ns", c.RLWaitMax, 10*time.Minute),
+		checkDur("timeout_ns", c.Timeout, 10*time.Minute),
+		checkDur("block_cooldown_ns", c.BlockCooldown, 10*time.Minute),
 	} {
 		if err != nil {
 			return err

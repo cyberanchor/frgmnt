@@ -364,12 +364,13 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
-		// Zero counts and durations fall back to the defaults too.
-		body.Config = mergeConfig(body.Config, def)
+		// Check before the defaults fill in the zeros: mergeConfig used to
+		// turn a negative value (workers: -1) into the default silently.
 		if err := body.Config.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		body.Config = mergeConfig(body.Config, def)
 		w2, err := s.mgr.Create(r.Context(), body.Name, body.Config)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -401,23 +402,25 @@ func defaultConfigFromSettings(s store.Settings) checker.Config {
 	return def
 }
 
+// mergeConfig fills the fields that are zero ("not set") from def. The
+// caller has rejected negative values with Validate first.
 func mergeConfig(in, def checker.Config) checker.Config {
-	if in.Workers <= 0 {
+	if in.Workers == 0 {
 		in.Workers = def.Workers
 	}
-	if in.MaxConns <= 0 {
+	if in.MaxConns == 0 {
 		in.MaxConns = def.MaxConns
 	}
-	if in.RetryDelay <= 0 {
+	if in.RetryDelay == 0 {
 		in.RetryDelay = def.RetryDelay
 	}
-	if in.RLWaitMax <= 0 {
+	if in.RLWaitMax == 0 {
 		in.RLWaitMax = def.RLWaitMax
 	}
-	if in.Timeout <= 0 {
+	if in.Timeout == 0 {
 		in.Timeout = def.Timeout
 	}
-	if in.ReadLimit <= 0 {
+	if in.ReadLimit == 0 {
 		in.ReadLimit = def.ReadLimit
 	}
 	if in.UserAgent == "" {
@@ -497,11 +500,11 @@ func (s *Server) handleWorkerCRUD(w http.ResponseWriter, r *http.Request, id str
 		if strings.TrimSpace(body.Name) == "" {
 			body.Name = existing.Name()
 		}
-		body.Config = mergeConfig(body.Config, existing.Config())
 		if err := body.Config.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		body.Config = mergeConfig(body.Config, existing.Config())
 		w2, err := s.mgr.Update(r.Context(), id, body.Name, body.Config)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
