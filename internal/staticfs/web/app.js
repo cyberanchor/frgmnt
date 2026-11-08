@@ -19,6 +19,10 @@ const STAT_LABEL = {
     free: "Free", reserved: "Reserved", auction: "Auction", available: "Avail",
     taken: "Taken", sold: "Sold", unknown: "Unknown", errors: "Errors",
 };
+// "free" only means that Fragment has no page for the name; a regular
+// account may hold it (@telegram comes back free).
+const FREE_HINT = "Not on Fragment: no page, not a collectible, not for sale. " +
+    "A regular Telegram account may still hold the name.";
 
 function escapeHTML(s) {
     return String(s ?? "")
@@ -241,7 +245,7 @@ function buildTile(w) {
         </div>
         <div class="tile-stats">
             ${TILE_STAT_KEYS.map(k => `
-                <div class="stat ${k}">
+                <div class="stat ${k}"${k === "free" ? ` title="${FREE_HINT}"` : ""}>
                     <div class="stat-n" data-k="${k}">0</div>
                     <div class="stat-l">${STAT_LABEL[k]}</div>
                 </div>

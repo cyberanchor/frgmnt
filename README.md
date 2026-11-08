@@ -48,14 +48,22 @@ Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
 
 | Status       | Meaning                                                  | Signal on the page                     |
 | ------------ | -------------------------------------------------------- | -------------------------------------- |
-| 🟢 free      | Nobody owns it, it can be claimed                        | redirect to `/?query=<name>`           |
+| 🟢 free      | Not on Fragment: no page, not a collectible, not for sale. A regular account may still hold it (see below) | redirect to `/?query=<name>` |
 | 🟣 reserved  | Reserved by Fragment (a bare `302 /` that survives retries and a healthy probe) | redirect to `/`  |
 | 🟡 auction   | Live auction                                             | `On auction`, `js-place-bid-btn`, timer |
 | 🔵 available | Fixed-price sale                                         | `For sale`, `js-buy-now-btn`           |
-| ⚪ taken     | Bound to an account, offers only                         | `Taken`, `js-make-offer-btn`           |
+| ⚪ taken     | A collectible bound to an account, offers only           | `Taken`, `js-make-offer-btn`           |
 | ⚫ sold      | Bought on Fragment                                       | `Sold`, `Purchased on`                 |
 | ❔ unknown   | The page matched no known layout                         |                                        |
 | ❌ error     | Network or HTTP error, Cloudflare challenge, throttling, or a name that cannot exist |                  |
+
+The statuses describe Fragment, not Telegram. Fragment only has pages for
+the names of its own market (auctions, sales, sold and bound collectibles)
+and redirects every other name to its search, which is what `free` reports.
+Whether a regular account holds such a name cannot be seen on Fragment: in
+a live check on 2026-11-08 `@telegram`, the official channel, came back
+`free`, and Fragment's search showed "Unavailable · Not for sale" for it and
+for a random never-used name alike.
 
 The parser trusts the visible status label first (`On auction`, `For sale`,
 `Sold`, `Taken`), then the JS hooks and "Purchased on", and only then the
@@ -80,7 +88,7 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
 - **Impossible names**: Telegram usernames have 4–32 characters from `a-z`,
   `0-9` and `_`, start with a letter and do not end with `_` (5 is the minimum
   for regular names, 4-character ones are Fragment collectibles). Fragment
-  redirects any other name to `/?query=` like a free one, so such names are
+  redirects any name it has no page for to `/?query=` (a `free`), so such names are
   never sent: the console writes `error (invalid: ...)`, the web panel counts
   them as rejected when the list is loaded.
 - **Listings lag**: search pages can still show a name that was delisted. The

@@ -125,7 +125,7 @@ func warnf(format string, args ...any) {
 type Status = checker.Status
 
 const (
-	StatusFree      = checker.StatusFree      // 302 -> /?query=NAME (username is free on Fragment)
+	StatusFree      = checker.StatusFree      // 302 -> /?query=NAME: Fragment has no page; a regular account may hold it
 	StatusReserved  = checker.StatusReserved  // 302 -> / that persists while a probe name is fine
 	StatusAuction   = checker.StatusAuction   // listed on an active auction
 	StatusTaken     = checker.StatusTaken     // already owned (Telegram-side)
@@ -879,6 +879,9 @@ func printUsage(fs *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -resume -append\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  cat names.txt | %s -input - -output results.txt -no-dedup\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -debug -workers 200 -rate 1000\n", ProgName)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "Statuses describe Fragment, not Telegram: \"free\" means Fragment has no page")
+	fmt.Fprintln(os.Stderr, "for the name (not a collectible, not for sale); a regular account may still hold it.")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Flags:")
 	fs.PrintDefaults()
