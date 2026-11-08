@@ -17,7 +17,6 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptrace"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -656,18 +655,40 @@ func (c *Checker) challengeResult(name string, code int, tr *requestTrace) (Resu
 // Helpers (exported where useful for callers and tests)
 // -----------------------------------------------------------------------------
 
-// usernameRe matches Fragment-style usernames: lowercase ASCII letters,
-// digits and underscore, length 1..64.
-var usernameRe = regexp.MustCompile(`^[a-z0-9_]{1,64}$`)
+// Telegram username rules: 4 to 32 characters from a-z, 0-9 and "_",
+// starting with a letter and not ending with "_". Regular usernames need 5
+// characters; the 4-character ones are Fragment collectibles. Anything
+// else cannot exist, and Fragment answers it like a free name (a redirect
+// to /?query=), so it used to come back as a false "free".
+const (
+	MinUsernameLen = 4
+	MaxUsernameLen = 32
+)
 
-// ValidateUsername rejects empty/invalid inputs. The caller has already
-// stripped a leading "@" and lower-cased the value.
+// ValidateUsername rejects names that cannot be Telegram usernames. The
+// caller has already stripped a leading "@" and lower-cased the value.
 func ValidateUsername(name string) error {
-	if name == "" {
+	switch {
+	case name == "":
 		return errors.New("empty")
+	case len(name) < MinUsernameLen:
+		return fmt.Errorf("shorter than %d characters", MinUsernameLen)
+	case len(name) > MaxUsernameLen:
+		return fmt.Errorf("longer than %d characters", MaxUsernameLen)
 	}
-	if !usernameRe.MatchString(name) {
-		return errors.New("invalid characters or length")
+	for i := 0; i < len(name); i++ {
+		switch ch := name[i]; {
+		case ch >= 'a' && ch <= 'z':
+		case ch >= '0' && ch <= '9', ch == '_':
+			if i == 0 {
+				return errors.New("must start with a letter")
+			}
+		default:
+			return errors.New("only a-z, 0-9 and _ are allowed")
+		}
+	}
+	if name[len(name)-1] == '_' {
+		return errors.New("must not end with _")
 	}
 	return nil
 }

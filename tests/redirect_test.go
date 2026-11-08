@@ -93,7 +93,7 @@ func TestThrottledClientBecomesError(t *testing.T) {
 	defer srv.Close()
 	useFragmentServer(t, srv)
 
-	res := testChecker(t, checker.Config{}).CheckOne(context.Background(), "tg")
+	res := testChecker(t, checker.Config{}).CheckOne(context.Background(), "tgname")
 	if res.Status != checker.StatusError {
 		t.Fatalf("status = %q, want error (throttled)", res.Status)
 	}
@@ -120,7 +120,7 @@ func TestGenuineReservedWithHealthyProbe(t *testing.T) {
 	defer srv.Close()
 	useFragmentServer(t, srv)
 
-	res := testChecker(t, checker.Config{}).CheckOne(context.Background(), "tg")
+	res := testChecker(t, checker.Config{}).CheckOne(context.Background(), "tgname")
 	if res.Status != checker.StatusReserved {
 		t.Fatalf("status = %q, want reserved (%s)", res.Status, res.Evidence)
 	}

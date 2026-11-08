@@ -54,7 +54,7 @@ Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
 | ⚪ taken     | Bound to an account, offers only                         | `Taken`, `js-make-offer-btn`           |
 | ⚫ sold      | Bought on Fragment                                       | `Sold`, `Purchased on`                 |
 | ❔ unknown   | The page matched no known layout                         |                                        |
-| ❌ error     | Network, HTTP or validation error, Cloudflare challenge, throttling |                             |
+| ❌ error     | Network or HTTP error, Cloudflare challenge, throttling, or a name that cannot exist |                  |
 
 The parser trusts the visible status label first (`On auction`, `For sale`,
 `Sold`, `Taken`), then the JS hooks and "Purchased on", and only then the
@@ -74,6 +74,12 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
   blocking this IP: the run stops instead of burning through the list. The
   console exits with code 3, a web worker ends with status `error`, and the
   names without a verdict stay for `-resume` / Resume.
+- **Impossible names**: Telegram usernames have 4–32 characters from `a-z`,
+  `0-9` and `_`, start with a letter and do not end with `_` (5 is the minimum
+  for regular names, 4-character ones are Fragment collectibles). Fragment
+  redirects any other name to `/?query=` like a free one, so such names are
+  never sent: the console writes `error (invalid: ...)`, the web panel counts
+  them as rejected when the list is loaded.
 - **Listings lag**: search pages can still show a name that was delisted. The
   username page is the source of truth.
 

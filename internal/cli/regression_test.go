@@ -386,3 +386,37 @@ func TestSameInputAndOutputRefused(t *testing.T) {
 		}
 	}
 }
+
+// Names that cannot be Telegram usernames ("ab", "1abcde", 40 letters)
+// passed the old 1-64 character check and were sent to Fragment, which
+// redirects them to /?query= like a free name: the results file said
+// "free" for all of them. Now they get an "invalid" error and no request.
+func TestImpossibleNamesAreNotReportedFree(t *testing.T) {
+	srv := newHitServer(t, freeHandler)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	bad := []string{"ab", "abc", "1abcde", "_abcde", "abcde_", strings.Repeat("a", 40)}
+	if err := os.WriteFile(in, []byte(strings.Join(append(bad, "kyqb"), "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	Main([]string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "2"})
+	raw, _ := os.ReadFile(out)
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if name, rest, ok := strings.Cut(line, " | "); ok {
+			got[strings.TrimPrefix(name, "@")] = rest
+		}
+	}
+	for _, n := range bad {
+		if !strings.HasPrefix(got[n], "error (invalid: ") {
+			t.Errorf("%s: %q, want an invalid-name error", n, got[n])
+		}
+		if c := srv.count(n); c != 0 {
+			t.Errorf("%s was requested %d times, want 0", n, c)
+		}
+	}
+	if got["kyqb"] != "free" {
+		t.Errorf("kyqb (a real 4-character collectible): %q, want free", got["kyqb"])
+	}
+}

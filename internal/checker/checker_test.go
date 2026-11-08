@@ -176,8 +176,8 @@ func TestParseNames(t *testing.T) {
 		},
 		{
 			name:         "mixed_separators",
-			blob:         "alice, bob\nclaire\tdan ; eve",
-			wantAccepted: []string{"alice", "bob", "claire", "dan", "eve"},
+			blob:         "alice, bobby\nclaire\tdanny ; evelyn",
+			wantAccepted: []string{"alice", "bobby", "claire", "danny", "evelyn"},
 		},
 		{
 			name:         "dedupe_case_insensitive",
@@ -192,7 +192,7 @@ func TestParseNames(t *testing.T) {
 		},
 		{
 			name:         "rejects_too_long",
-			blob:         "short_one\n" + strings.Repeat("a", 65),
+			blob:         "short_one\n" + strings.Repeat("a", 33),
 			wantAccepted: []string{"short_one"},
 			wantRejected: 1,
 		},
@@ -253,5 +253,37 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	n := normalizeConfig(c)
 	if n.Workers != c.Workers {
 		t.Errorf("DefaultConfig should already be normalised: Workers %d -> %d", c.Workers, n.Workers)
+	}
+}
+
+// The validator accepted 1 to 64 characters from a-z, 0-9 and "_". Names
+// that cannot exist in Telegram ("ab", "1abcde", 40 letters) were sent to
+// Fragment, which redirects them to /?query= like a free name, so they came
+// back as false "free".
+func TestValidateUsernameTelegramRules(t *testing.T) {
+	valid := []string{"kyqb", "e8qb", "uu99", "durov", "a_b_c", "abc1", strings.Repeat("a", 32)}
+	invalid := map[string]string{
+		"":                      "empty",
+		"ab":                    "shorter than 4",
+		"abc":                   "shorter than 4",
+		strings.Repeat("a", 33): "longer than 32",
+		strings.Repeat("a", 40): "longer than 32",
+		"1abcde":                "start with a letter",
+		"_abcde":                "start with a letter",
+		"abcde_":                "end with _",
+		"ab-cd":                 "only a-z",
+		"ab.cd":                 "only a-z",
+		"абвгд":                 "only a-z",
+	}
+	for _, n := range valid {
+		if err := ValidateUsername(n); err != nil {
+			t.Errorf("%q: %v, want valid", n, err)
+		}
+	}
+	for n, want := range invalid {
+		err := ValidateUsername(n)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%q: %v, want an error with %q", n, err, want)
+		}
 	}
 }
