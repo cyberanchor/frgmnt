@@ -18,3 +18,7 @@ settings.json
 .idea/
 .vscode/
 *.swp
+
+# Console mode output and page cache
+/.fragment_cache/
+/results.txt

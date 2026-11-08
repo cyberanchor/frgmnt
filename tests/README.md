@@ -1,6 +1,6 @@
 # Black-box unit tests
 
-This directory is the dedicated test suite for **fragment_checker_v4**. It
+This directory is the dedicated test suite for **frgmnt**. It
 lives outside `internal/` on purpose: the tests use only exported APIs, the
 same surface the CLI and the web panel use.
 
@@ -11,7 +11,7 @@ binary path at it via `-base-url`.
 ## Run
 
 ```bash
-cd fragment_checker_v4
+cd frgmnt
 
 # The separate suite
 go test ./tests/... -v

@@ -1,4 +1,4 @@
-module github.com/cyberanchor/frgmnt/fragment_checker_v4
+module github.com/cyberanchor/frgmnt
 
 go 1.21
 

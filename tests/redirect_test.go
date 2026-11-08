@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/checker"
 )
 
 // useFragmentServer points the checker at a local fake Fragment and restores

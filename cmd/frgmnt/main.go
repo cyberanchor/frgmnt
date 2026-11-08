@@ -15,8 +15,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/cli"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/webapp"
+	"github.com/cyberanchor/frgmnt/internal/cli"
+	"github.com/cyberanchor/frgmnt/internal/webapp"
 )
 
 // version is the unified binary version. Component versions are independent.

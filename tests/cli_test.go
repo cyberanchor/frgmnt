@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/cli"
+	"github.com/cyberanchor/frgmnt/internal/cli"
 )
 
 // TestCLIEndToEnd drives the real console entry point against a local fake

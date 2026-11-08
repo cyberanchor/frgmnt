@@ -24,11 +24,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/logbus"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/server"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/staticfs"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/store"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/worker"
+	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/server"
+	"github.com/cyberanchor/frgmnt/internal/staticfs"
+	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/worker"
 )
 
 // version is the human-readable release tag.

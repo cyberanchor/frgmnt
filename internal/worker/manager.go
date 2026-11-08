@@ -15,9 +15,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/logbus"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/store"
 )
 
 // Status reflects the runtime state of one tile.

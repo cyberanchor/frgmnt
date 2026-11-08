@@ -14,10 +14,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/logbus"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/store"
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/worker"
+	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/worker"
 )
 
 // Server is the assembled HTTP application.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/checker"
 )
 
 func TestPageCacheHitAvoidsSecondRequest(t *testing.T) {

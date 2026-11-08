@@ -1,4 +1,4 @@
-// Package tests contains the black-box unit suite for fragment_checker_v4.
+// Package tests contains the black-box unit suite for frgmnt.
 //
 // The tests live outside internal/ on purpose: they exercise the public
 // checker API only, the same way the CLI and the web panel do. White-box
@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/checker"
 )
 
 func fixture(t *testing.T, name string) []byte {

@@ -5,7 +5,7 @@ package main
 import (
 	"os"
 
-	"github.com/cyberanchor/frgmnt/fragment_checker_v4/internal/webapp"
+	"github.com/cyberanchor/frgmnt/internal/webapp"
 )
 
 func main() { os.Exit(webapp.Main(os.Args[1:])) }
