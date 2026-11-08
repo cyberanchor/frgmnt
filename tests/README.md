@@ -36,16 +36,25 @@ go test ./...
 ## Why some tests stay in `internal/`
 
 A few behaviours are unexported implementation details (the on-disk cache
-layout, CLI helpers, log-bus internals). Their white-box tests remain next to
-the code:
+layout, CLI helpers, log-bus internals, the worker lifecycle, the HTTP guard).
+Their white-box tests remain next to the code:
 
 ```
 internal/checker/checker_test.go
 internal/checker/cache_test.go
+internal/checker/regression_test.go
 internal/cli/cli_test.go
+internal/cli/regression_test.go
 internal/logbus/logbus_test.go
+internal/server/server_test.go
 internal/store/store_test.go
+internal/store/regression_test.go
+internal/worker/manager_test.go
 ```
+
+`regression_test.go`, `manager_test.go` and `server_test.go` hold one test
+per bug fixed after the import into this repository; the comment above each
+test describes the old behaviour, and `git log` has the matching fix.
 
 The rule of thumb: if it can be tested through a public API, it belongs in
 `tests/`; otherwise it stays in-package.

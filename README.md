@@ -1,328 +1,255 @@
-# fragment_checker_web
+<div align="center">
 
-A single-binary, web-panel fork of [`fragment_checker`](../fragment_checker_v3.1)
-for checking Fragment.com username availability. Bundles a static frontend,
-a small REST + Server-Sent Events backend, and a local SQLite store into
-one statically-linked Go executable.
+<h1> frgmnt </h1>
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│   browser ──HTTP──▶  fragment_checker_web  ──HTTPS──▶  fragment  │
-│                          │                                       │
-│                          ├─ /api/*       REST                    │
-│                          ├─ /api/.../events   SSE                │
-│                          ├─ embedded HTML/CSS/JS                 │
-│                          ├─ SQLite (data.db, WAL)                │
-│                          └─ settings.json                        │
-└──────────────────────────────────────────────────────────────────┘
-```
+<sub>Fragment.com username availability checker. One static Go binary with two modes: a console checker for big lists and a web panel with worker tiles, resume and live progress. Every verdict carries a confidence score and the evidence behind it.</sub>
 
-## Features
+<kbd>🔎 Usernames</kbd> <kbd>⚡ Concurrent</kbd> <kbd>⏯️ Resume</kbd> <kbd>🗄️ Page cache</kbd> <kbd>🖥️ Web panel</kbd> <kbd>⌨️ Console</kbd>
 
-- **One static binary** — `frgmnt` bundles the console checker (`frgmnt
-  check`) and the web panel (`frgmnt web`); no CGO, no runtime assets.
-- **Embedded web panel** — HTML/CSS/JS shipped via `embed.FS`.
-- **Worker tiles** — independent checker sessions, per-worker config and
-  results. Configurable count and parameters from the UI.
-- **Start vs Resume** — fresh runs wipe previous results; Resume continues
-  from the first unchecked name and keeps everything in place.
-- **Bulk Start / Stop** — one click on the Workers tab to fan out across
-  every idle / running worker.
-- **Live progress via SSE** — no polling, no WebSocket dependency.
-- **Document-title progress** — `▶ N · P% — ...` while runs are active so
-  background tabs surface progress without focus.
-- **Browser notifications** on worker completion (opt-in by browser).
-- **Day / night theme** — CSS variables, toggled in the top-right. The
-  toggle is authoritative; settings.json provides only the initial seed.
-- **File upload or textarea** for username lists. Both parse the same
-  permissive separators (`\n`, comma, space, tab, semicolon) and strip a
-  leading `@`.
-- **Result filter chips** — click a status to narrow the result list.
-- **Page cache** — Fragment HTML is cached under `data/pagecache/`. Bought
-  (`sold`) pages are reused for 7 days, `taken` for 6 hours, and
-  auction/sale pages for 2 minutes. Cache hits are re-parsed with the
-  current parser, so detection improvements apply retroactively.
-- **Confidence + evidence** — every result carries a 0–100 confidence
-  score and the signal chain that decided it (e.g.
-  `text="for sale"; class=avail; timer; buy-now`), exposed via the REST API
-  and the result list.
-- **Debug console** — small REPL that hits the REST API from the browser.
-- **Logs tab** with topic filter, pause and live tail.
-- **CLI flags** for address, data dir and log level.
-- **Persistent state** — workers, inputs, marked-checked flags and results
-  survive restarts.
-- **Tested** — a separate black-box suite in `tests/` (parser fixtures,
-  redirects/throttling, page cache, CLI end-to-end) plus white-box tests for
-  internals; `go test -race ./...` is clean.
-- **One third-party dependency** — `modernc.org/sqlite` (pure-Go, no CGO).
+![GitHub Stars](https://img.shields.io/github/stars/cyberanchor/frgmnt?color=green&style=social)
+![GitHub Forks](https://img.shields.io/github/forks/cyberanchor/frgmnt?color=green&style=social)
+![GitHub Issues](https://img.shields.io/github/issues/cyberanchor/frgmnt?color=green&style=flat-square)
+![GitHub Pull Requests](https://img.shields.io/github/issues-pr/cyberanchor/frgmnt?color=green&style=flat-square)
+![GitHub Contributors](https://img.shields.io/github/contributors/cyberanchor/frgmnt?color=green&style=flat-square)
 
-## Requirements
+[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white&style=flat-square)](https://go.dev/)
+[![SQLite](https://img.shields.io/badge/SQLite-pure_Go-003B57?logo=sqlite&logoColor=white&style=flat-square)](https://pkg.go.dev/modernc.org/sqlite)
+![HTML5](https://img.shields.io/badge/HTML5-E34F26?logo=html5&logoColor=white&style=flat-square)
+![CSS3](https://img.shields.io/badge/CSS3-1572B6?logo=css3&logoColor=white&style=flat-square)
+![JavaScript](https://img.shields.io/badge/JavaScript-F7DF1E?logo=javascript&logoColor=black&style=flat-square)
+[![CI](https://img.shields.io/github/actions/workflow/status/cyberanchor/frgmnt/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/cyberanchor/frgmnt/actions/workflows/ci.yml)
 
-- Go 1.21+
-- No system SQLite or libc dependencies (CGO is off by default).
+</div>
 
-## Build
+> **Based on:** the public username pages of [fragment.com](https://fragment.com/) (`https://fragment.com/username/<name>`). No API key and no Telegram account are needed.
 
-The recommended build is the unified binary with `check` and `web` modes:
+> **Output:** the console mode writes one `@name | status` line per name to `results.txt`; the web mode keeps workers, inputs and results in SQLite ([`data/data.db`](#data-layout)) and serves them over a REST + SSE API.
+
+## Quick start
 
 ```bash
-# development
-go build -o frgmnt ./cmd/frgmnt
-
-# release (stripped, reproducible, static)
+git clone https://github.com/cyberanchor/frgmnt && cd frgmnt
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
-```
 
-The web-only entry point remains available:
-
-```bash
-go build -o fragment_checker_web ./cmd/server
-```
-
-A `Makefile` provides shortcuts:
-
-```bash
-make unified     # unified `frgmnt` binary (check + web)
-make build       # web-only debug build
-make release     # unified stripped release build
-make run         # build + run web on 127.0.0.1:8080
-make vet         # go vet ./...
-make test        # go test ./...
-make test-suite  # separate black-box suite: go test ./tests/... -v
-make test-race   # go test -race -count=1 ./...
-make tidy        # go mod tidy
-make clean
-```
-
-## Run
-
-```bash
-./frgmnt web                                                  # default :8080
-./frgmnt web -addr 127.0.0.1:9090 -data ./var
-./frgmnt web -log-level debug
-./frgmnt web -version
-
-# web-only binary, same flags
-./fragment_checker_web -addr 127.0.0.1:8080 -data ./data
-```
-
-The console mode lives in the same binary:
-
-```bash
+# console: one name per line in, "@name | status" lines out
 ./frgmnt check -input names.txt -output results.txt -workers 200
+
+# web panel on http://127.0.0.1:8080
+./frgmnt web
 ```
 
-Then open the printed URL (default <http://127.0.0.1:8080>) in your browser.
+Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
+`frgmnt 1.0.0 (cli 3.1, web 0.3.0)`; `./frgmnt help`, `./frgmnt check -h` and
+`./frgmnt web -h` list every flag. The old shorthands still work:
+`./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
 
-## CLI flags
+## Statuses
 
-| Flag         | Default            | Description                                 |
-| ------------ | ------------------ | ------------------------------------------- |
-| `-addr`      | `127.0.0.1:8080`   | HTTP listen address                         |
-| `-data`      | `./data`           | Directory for SQLite DB and `settings.json` |
-| `-log-level` | `info`             | `error`, `warn`, `info`, `debug`, `trace`   |
-| `-cache-dir` | `<data>/pagecache` | On-disk page cache directory                |
-| `-cache-ttl` | `2m`               | TTL for volatile pages (auction/available)  |
-| `-cache-sold-ttl` | `168h`        | TTL for sold/bought pages; negative = never |
-| `-no-cache`  | `false`            | Disable the page cache                      |
-| `-version`   | `false`            | Print version and exit                      |
+| Status       | Meaning                                                  | Signal on the page                     |
+| ------------ | -------------------------------------------------------- | -------------------------------------- |
+| 🟢 free      | Nobody owns it, it can be claimed                        | redirect to `/?query=<name>`           |
+| 🟣 reserved  | Reserved by Fragment (a bare `302 /` that survives retries and a healthy probe) | redirect to `/`  |
+| 🟡 auction   | Live auction                                             | `On auction`, `js-place-bid-btn`, timer |
+| 🔵 available | Fixed-price sale                                         | `For sale`, `js-buy-now-btn`           |
+| ⚪ taken     | Bound to an account, offers only                         | `Taken`, `js-make-offer-btn`           |
+| ⚫ sold      | Bought on Fragment                                       | `Sold`, `Purchased on`                 |
+| ❔ unknown   | The page matched no known layout                         |                                        |
+| ❌ error     | Network, HTTP or validation error, Cloudflare challenge, throttling |                             |
 
-Bind to `0.0.0.0` only if you understand the exposure — this is a local tool
-and has no auth layer.
+The parser trusts the visible status label first (`On auction`, `For sale`,
+`Sold`, `Taken`), then the JS hooks and "Purchased on", and only then the
+`tm-status-*` class. Every result has a confidence score (0–100) and an
+evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
+
+- **Several badges**: a header can show `BANNED` and `Sold`; the commercial badge wins.
+- **Auction with buy-now**: `On auction` still wins, it is not a conflict.
+- **`302 /` is ambiguous**: Fragment uses it for rare reserved names and for
+  throttled clients. All workers pause for a shared cooldown, the request is
+  retried with the same cookie session, and a random free name is probed.
+  Only a healthy probe gives `reserved`; otherwise the result is an error,
+  never a false `reserved`.
+- **Listings lag**: search pages can still show a name that was delisted. The
+  username page is the source of truth.
+
+## Console mode
+
+```bash
+./frgmnt check -input names.txt -output results.txt                  # 500 workers, 8 connections
+./frgmnt check -input names.txt -output results.txt -resume          # skip names already in results.txt
+cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
+```
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `-input` | | Name list, one per line (`-` = stdin); a leading `@` is stripped |
+| `-output` | | Results file (truncated unless `-append` or `-resume`) |
+| `-workers` | `500` | Parallel workers |
+| `-conns` | `8` | TCP connections to fragment.com (HTTP/2 multiplexing) |
+| `-rate` | `0` | Global limit, requests per second (0 = unlimited) |
+| `-retries` / `-retry-delay` | `2` / `500ms` | Extra attempts per name and the pause between them |
+| `-rl-wait-max` | `30s` | Longest `Retry-After` honoured on HTTP 429 |
+| `-timeout` | `15s` | Whole-request timeout |
+| `-readlimit` | `16384` | Body bytes scanned for the status (1 KiB–1 MiB) |
+| `-cache-dir` / `-no-cache` | `.fragment_cache` | Page cache directory, or no cache |
+| `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
+| `-filter` | | Write only these statuses, e.g. `free,auction` |
+| `-append` / `-resume` | | Append to the output; `-resume` also skips names already in it |
+| `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
+| `-quiet` / `-debug` / `-trace` | | Less or more output on stdout and stderr |
+| `-insecure` | | Skip TLS verification (debugging only) |
+| `-base-url` | | Another Fragment base URL (tests, mirrors) |
+
+Ctrl+C stops gracefully: finished results are flushed, checks that were cut
+short are not written, so `-resume` checks them again. The exit code is 1 when
+the results file could not be written.
 
 ## Web panel
 
-- **Workers** — grid of tiles. Each tile has Start / Stop / Input·Results /
-  Edit / Delete buttons, a progress bar and a status-breakdown panel.
-- **Settings** — global defaults (workers, rate, retries, timeout), theme,
-  log level, UI history limit. Saved to `data/settings.json`.
-- **Logs** — live SSE tail of every server event, filterable by worker.
-- **Debug Console** — type raw API calls (e.g. `GET /api/workers`) and see
-  the JSON response inline. Includes an expandable command crib-sheet.
+```bash
+./frgmnt web                                   # http://127.0.0.1:8080, data in ./data
+./frgmnt web -addr 127.0.0.1:9090 -data ./var -log-level debug
+```
 
-## REST API
+- **Worker tiles**: independent checker sessions, each with its own config,
+  input list, progress bar and status breakdown. Start runs from scratch,
+  Resume continues from the first unchecked name, Start all / Stop all act on
+  every tile.
+- **Input**: paste names or upload a file; commas, spaces, tabs, semicolons and
+  new lines all separate names, a leading `@` is stripped.
+- **Results**: filter chips per status, plain-text download, confidence,
+  evidence and cache marks.
+- **Settings**: defaults for new workers (workers, rate, retries, timeout),
+  theme, log level, history limit; saved to `data/settings.json`.
+- **Logs** with a topic filter, pause and live tail; a **debug console** that
+  sends raw API calls; progress in the tab title; browser notifications when a
+  worker finishes.
+- **State survives restarts**: workers, inputs, checked flags and results.
+  On Ctrl+C the panel waits for running workers to save their last results;
+  a second Ctrl+C quits at once.
 
-| Method | Path                                       | Description                       |
-| ------ | ------------------------------------------ | --------------------------------- |
-| GET    | `/api/health`                              | Liveness + counters               |
-| GET    | `/api/settings`                            | Global settings                   |
-| PUT    | `/api/settings`                            | Replace global settings           |
-| GET    | `/api/workers`                             | List workers                     |
-| POST   | `/api/workers`                             | Create worker                    |
-| GET    | `/api/workers/{id}`                        | Worker details                   |
-| PATCH  | `/api/workers/{id}`                        | Update name/config               |
-| DELETE | `/api/workers/{id}`                        | Delete worker + its data         |
-| POST   | `/api/workers/{id}/input`                  | Load names from `{"text":"..."}` |
-| POST   | `/api/workers/{id}/input/upload`           | Multipart upload (`file` field)  |
-| POST   | `/api/workers/{id}/start`                  | Start the run (`?resume=true` keeps previous results) |
-| POST   | `/api/workers/{id}/stop`                   | Cancel the run                   |
-| POST   | `/api/workers-bulk/start`                  | Start every ready/done/error worker (`?resume=true`)  |
-| POST   | `/api/workers-bulk/stop`                   | Stop every running worker        |
-| POST   | `/api/workers/{id}/clear`                  | Clear results                    |
-| GET    | `/api/workers/{id}/results`                | `?after=ID&limit=N`              |
-| GET    | `/api/workers/{id}/results/download`       | Plain-text results download      |
-| GET    | `/api/workers/{id}/events`                 | SSE: per-worker progress + logs  |
-| GET    | `/api/logs`                                | Recent logs (`?topic=ID&limit=N`)|
-| GET    | `/api/logs/stream`                         | SSE: live log tail               |
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `-addr` | `127.0.0.1:8080` | Listen address |
+| `-data` | `./data` | Directory for `data.db` and `settings.json` |
+| `-log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
+| `-cache-dir` / `-no-cache` | `<data>/pagecache` | Page cache directory, or no cache |
+| `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
+| `-version` | | Print the version |
 
-All POST/PUT/PATCH bodies are JSON. Multipart upload is only used by
-`/input/upload`. Request bodies are capped at 50 MB JSON / 100 MB upload.
-Each result object also carries `confidence` (0–100), `evidence` (the signal
-chain) and `cached` (served from the page cache).
+The panel has no login. It refuses state-changing requests that a browser
+marks as coming from another site (`Origin`, `Sec-Fetch-Site`), and while it
+listens on a loopback address it only answers to a loopback `Host`
+(`127.0.0.1`, `localhost`, `::1`, any port, so `ssh -L` works). Bind it to
+another address only on a network you trust.
 
-## Data layout
+### REST API
+
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| GET | `/api/health` | Liveness, worker count, log level |
+| GET / PUT | `/api/settings` | Global settings |
+| GET / POST | `/api/workers` | List / create workers (`{"name": ..., "config": {...}}`) |
+| GET / PATCH / DELETE | `/api/workers/{id}` | One worker; PATCH changes only the fields it sends |
+| POST | `/api/workers/{id}/input` | Load names from `{"text": "..."}` |
+| POST | `/api/workers/{id}/input/upload` | Multipart upload, field `file` |
+| POST | `/api/workers/{id}/start` · `/stop` · `/clear` | Run (`?resume=true` keeps results), cancel, clear results |
+| POST | `/api/workers-bulk/start` · `/stop` | Start every ready/done/error worker, stop every running one |
+| GET | `/api/workers/{id}/results` | `?after=ID&limit=N`, with counts per status |
+| GET | `/api/workers/{id}/results/download` | Plain-text results |
+| GET | `/api/workers/{id}/events` | SSE: progress and log of one worker |
+| GET | `/api/logs` · `/api/logs/stream` | Recent log entries (`?topic=ID&limit=N`), SSE live tail |
+
+Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
+`max_conns` up to 1000, `rate_rps` up to 1000, `retries` up to 10,
+`read_limit` up to 1 MiB; anything else is answered with 400.
+
+```bash
+curl -s -X POST localhost:8080/api/workers -d '{"name":"w1","config":{"workers":100,"retries":1}}'
+curl -s -X POST localhost:8080/api/workers/<id>/input -d '{"text":"durov, @pavel\nwallet"}'
+curl -s -X POST localhost:8080/api/workers/<id>/start
+```
+
+### Data layout
 
 ```
 data/
-  data.db          # SQLite database (workers, inputs, results)
-  data.db-wal      # WAL files (managed by SQLite)
-  data.db-shm
-  settings.json    # editable by hand if needed
-  pagecache/       # gzipped Fragment HTML + JSON metadata, two-level shard
+  data.db          # SQLite (WAL): workers, inputs with checked flags, results
+  settings.json    # global settings, editable by hand
+  pagecache/       # gzipped Fragment pages + JSON metadata, two-level shards
 ```
 
-`settings.json`:
+## Page cache
 
-```json
-{
-  "theme": "dark",
-  "log_level": "info",
-  "default_workers": 50,
-  "default_rate_rps": 0,
-  "default_retries": 2,
-  "default_timeout_s": 15,
-  "history_limit_max": 500
-}
+Fetched pages are stored gzipped under `.fragment_cache/` (console) or
+`<data>/pagecache/` (web) and re-parsed with the current parser on every hit,
+so parser fixes apply to old entries.
+
+| Status | TTL |
+| ------ | --- |
+| sold | 7 days (`-cache-sold-ttl`, negative = forever) |
+| taken | 6 hours |
+| reserved | 24 hours |
+| auction, available | 2 minutes (`-cache-ttl`) |
+| free, unknown, error | not cached |
+
+When Fragment cannot be reached, a stale **sold** or **taken** entry is served
+and marked as such (`network failed (...); served stale cache`). Stale auction
+or sale pages are not served: those are likely over.
+
+## Build and tests
+
+```bash
+make unified      # static ./frgmnt (check + web)
+make release      # + the web-only ./fragment_checker_web (cmd/server)
+make test         # go test ./...
+make test-race    # go test -race -count=1 ./...
+make test-suite   # black-box suite: go test ./tests/... -v
+make vet
 ```
 
-## Status taxonomy
-
-Identical to v3.1, see [the original README](../fragment_checker_v3.1/README.md)
-for full details:
-
-| Status    | Meaning                                         |
-| --------- | ----------------------------------------------- |
-| free      | Available to claim                              |
-| reserved  | Reserved (Telegram-style redirect)              |
-| auction   | Live auction ("On auction" + place-bid + timer) |
-| available | Fixed-price listing ("For sale" + buy-now)      |
-| taken     | Bound to an account ("Taken" + make-offer)      |
-| sold      | Purchased on Fragment ("Sold" + "Purchased on") |
-| unknown   | HTML did not match any pattern                  |
-| error     | Network / HTTP / validation                     |
-
-Detection notes:
-
-- Multiple header badges are supported. A sold name can render
-  `BANNED` + `Sold`; the commercial badge wins.
-- An auction can also offer buy-now; `On auction` still wins.
-- A bare `302 /` is retried with a shared cooldown and a cookie session.
-  A random free-name probe distinguishes throttling from a genuinely
-  reserved name, so rate limits never masquerade as `reserved`.
-- Search/listing pages can lag behind the username page; results are based
-  on `https://fragment.com/username/<name>`.
+- [`tests/`](tests/README.md): black-box tests through the exported API
+  (status layouts, redirects and throttling, page cache, a console run)
+  against local fake Fragment servers, no network.
+- `internal/*/*_test.go`: white-box tests, including one regression test per
+  bug fixed after the import (`regression_test.go`, `manager_test.go`,
+  `server_test.go`).
+- [CI](.github/workflows/ci.yml) on Go 1.21 and 1.22: gofmt, vet, race tests,
+  the black-box suite and the release build.
 
 ## Project layout
 
 ```
-.
-├── cmd/frgmnt/main.go                  # unified dispatcher: check | web
-├── cmd/server/main.go                  # web-only entry point (wrapper)
-├── internal/cli/cli.go                 # console checker (package cli)
-├── internal/cli/cache.go               # console page cache
-├── internal/webapp/webapp.go           # web panel bootstrap (package webapp)
-├── tests/                              # separate black-box unit suite
-│   ├── README.md                       # how to run, what is covered
-│   ├── parser_test.go                  # status layouts + confidence
-│   ├── redirect_test.go                # free / throttle / reserved
-│   ├── cache_test.go                   # hit, TTL, stale fallback
-│   ├── cli_test.go                     # end-to-end console run
-│   └── testdata/                       # minimal Fragment HTML fixtures
-├── internal/checker/checker.go         # checker core (library)
-├── internal/checker/parse.go           # multi-signal status parser
-├── internal/checker/cache.go           # on-disk page cache
-├── internal/checker/cache_test.go      # cache internals (white-box)
-├── internal/checker/checker_test.go    # helper tests (white-box)
-├── internal/logbus/logbus.go           # event bus + SSE fan-out
-├── internal/logbus/logbus_test.go      # ring buffer + close-race tests
-├── internal/store/store.go             # SQLite + settings
-├── internal/store/store_test.go        # CRUD + resume helpers
-├── internal/worker/manager.go          # per-tile lifecycle
-├── internal/server/server.go           # HTTP, REST, SSE
-├── internal/staticfs/                  # embedded UI bundle
-│   ├── staticfs.go
-│   └── web/
-│       ├── index.html
-│       ├── styles.css
-│       └── app.js
-├── .github/workflows/ci.yml            # vet + race tests + release build
-├── go.mod
-└── README.md
+cmd/frgmnt/          unified binary: check | web | version
+cmd/server/          web-only entry point (fragment_checker_web)
+internal/cli/        console checker: flags, worker pool, parser, page cache
+internal/webapp/     web mode bootstrap and shutdown
+internal/checker/    web engine: HTTP, retries, cooldown, parser, page cache
+internal/worker/     worker tiles: lifecycle, input producer, result writer
+internal/server/     REST + SSE, request guard
+internal/store/      SQLite schema, migrations, settings.json
+internal/logbus/     in-memory log ring and SSE fan-out
+internal/staticfs/   embedded panel (index.html, styles.css, app.js)
+tests/               black-box suite and HTML fixtures
 ```
 
-## Tests
+## Contributors
 
-The primary suite is deliberately separate from the code:
+<a href="https://github.com/cyberanchor/frgmnt/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=cyberanchor/frgmnt" />
+</a>
 
-```bash
-go test ./tests/... -v          # black-box: parser, redirects, cache, CLI
-go test -race -count=1 ./...    # everything, with the race detector
-```
+<!--
+## Star History
 
-`tests/` uses only exported APIs and local `httptest` servers — no network.
-See [tests/README.md](tests/README.md) for the coverage table and fixture
-rules. White-box tests for unexported internals stay in `internal/`.
-
-## Changelog
-
-### Detection hardening (post-1.0.0)
-- Multi-badge headers: `BANNED` + `Sold` on the same page now resolve to
-  `sold` (the commercial badge wins), with the full badge list in evidence.
-- `On auction` + `js-buy-now-btn` is accepted as a normal auction instead of
-  being treated as a conflicting signal.
-- A bare `302 /` is retried with a shared cool-down and persistent cookies.
-  A random free-name probe separates throttling from a genuine reserved
-  name; a throttled client now gets an error, never a false `reserved`.
-
-### Unified binary 1.0.0
-- `cmd/frgmnt` provides both modes from one 11 MB static binary:
-  `frgmnt check` (console) and `frgmnt web` (panel).
-- Legacy shorthands still work: `frgmnt -input ...` routes to `check`, and
-  `frgmnt -addr ...`/`-data ...` routes to `web`.
-- The console checker moved from the standalone v3.1 source tree into
-  `internal/cli`, sharing the parser/cache design with the web panel.
-- `cmd/server` remains as a thin web-only wrapper.
-
-### v0.3.0
-- **Detection fix**: `For sale` pages (fixed-price listings) were reported as
-  `auction` because they also carry `tm-countdown-timer`. The parser now
-  trusts the visible label and the `js-buy-now-btn` / `js-place-bid-btn` /
-  `js-make-offer-btn` hooks. Added confidence scores and an evidence chain.
-- **Page cache**: gzipped HTML under `data/pagecache/`, with per-status TTLs.
-  `sold` (bought) pages are the primary win: 7 days by default. Cache hits
-  are re-parsed so parser fixes apply to old entries; a stale entry is used
-  as a fallback if the network fails.
-- Results API/SQLite gained `confidence`, `evidence` and `cached` columns
-  (idempotent migration).
-- `http.ServeFileFS` replaced with `fs.ReadFile`, restoring Go 1.21
-  compatibility and a green `go vet`.
-
-### v0.2.0
-- Persister: final batch is now flushed on a detached context so Stop
-  never loses the last ~32 results.
-- logbus: `Subscribe`/`Close` race is closed; subscribing on a closed bus
-  returns a pre-closed channel instead of leaking.
-- `Worker.started_at` persisted across restarts.
-- Theme: localStorage is authoritative; server only seeds it on first load.
-- New: Start vs Resume, bulk Start/Stop, status filter chips, title-bar
-  progress, completion notifications.
-- Tests: unit tests for parsers, event bus and store; race-clean.
-- CI: GitHub Actions on Go 1.21 + 1.22 — vet, race tests, release build.
-
-### v0.1.0
-- Initial release.
-
+<a href="https://www.star-history.com/#cyberanchor/frgmnt&type=date&legend=bottom-right">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=cyberanchor/frgmnt&type=date&theme=dark&legend=bottom-right" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=cyberanchor/frgmnt&type=date&legend=bottom-right" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=cyberanchor/frgmnt&type=date&legend=bottom-right" />
+  </picture>
+</a>
+-->
 
 ## License
 
-MIT. See `LICENSE`.
+[MIT](LICENSE)
