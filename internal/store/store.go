@@ -93,12 +93,6 @@ CREATE TABLE IF NOT EXISTS worker_inputs (
     FOREIGN KEY (worker_id) REFERENCES workers(id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_inputs_pending
-    ON worker_inputs(worker_id, checked, seq);
-
-CREATE INDEX IF NOT EXISTS idx_inputs_user
-    ON worker_inputs(worker_id, username);
-
 CREATE TABLE IF NOT EXISTS results (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     worker_id    TEXT NOT NULL,
@@ -135,8 +129,22 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// Indexes on columns that older databases get from the ALTERs above
+	// must come after them: created in the schema, idx_inputs_pending made
+	// a database without the "checked" column impossible to open.
+	if _, err := db.Exec(inputIndexes); err != nil {
+		return err
+	}
 	return nil
 }
+
+const inputIndexes = `
+CREATE INDEX IF NOT EXISTS idx_inputs_pending
+    ON worker_inputs(worker_id, checked, seq);
+
+CREATE INDEX IF NOT EXISTS idx_inputs_user
+    ON worker_inputs(worker_id, username);
+`
 
 // -----------------------------------------------------------------------------
 // Workers

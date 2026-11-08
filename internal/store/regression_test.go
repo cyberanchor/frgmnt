@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,5 +137,44 @@ func TestSettingsMissingKeysGetDefaults(t *testing.T) {
 	def.Theme = "light"
 	if got != def {
 		t.Errorf("settings = %+v, want %+v", got, def)
+	}
+}
+
+// migrate() created idx_inputs_pending(worker_id, checked, seq) in the
+// schema, before the ALTER TABLE that adds "checked" to older databases, so
+// a database from before that column could not be opened at all ("no such
+// column: checked").
+func TestMigrateFromSchemaWithoutCheckedColumn(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := `
+CREATE TABLE workers (id TEXT PRIMARY KEY, name TEXT NOT NULL, config_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'idle', total INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE worker_inputs (worker_id TEXT NOT NULL, seq INTEGER NOT NULL, username TEXT NOT NULL,
+  PRIMARY KEY (worker_id, seq));
+CREATE TABLE results (id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id TEXT NOT NULL,
+  username TEXT NOT NULL, status TEXT NOT NULL, error TEXT, took_ns INTEGER NOT NULL,
+  checked_at INTEGER NOT NULL);
+INSERT INTO workers VALUES ('w1','old','{}','idle',1,1,1);
+INSERT INTO worker_inputs VALUES ('w1',0,'alice');`
+	if _, err := db.Exec(old); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open on a database without the checked column: %v", err)
+	}
+	defer s.Close()
+	if got := pendingNames(t, s, "w1"); !equalStrSlice(got, []string{"alice"}) {
+		t.Errorf("pending after migration = %v, want [alice]", got)
 	}
 }
