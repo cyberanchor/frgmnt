@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,7 @@ type Server struct {
 	bus      *logbus.Bus
 	staticFS fs.FS
 	mux      *http.ServeMux
+	handler  http.Handler // mux behind guard()
 }
 
 // Options bundles dependencies needed to assemble a Server.
@@ -50,18 +53,89 @@ func New(opt Options) *Server {
 		mux:      http.NewServeMux(),
 	}
 	s.routes()
+	s.handler = s.guard(s.mux)
 	return s
 }
 
 // Handler returns the underlying http.Handler (useful for tests).
-func (s *Server) Handler() http.Handler { return s.mux }
+func (s *Server) Handler() http.Handler { return s.handler }
+
+// guard rejects requests that a web page on another site can make through
+// the user's browser. The API has no login, so without it any page open in
+// the same browser could create, start or delete workers with a "simple"
+// cross-site POST (text/plain needs no CORS preflight), and a full start
+// wipes the worker's previous results.
+//
+//   - State-changing requests must come from the panel itself: a browser
+//     marks cross-site requests with Sec-Fetch-Site and Origin. Clients
+//     that send neither (curl, scripts) are not affected.
+//   - When the panel listens on a loopback address, the Host header must
+//     be a loopback name as well. This stops DNS rebinding, where a hostile
+//     domain resolves to 127.0.0.1 and its pages become "same-origin".
+func (s *Server) guard(next http.Handler) http.Handler {
+	loopbackOnly := isLoopbackAddr(s.addr)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if loopbackOnly && !isLoopbackHost(r.Host) {
+			writeError(w, http.StatusForbidden, "host "+r.Host+" is not allowed")
+			return
+		}
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
+				writeError(w, http.StatusForbidden, "cross-site request blocked")
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" && !sameOrigin(origin, r.Host) {
+				writeError(w, http.StatusForbidden, "cross-origin request blocked")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackAddr reports whether a listen address only accepts local
+// connections ("127.0.0.1:8080", "localhost:8080", "[::1]:8080").
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	return isLoopbackName(host)
+}
+
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	return isLoopbackName(host)
+}
+
+func isLoopbackName(host string) bool {
+	host = strings.TrimSuffix(strings.Trim(host, "[]"), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func sameOrigin(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false // includes Origin: null
+	}
+	return strings.EqualFold(u.Host, host)
+}
 
 // Run blocks until ctx is cancelled. It performs a graceful shutdown when
 // the context is done.
 func (s *Server) Run(ctx context.Context) error {
 	srv := &http.Server{
 		Addr:              s.addr,
-		Handler:           s.mux,
+		Handler:           s.handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		// SSE responses are long-lived; do NOT set a write deadline.
 	}
