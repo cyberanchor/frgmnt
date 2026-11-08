@@ -195,3 +195,15 @@ func FuzzParseNamesReaderMatchesParseNames(f *testing.F) {
 		}
 	})
 }
+
+// With a rate limit set, a second Close panicked: "close of closed channel".
+func TestCheckerCloseTwiceDoesNotPanic(t *testing.T) {
+	c := New(Config{RateRPS: 5})
+	c.Close()
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("second Close panicked: %v", p)
+		}
+	}()
+	c.Close()
+}

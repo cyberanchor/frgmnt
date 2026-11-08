@@ -219,6 +219,7 @@ func New(cfg Config) *Checker {
 func (c *Checker) Config() Config { return c.cfg }
 
 // Close releases internal resources (rate limiter goroutine, idle TCP conns).
+// It is safe to call more than once.
 func (c *Checker) Close() {
 	c.limiter.Close()
 	c.client.CloseIdleConnections()
@@ -614,6 +615,7 @@ func newHTTPClient(c Config) *http.Client {
 type rateLimiter struct {
 	tokens chan struct{}
 	stop   chan struct{}
+	once   sync.Once // Close may be called more than once
 }
 
 func newRateLimiter(rps int) *rateLimiter {
@@ -662,7 +664,7 @@ func (rl *rateLimiter) Close() {
 	if rl == nil {
 		return
 	}
-	close(rl.stop)
+	rl.once.Do(func() { close(rl.stop) })
 }
 
 // -----------------------------------------------------------------------------
