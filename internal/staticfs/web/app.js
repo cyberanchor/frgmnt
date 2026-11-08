@@ -1,8 +1,8 @@
 /* ============================================================================
  * fragment_checker — web panel client
- * Vanilla ES2020. No framework. All state held in two maps + a couple of
- * EventSource handles. The code is intentionally flat and short so it is
- * easy to audit/extend.
+ * Vanilla ES2020. No framework. All state held in a few maps + the log
+ * EventSource; tiles are polled. The code is intentionally flat and short so
+ * it is easy to audit/extend.
  * ========================================================================== */
 "use strict";
 
@@ -79,7 +79,6 @@ function toast(msg, kind = "ok", ttl = 3500) {
 
 const state = {
     workers: new Map(),       // id -> worker view
-    workerStreams: new Map(), // id -> EventSource
     detailsResults: new Map(),// id -> last seen result id (for details modal)
     detailsCounts: new Map(), // id -> {status: count}
     detailsFilter: "all",     // active status chip in the details modal
@@ -147,19 +146,32 @@ setInterval(pollHealth, 5000);
 /*  Workers                                                                   */
 /* -------------------------------------------------------------------------- */
 
-async function loadWorkers() {
+// loadWorkers fetches every worker and redraws the tiles. pollWorkers()
+// runs it once a second; quiet skips the error toast for that refresh.
+async function loadWorkers(quiet = false) {
     let workers;
     try {
         workers = await api("GET", "/api/workers") || [];
     } catch (e) {
-        toast("Failed to load workers: " + e.message, "error");
+        if (!quiet) toast("Failed to load workers: " + e.message, "error");
         return;
     }
+    const prevStatus = new Map();
+    for (const [id, w] of state.workers) prevStatus.set(id, w.status);
+    const listChanged = workers.length !== state.workers.size ||
+        workers.some((w) => state.workers.get(w.id)?.name !== w.name);
     state.workers.clear();
     for (const w of workers) state.workers.set(w.id, w);
     renderWorkers();
-    syncWorkerStreams();
-    refreshLogsTopicFilter();
+    if (listChanged) refreshLogsTopicFilter();
+    refreshTitle();
+    // Notification on transition: running -> done / error.
+    for (const w of workers) {
+        const before = prevStatus.get(w.id);
+        if (before === "running" && (w.status === "done" || w.status === "error")) {
+            notifyComplete(w);
+        }
+    }
 }
 
 function renderWorkers() {
@@ -330,59 +342,24 @@ function refreshTitle() {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Per-worker SSE stream                                                     */
+/*  Live tile updates                                                         */
 /* -------------------------------------------------------------------------- */
 
-function syncWorkerStreams() {
-    // Close streams for workers no longer present.
-    for (const [id, es] of state.workerStreams) {
-        if (!state.workers.has(id)) {
-            es.close();
-            state.workerStreams.delete(id);
-        }
+// Tiles are refreshed by polling GET /api/workers once a second. The panel
+// used to open one EventSource per worker, but a browser allows only six
+// HTTP/1.1 connections per host: with five or more workers (plus the log
+// stream) the streams took every connection and the panel's own requests
+// (buttons, settings, results) hung. The per-worker stream also appended
+// result rows that the 2 s results poll added again (duplicates at debug).
+let workersPollBusy = false;
+async function pollWorkers() {
+    if (workersPollBusy) return;
+    workersPollBusy = true;
+    try {
+        await loadWorkers(true);
+    } finally {
+        workersPollBusy = false;
     }
-    // Open streams for new workers.
-    for (const id of state.workers.keys()) {
-        if (state.workerStreams.has(id)) continue;
-        openWorkerStream(id);
-    }
-}
-
-function openWorkerStream(id) {
-    const es = new EventSource(`/api/workers/${id}/events`);
-    state.workerStreams.set(id, es);
-    es.addEventListener("stats", (e) => {
-        try {
-            const payload = JSON.parse(e.data);
-            const w = state.workers.get(id);
-            if (!w) return;
-            const prevStatus = w.status;
-            w.status = payload.status ?? w.status;
-            if (payload.total) w.total = payload.total;
-            if (payload.stats) w.stats = payload.stats;
-            const tile = $(`.tile[data-id="${id}"]`);
-            if (tile) updateTile(tile, w);
-            // Notification on transition: running -> done / error.
-            if (prevStatus === "running" && (w.status === "done" || w.status === "error")) {
-                notifyComplete(w);
-            }
-            refreshTitle();
-        } catch {}
-    });
-    es.addEventListener("log", (e) => {
-        let entry;
-        try { entry = JSON.parse(e.data); } catch { return; }
-        // Worker-scoped result events: append to details modal if open.
-        if (entry.message && entry.message.startsWith("{") && entry.message.includes('"event":"result"')) {
-            try {
-                const payload = JSON.parse(entry.message);
-                appendDetailsResult(id, payload);
-            } catch {}
-        }
-    });
-    es.onerror = () => {
-        // Browsers reconnect automatically; just leave it.
-    };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -526,6 +503,9 @@ async function loadDetailsResults(id) {
         const frag = document.createDocumentFragment();
         for (const r of rs) frag.appendChild(buildResultRow(r));
         list.appendChild(frag);
+        // Cap visible rows to avoid heavy DOMs.
+        const limit = (state.settings && state.settings.history_limit_max) || 500;
+        while (list.children.length > limit) list.removeChild(list.firstChild);
         list.scrollTop = list.scrollHeight;
     } catch (e) {
         toast("Load results: " + e.message, "error");
@@ -584,26 +564,6 @@ function maybeRequestNotificationPermission() {
         // Best-effort; some browsers require a user gesture.
         try { Notification.requestPermission().catch(() => {}); } catch {}
     }
-}
-
-function appendDetailsResult(id, payload) {
-    if (detailsCurrentId !== id) return;
-    const list = $("#details-results");
-    if (!list) return;
-    const counts = state.detailsCounts.get(id) || {};
-    counts[payload.status] = (counts[payload.status] || 0) + 1;
-    state.detailsCounts.set(id, counts);
-    renderDetailsCounts(id);
-
-    list.appendChild(buildResultRow({
-        username: payload.username,
-        status: payload.status,
-        error: payload.error || "",
-    }));
-    // Cap visible rows to avoid heavy DOMs.
-    const limit = (state.settings && state.settings.history_limit_max) || 500;
-    while (list.children.length > limit) list.removeChild(list.firstChild);
-    list.scrollTop = list.scrollHeight;
 }
 
 $("#details-load-text").addEventListener("click", async () => {
@@ -827,8 +787,8 @@ $("#console-clear").addEventListener("click", () => { $("#console-output").inner
     openLogStream();
     refreshTitle();
     maybeRequestNotificationPermission();
-    // Periodically reconcile worker views (in case SSE was dropped).
-    setInterval(() => { loadWorkers(); }, 8000);
+    // Live tile updates (see pollWorkers).
+    setInterval(pollWorkers, 1000);
     setInterval(refreshTitle, 1500);
     // When details modal is open, pull incremental results too.
     setInterval(() => {
