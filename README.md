@@ -112,8 +112,9 @@ the results file could not be written.
 
 - **Worker tiles**: independent checker sessions, each with its own config,
   input list, progress bar and status breakdown. Start runs from scratch,
-  Resume continues from the first unchecked name, Start all / Stop all act on
-  every tile.
+  Resume continues from the first unchecked name. Start all starts new
+  workers and continues stopped ones (it never deletes results; finished
+  workers are left as they are), Stop all stops every running one.
 - **Input**: paste names or upload a file; commas, spaces, tabs, semicolons and
   new lines all separate names, a leading `@` is stripped.
 - **Results**: filter chips per status, plain-text download, confidence,
@@ -153,7 +154,7 @@ another address only on a network you trust.
 | POST | `/api/workers/{id}/input` | Load names from `{"text": "..."}` |
 | POST | `/api/workers/{id}/input/upload` | Multipart upload, field `file` |
 | POST | `/api/workers/{id}/start` · `/stop` · `/clear` | Run (`?resume=true` keeps results), cancel, clear results |
-| POST | `/api/workers-bulk/start` · `/stop` | Start every ready/done/error worker, stop every running one |
+| POST | `/api/workers-bulk/start` · `/stop` | Continue every worker with unchecked names (never from scratch), stop every running one |
 | GET | `/api/workers/{id}/results` | `?after=ID&limit=N`, with counts per status |
 | GET | `/api/workers/{id}/results/download` | Plain-text results |
 | GET | `/api/workers/{id}/events` | SSE: progress and log of one worker |

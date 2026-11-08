@@ -283,6 +283,14 @@ func (m *Manager) Start(ctx context.Context, id string, opt StartOptions) error 
 	return nil
 }
 
+// Pending returns how many names a Resume of the worker would check.
+func (m *Manager) Pending(ctx context.Context, id string) (int64, error) {
+	if _, err := m.Get(id); err != nil {
+		return 0, err
+	}
+	return m.store.PendingInputCount(ctx, id)
+}
+
 // Stop cancels the run loop. Safe on a non-running worker (no-op).
 func (m *Manager) Stop(id string) error {
 	w, err := m.Get(id)

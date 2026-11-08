@@ -2,15 +2,117 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
 	"github.com/cyberanchor/frgmnt/internal/worker"
 )
+
+// fakeFragment answers every name with "free" (302 to /?query=) and counts
+// the requests per name. Names starting with "slow" are answered after
+// delay, so a run can be stopped half way.
+type fakeFragment struct {
+	mu   sync.Mutex
+	hits map[string]int
+}
+
+func newFakeFragment(t *testing.T, delay time.Duration) *fakeFragment {
+	t.Helper()
+	f := &fakeFragment{hits: map[string]int{}}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		f.mu.Lock()
+		f.hits[name]++
+		f.mu.Unlock()
+		if delay > 0 && strings.HasPrefix(name, "slow") {
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	}))
+	old := checker.FragmentURLTemplate
+	checker.FragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() {
+		checker.FragmentURLTemplate = old
+		srv.Close()
+	})
+	return f
+}
+
+func (f *fakeFragment) hitsFor(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hits[name]
+}
+
+// seqNames returns prefix000, prefix001, ...
+func seqNames(prefix string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("%s%03d", prefix, i)
+	}
+	return out
+}
+
+// newWorkerWithInput creates a worker through the API and loads names.
+func newWorkerWithInput(t *testing.T, s *Server, name, config string, names []string) string {
+	t.Helper()
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"`+name+`","config":`+config+`}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create %s: %d %s", name, rec.Code, rec.Body.String())
+	}
+	id := decodeView(t, rec).ID
+	body, _ := json.Marshal(map[string]string{"text": strings.Join(names, "\n")})
+	if rec := do(t, s, "POST", "/api/workers/"+id+"/input", "application/json", string(body), nil); rec.Code != http.StatusOK {
+		t.Fatalf("input %s: %d %s", name, rec.Code, rec.Body.String())
+	}
+	return id
+}
+
+// waitStopped waits until the worker is no longer running.
+func waitStopped(t *testing.T, s *Server, id string) worker.Status {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		w, err := s.mgr.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := w.Status(); st != worker.StatusRunning {
+			return st
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("worker %s still running", id)
+	return ""
+}
+
+// resultNames returns the usernames of the stored results of a worker.
+func resultNames(t *testing.T, st *store.Store, id string) []string {
+	t.Helper()
+	rs, err := st.ListResults(context.Background(), id, 0, 100000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.Username)
+	}
+	return out
+}
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
@@ -209,5 +311,72 @@ func TestCreateUsesSettingsDefaults(t *testing.T) {
 	got = decodeView(t, rec).Config
 	if got.Retries != 0 || got.RateRPS != 0 {
 		t.Errorf("explicit retries=0 rate_rps=0 became %d/%d", got.Retries, got.RateRPS)
+	}
+}
+
+// "Start all" started every ready, done and error worker from scratch,
+// which deletes its results first: a finished worker lost all of them, and
+// a stopped worker (status "ready") started over instead of continuing.
+func TestBulkStartContinuesAndKeepsResults(t *testing.T) {
+	f := newFakeFragment(t, 100*time.Millisecond)
+	s, st := newTestServer(t)
+	cfg := `{"workers":2,"retries":0}`
+
+	finished := newWorkerWithInput(t, s, "finished", cfg, seqNames("done", 5))
+	stopped := newWorkerWithInput(t, s, "stopped", cfg, seqNames("slow", 40))
+	fresh := newWorkerWithInput(t, s, "fresh", cfg, seqNames("fresh", 5))
+
+	if rec := do(t, s, "POST", "/api/workers/"+finished+"/start", "", "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("start: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := waitStopped(t, s, finished); got != worker.StatusDone {
+		t.Fatalf("finished worker: status %s, want done", got)
+	}
+
+	do(t, s, "POST", "/api/workers/"+stopped+"/start", "", "", nil)
+	deadline := time.Now().Add(10 * time.Second)
+	for len(resultNames(t, st, stopped)) < 4 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	do(t, s, "POST", "/api/workers/"+stopped+"/stop", "", "", nil)
+	waitStopped(t, s, stopped)
+	before := resultNames(t, st, stopped)
+	if len(before) == 0 || len(before) == 40 {
+		t.Fatalf("stopped worker has %d results, want a partial run", len(before))
+	}
+
+	rec := do(t, s, "POST", "/api/workers-bulk/start", "", "", nil)
+	var res map[string]int
+	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+	if rec.Code != http.StatusOK || res["started"] != 2 || res["skipped"] != 1 {
+		t.Fatalf("bulk start: %d %s, want started=2 skipped=1", rec.Code, rec.Body.String())
+	}
+	for _, id := range []string{finished, stopped, fresh} {
+		waitStopped(t, s, id)
+	}
+
+	if got := resultNames(t, st, finished); len(got) != 5 {
+		t.Errorf("finished worker: %d results after Start all, want its 5", len(got))
+	}
+	for _, n := range seqNames("done", 5) {
+		if h := f.hitsFor(n); h != 1 {
+			t.Errorf("%s was requested %d times, want 1 (finished worker restarted)", n, h)
+		}
+	}
+	after := resultNames(t, st, stopped)
+	seen := map[string]bool{}
+	for _, n := range after {
+		seen[n] = true
+	}
+	if len(after) != 40 || len(seen) != 40 {
+		t.Errorf("stopped worker: %d results (%d unique) after Start all, want 40", len(after), len(seen))
+	}
+	for _, n := range before {
+		if h := f.hitsFor(n); h != 1 {
+			t.Errorf("%s was checked before the stop and requested %d times, want 1", n, h)
+		}
+	}
+	if got := resultNames(t, st, fresh); len(got) != 5 {
+		t.Errorf("fresh worker: %d results, want 5", len(got))
 	}
 }

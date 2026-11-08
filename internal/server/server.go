@@ -563,21 +563,30 @@ func (s *Server) handleWorkerStart(w http.ResponseWriter, r *http.Request, id st
 	writeJSON(w, http.StatusOK, toView(w2))
 }
 
+// handleBulkStart continues every worker that has unchecked names: a new
+// worker starts at its first name, a stopped one where it stopped. It never
+// starts a worker from scratch, so no results are deleted, and a finished
+// worker is left as it is. It used to start every ready, done and error
+// worker fresh, which wiped their results (a stopped worker is "ready").
 func (s *Server) handleBulkStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w, "POST")
 		return
 	}
-	resume := r.URL.Query().Get("resume") == "true" || r.URL.Query().Get("resume") == "1"
 	started := 0
 	skipped := 0
 	for _, item := range s.mgr.List() {
-		status := item.Status()
-		if status != "ready" && status != "done" && status != "error" {
+		switch item.Status() {
+		case worker.StatusReady, worker.StatusDone, worker.StatusError:
+		default:
 			skipped++
 			continue
 		}
-		if err := s.mgr.Start(r.Context(), item.ID(), worker.StartOptions{Resume: resume}); err != nil {
+		if n, err := s.mgr.Pending(r.Context(), item.ID()); err != nil || n == 0 {
+			skipped++
+			continue
+		}
+		if err := s.mgr.Start(r.Context(), item.ID(), worker.StartOptions{Resume: true}); err != nil {
 			skipped++
 			continue
 		}
