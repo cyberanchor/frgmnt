@@ -249,6 +249,10 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 		}
 		// Apply defaults onto zero fields.
 		body.Config = mergeConfig(body.Config, defaultConfigFromSettings(s.store.GetSettings()))
+		if err := body.Config.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		w2, err := s.mgr.Create(r.Context(), body.Name, body.Config)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -369,6 +373,10 @@ func (s *Server) handleWorkerCRUD(w http.ResponseWriter, r *http.Request, id str
 			body.Name = existing.Name()
 		}
 		body.Config = mergeConfig(body.Config, existing.Config())
+		if err := body.Config.Validate(); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		w2, err := s.mgr.Update(r.Context(), id, body.Name, body.Config)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())

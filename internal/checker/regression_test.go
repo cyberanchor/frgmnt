@@ -59,3 +59,36 @@ func TestCancelledChecksAreNotEmitted(t *testing.T) {
 		t.Errorf("over 5 cancelled runs: %d interrupted checks were emitted as errors, Stats.Errors=%d", emitted, errors)
 	}
 }
+
+// read_limit came straight from the REST API into make([]byte, n). A huge
+// value panicked inside a worker goroutine and took the whole web process
+// down, with every other worker.
+func TestHugeReadLimitDoesNotPanic(t *testing.T) {
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<span class="tm-section-header-status tm-status-unavail">Sold</span>`)
+	})
+	c := New(Config{ReadLimit: 1 << 62, Retries: 0})
+	defer c.Close()
+	defer func() {
+		if p := recover(); p != nil {
+			t.Errorf("CheckOne panicked: %v", p)
+		}
+	}()
+	if r := c.CheckOne(context.Background(), "adam"); r.Status != StatusSold {
+		t.Errorf("status = %s (%s), want sold", r.Status, r.Error)
+	}
+}
+
+func TestNormalizeConfigClampsUpperBounds(t *testing.T) {
+	c := normalizeConfig(Config{Workers: 1 << 30, MaxConns: 1 << 30, RateRPS: 1 << 62, Retries: 1 << 20, ReadLimit: 1 << 62})
+	if c.Workers != MaxWorkers || c.MaxConns != MaxConnLimit || c.RateRPS != MaxRateRPS ||
+		c.Retries != MaxRetries || c.ReadLimit != MaxReadLimit {
+		t.Errorf("not clamped: %+v", c)
+	}
+	if err := (Config{ReadLimit: 1 << 62}).Validate(); err == nil {
+		t.Error("Validate accepted read_limit=1<<62")
+	}
+	if err := DefaultConfig().Validate(); err != nil {
+		t.Errorf("Validate rejected the default config: %v", err)
+	}
+}

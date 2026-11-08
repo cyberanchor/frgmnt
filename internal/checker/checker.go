@@ -110,6 +110,41 @@ type Config struct {
 	BlockCooldown time.Duration `json:"block_cooldown_ns,omitempty"`
 }
 
+// Upper bounds for Config values. The web API rejects values above them;
+// normalizeConfig clamps anything that still gets through (for example a
+// config saved by an older version). Without them a single API call could
+// crash the process: read_limit goes straight into make([]byte, n).
+const (
+	MaxWorkers   = 1000
+	MaxConnLimit = 1000
+	MaxRateRPS   = 1000
+	MaxRetries   = 10
+	MaxReadLimit = 1 << 20 // the status markers sit in the first ~8 KB
+)
+
+// Validate reports values that are out of range. Zero means "use the
+// default" for the counts, so only negative and too large values fail.
+func (c Config) Validate() error {
+	check := func(name string, v, max int) error {
+		if v < 0 || v > max {
+			return fmt.Errorf("%s must be between 0 and %d, got %d", name, max, v)
+		}
+		return nil
+	}
+	for _, err := range []error{
+		check("workers", c.Workers, MaxWorkers),
+		check("max_conns", c.MaxConns, MaxConnLimit),
+		check("rate_rps", c.RateRPS, MaxRateRPS),
+		check("retries", c.Retries, MaxRetries),
+		check("read_limit", c.ReadLimit, MaxReadLimit),
+	} {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DefaultConfig returns the recommended production values.
 func DefaultConfig() Config {
 	return Config{
@@ -702,17 +737,12 @@ func (s *liveStats) snapshot() Stats {
 // -----------------------------------------------------------------------------
 
 func normalizeConfig(c Config) Config {
-	if c.Workers < 1 {
-		c.Workers = 1
-	}
-	if c.MaxConns < 1 {
-		c.MaxConns = 1
-	}
-	if c.ReadLimit < 1024 {
-		c.ReadLimit = 1024
-	}
-	if c.Retries < 0 {
-		c.Retries = 0
+	c.Workers = clamp(c.Workers, 1, MaxWorkers)
+	c.MaxConns = clamp(c.MaxConns, 1, MaxConnLimit)
+	c.ReadLimit = clamp(c.ReadLimit, 1024, MaxReadLimit)
+	c.Retries = clamp(c.Retries, 0, MaxRetries)
+	if c.RateRPS > MaxRateRPS {
+		c.RateRPS = MaxRateRPS
 	}
 	if c.RetryDelay <= 0 {
 		c.RetryDelay = 500 * time.Millisecond
@@ -730,6 +760,16 @@ func normalizeConfig(c Config) Config {
 		c.BlockCooldown = 3 * time.Second
 	}
 	return c
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 // -----------------------------------------------------------------------------
