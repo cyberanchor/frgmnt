@@ -92,3 +92,24 @@ func TestNormalizeConfigClampsUpperBounds(t *testing.T) {
 		t.Errorf("Validate rejected the default config: %v", err)
 	}
 }
+
+// waitBlock had a loop meant to re-read the shared deadline, but both
+// select branches returned, so a cooldown extended by another worker while
+// we slept was ignored and the request went out during the pause.
+func TestWaitBlockHonoursExtendedCooldown(t *testing.T) {
+	c := New(Config{BlockCooldown: 50 * time.Millisecond})
+	defer c.Close()
+	start := time.Now()
+	c.triggerBlock() // deadline = start + 50ms
+	done := make(chan time.Duration, 1)
+	go func() {
+		_ = c.waitBlock(context.Background())
+		done <- time.Since(start)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	c.cfg.BlockCooldown = 300 * time.Millisecond
+	c.triggerBlock() // another worker saw "302 /": deadline = start + ~310ms
+	if got := <-done; got < 250*time.Millisecond {
+		t.Errorf("waitBlock returned after %v, but the shared cooldown was extended to ~310ms", got.Round(time.Millisecond))
+	}
+}

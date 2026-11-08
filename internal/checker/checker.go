@@ -873,6 +873,8 @@ func (c *Checker) triggerBlock() {
 }
 
 // waitBlock sleeps until the shared cooldown expires, or ctx is cancelled.
+// Another worker can push the deadline further while we sleep (a new
+// "302 /"), so the deadline is read again after every timer.
 func (c *Checker) waitBlock(ctx context.Context) error {
 	for {
 		until := c.blockUntil.Load()
@@ -889,7 +891,6 @@ func (c *Checker) waitBlock(ctx context.Context) error {
 			t.Stop()
 			return ctx.Err()
 		case <-t.C:
-			return nil
 		}
 	}
 }
