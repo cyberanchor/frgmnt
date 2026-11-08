@@ -101,13 +101,16 @@ func (m *Manager) Load(ctx context.Context) error {
 			m.bus.Publish(logbus.LevelError, "", fmt.Sprintf("load worker %s: %v", row.ID, err))
 			continue
 		}
-		// Rehydrated workers always start idle/ready — never auto-running.
-		queued, _ := m.store.InputCount(ctx, w.id)
-		w.total = queued
-		if queued > 0 {
-			w.setStatus(StatusReady)
-		} else {
+		// Rehydrated workers never auto-run. A finished list stays done:
+		// it used to come back as "ready" with zero counters on the tile.
+		m.refreshProgress(ctx, w)
+		switch total, checked := w.Total(), w.checkedCount(); {
+		case total == 0:
 			w.setStatus(StatusIdle)
+		case checked >= total:
+			w.setStatus(StatusDone)
+		default:
+			w.setStatus(StatusReady)
 		}
 		m.workers[w.id] = w
 	}
@@ -228,9 +231,7 @@ func (m *Manager) SetInput(ctx context.Context, id string, names []string) (int6
 	if err := m.store.ReplaceInputs(ctx, id, names); err != nil {
 		return 0, err
 	}
-	w.mu.Lock()
-	w.total = int64(len(names))
-	w.mu.Unlock()
+	m.refreshProgress(ctx, w)
 	if len(names) > 0 {
 		w.setStatus(StatusReady)
 	} else {
@@ -322,6 +323,7 @@ func (m *Manager) ClearResults(ctx context.Context, id string) error {
 	if err := m.store.ClearResults(ctx, id); err != nil {
 		return err
 	}
+	m.refreshProgress(ctx, w)
 	m.bus.Publish(logbus.LevelInfo, id, "results cleared")
 	return nil
 }
@@ -375,6 +377,14 @@ type Worker struct {
 	chk       *checker.Checker // non-nil while running
 	lastStats checker.Stats    // cached snapshot from the most recent run
 
+	// checked and counts describe the stored results: names flagged
+	// checked, and results per status. They are read from the database
+	// when the worker is loaded or a run starts, and grow with every batch
+	// the run saves, so the tile adds up over Resume runs and survives a
+	// restart.
+	checked int64
+	counts  map[string]int64
+
 	manager *Manager
 }
 
@@ -412,18 +422,75 @@ func (w *Worker) Total() int64 {
 	return w.total
 }
 
-// Stats returns the live counters while running, or the cached snapshot
-// from the most recent run after completion. Zero only when the worker
-// has never been started.
+// Stats returns the counters shown on the tile. Total, Checked and the
+// per-status counts describe the stored results of the whole list. They
+// used to be the counters of the current run only: after a Resume the tile
+// showed "32/40 = 80%" for a finished list, and after a restart zeros. The
+// request counters (retries, rate limits, connections, cache, challenges)
+// are those of the current run, or of the last one.
 func (w *Worker) Stats() checker.Stats {
 	w.mu.RLock()
-	chk := w.chk
-	last := w.lastStats
-	w.mu.RUnlock()
-	if chk == nil {
-		return last
+	defer w.mu.RUnlock()
+	st := w.lastStats
+	if w.chk != nil {
+		st = w.chk.Snapshot()
 	}
-	return chk.Snapshot()
+	st.Total = w.total
+	st.Checked = w.checked
+	c := w.counts
+	st.Free = c[string(checker.StatusFree)]
+	st.Reserved = c[string(checker.StatusReserved)]
+	st.Auction = c[string(checker.StatusAuction)]
+	st.Taken = c[string(checker.StatusTaken)]
+	st.Sold = c[string(checker.StatusSold)]
+	st.Available = c[string(checker.StatusAvailable)]
+	st.Unknown = c[string(checker.StatusUnknown)]
+	st.Errors = c[string(checker.StatusError)]
+	return st
+}
+
+func (w *Worker) checkedCount() int64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.checked
+}
+
+// addSaved counts a batch of results that was stored.
+func (w *Worker) addSaved(batch []store.Result) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.counts == nil {
+		w.counts = make(map[string]int64)
+	}
+	for _, r := range batch {
+		w.counts[r.Status]++
+	}
+	w.checked += int64(len(batch))
+}
+
+// refreshProgress reads the list size, the checked names and the results
+// per status of a worker from the database.
+func (m *Manager) refreshProgress(ctx context.Context, w *Worker) {
+	total, err := m.store.InputCount(ctx, w.id)
+	if err != nil {
+		m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("progress: %v", err))
+		return
+	}
+	pending, err := m.store.PendingInputCount(ctx, w.id)
+	if err != nil {
+		m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("progress: %v", err))
+		return
+	}
+	counts, err := m.store.CountByStatus(ctx, w.id)
+	if err != nil {
+		m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("progress: %v", err))
+		return
+	}
+	w.mu.Lock()
+	w.total = total
+	w.checked = total - pending
+	w.counts = counts
+	w.mu.Unlock()
 }
 
 // StartedAt returns the wall-clock time of the most recent Start call.
@@ -561,6 +628,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 			queued, cfg.Workers, cfg.MaxConns, cfg.Retries, cfg.RateRPS))
 	}
 	chk.SetTotal(queued)
+	m.refreshProgress(ctx, w)
 
 	in := make(chan string, 1024)
 	out := make(chan checker.Result, 1024)
@@ -664,6 +732,8 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 		// checks them again.
 		if err := m.store.RecordResults(c, batch); err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("persist: %v", err))
+		} else {
+			w.addSaved(batch)
 		}
 		batch = batch[:0]
 	}

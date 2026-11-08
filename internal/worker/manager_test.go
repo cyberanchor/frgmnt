@@ -479,3 +479,75 @@ func TestBlockedRunStopsAndResumeRechecks(t *testing.T) {
 		t.Errorf("after Resume: status %s, counts %v; want done with 300 free and no errors", w.Status(), counts)
 	}
 }
+
+// The tile shows Stats().Checked of Stats().Total. Checked counted only
+// the current run, so after Stop and Resume a finished list of 40 names
+// showed "32/40 = 80%" with status done.
+func TestTileProgressAddsUpOverResume(t *testing.T) {
+	newFakeFragment(t, 50*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "resume", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(40)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for w.Stats().Checked < 6 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = h.m.Stop(w.ID())
+	waitNotRunning(w, 10*time.Second)
+	if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 20*time.Second) {
+		t.Fatal("resume did not finish")
+	}
+	st := w.Stats()
+	if w.Status() != StatusDone || st.Checked != 40 || st.Total != 40 || st.Free != 40 {
+		t.Errorf("after Stop and Resume: status %s, checked %d of %d, free %d; want done 40/40, 40 free",
+			w.Status(), st.Checked, st.Total, st.Free)
+	}
+}
+
+// After a restart every tile showed 0/N and zero counters although the
+// results were in the database, and a finished worker came back "ready".
+func TestProgressSurvivesRestart(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "restart", testConfig(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(18)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+
+	m2 := New(h.st, h.bus) // the process restarts on the same database
+	m2.ConfigureCache("", 0, 0, true)
+	if err := m2.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	w2, err := m2.Get(w.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := w2.Stats()
+	if w2.Status() != StatusDone || st.Checked != 18 || st.Total != 18 || st.Free != 18 {
+		t.Errorf("after a restart: status %s, checked %d of %d, free %d; want done 18/18, 18 free",
+			w2.Status(), st.Checked, st.Total, st.Free)
+	}
+}
