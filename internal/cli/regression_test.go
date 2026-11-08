@@ -263,3 +263,26 @@ func TestVersionUsesProgName(t *testing.T) {
 		t.Errorf("-version printed %q (exit %d), want %q", out, code, "frgmnt check "+Version)
 	}
 }
+
+// A typo in -filter was reported only after the output file had been opened
+// with O_TRUNC, so "-filter fre" wiped the results of the previous run and
+// then exited.
+func TestFilterTypoKeepsOutputFile(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	const old = "@alice | free\n@bobby | taken\n"
+	if err := os.WriteFile(in, []byte("alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := Main([]string{"-input", in, "-output", out, "-filter", "fre", "-no-cache", "-base-url", "http://127.0.0.1:1"})
+	if code == 0 {
+		t.Error("an unknown -filter status exited with 0")
+	}
+	if got, _ := os.ReadFile(out); string(got) != old {
+		t.Errorf("results file after the failed run: %q, want it unchanged", got)
+	}
+}

@@ -1761,6 +1761,15 @@ func Main(args []string) int {
 	}
 	readLimit = *readLimitF
 
+	// --- Filter ---
+	// Parsed before the output file is opened: opening truncates it, and a
+	// typo in -filter used to wipe the previous results before failing.
+	filter, err := parseFilter(*filterRaw)
+	if err != nil {
+		log.Printf("[ERROR] -filter: %v", err)
+		return 2
+	}
+
 	// --- Open input ---
 	var inReader io.Reader
 	if *inputPath == "-" {
@@ -1798,12 +1807,6 @@ func Main(args []string) int {
 	}
 	fileW := bufio.NewWriterSize(outFile, 64*1024)
 	stdoutW := bufio.NewWriterSize(os.Stdout, 64*1024)
-
-	// --- Filter ---
-	filter, err := parseFilter(*filterRaw)
-	if err != nil {
-		log.Fatalf("Filter error: %v", err)
-	}
 
 	// --- Log level banner ---
 	levelName := "normal"
