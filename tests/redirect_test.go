@@ -100,9 +100,10 @@ func TestThrottledClientBecomesError(t *testing.T) {
 	if res.Error == "" {
 		t.Fatal("expected an explanatory error")
 	}
-	// 3 attempts + 1 health probe.
-	if got := atomic.LoadInt32(&calls); got != 4 {
-		t.Fatalf("server calls = %d, want 4", got)
+	// 3 attempts + 2 probes: one at the first "302 /" (it decides that all
+	// workers pause), one for the verdict.
+	if got := atomic.LoadInt32(&calls); got != 5 {
+		t.Fatalf("server calls = %d, want 5", got)
 	}
 }
 
@@ -126,5 +127,57 @@ func TestGenuineReservedWithHealthyProbe(t *testing.T) {
 	}
 	if res.Confidence != 60 {
 		t.Fatalf("confidence = %d, want 60", res.Confidence)
+	}
+}
+
+// Every bare "302 /" paused all workers for BlockCooldown (3 s) before the
+// next attempt, so each reserved name in a list stalled the whole run for
+// about 3 s per attempt: 7 reserved names took 9 s. Now a probe decides:
+// with a healthy probe nobody pauses.
+func TestReservedNamesDoNotPauseOthers(t *testing.T) {
+	var probes int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		switch {
+		case strings.HasPrefix(name, "zzprobe"):
+			atomic.AddInt32(&probes, 1)
+			http.Redirect(w, r, "/?query="+name, http.StatusFound)
+		case strings.HasPrefix(name, "rsv"):
+			http.Redirect(w, r, "/", http.StatusFound)
+		default:
+			http.Redirect(w, r, "/?query="+name, http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+	useFragmentServer(t, srv)
+
+	c := checker.New(checker.Config{Workers: 8, Retries: 2, RetryDelay: 50 * time.Millisecond,
+		BlockCooldown: 3 * time.Second, Timeout: 2 * time.Second})
+	defer c.Close()
+	in := make(chan string, 64)
+	for i := 0; i < 7; i++ {
+		in <- "rsvname" + string(rune('a'+i))
+	}
+	for i := 0; i < 50; i++ {
+		in <- "freename" + string(rune('a'+i%26)) + string(rune('a'+i/26))
+	}
+	close(in)
+	out := make(chan checker.Result, 64)
+	start := time.Now()
+	c.Run(context.Background(), in, out)
+	took := time.Since(start)
+	close(out)
+	counts := map[checker.Status]int{}
+	for r := range out {
+		counts[r.Status]++
+	}
+	if counts[checker.StatusReserved] != 7 || counts[checker.StatusFree] != 50 {
+		t.Errorf("counts %v, want 7 reserved and 50 free", counts)
+	}
+	if took > 2*time.Second {
+		t.Errorf("7 reserved names among 57 took %v; a reserved name must not pause the others", took)
+	}
+	if p := atomic.LoadInt32(&probes); p > 14 {
+		t.Errorf("%d probes for 7 reserved names, want at most 2 per name", p)
 	}
 }

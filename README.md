@@ -64,10 +64,12 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
 - **Several badges**: a header can show `BANNED` and `Sold`; the commercial badge wins.
 - **Auction with buy-now**: `On auction` still wins, it is not a conflict.
 - **`302 /` is ambiguous**: Fragment uses it for rare reserved names and for
-  throttled clients. All workers pause for a shared cooldown, the request is
-  retried with the same cookie session, and a random free name is probed.
-  Only a healthy probe gives `reserved`; otherwise the result is an error,
-  never a false `reserved`.
+  throttled clients. A random free name is probed at once (one probe shared
+  by all workers): if it is redirected to `/` as well, the client is
+  throttled and all workers pause for a shared cooldown. The name is retried
+  with the same cookie session, and the verdict takes a fresh probe: only a
+  healthy probe gives `reserved`; otherwise the result is an error, never a
+  false `reserved`. A reserved name does not slow the other workers down.
 - **Cloudflare challenge**: an answer with `cf-mitigated: challenge` (HTTP 403)
   or a "Just a moment..." page says nothing about the name and is an error.
   After 10 of them in a row, with no other answer in between, Fragment is

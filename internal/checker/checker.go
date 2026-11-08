@@ -117,9 +117,9 @@ type Config struct {
 	CacheSoldTTL time.Duration `json:"cache_sold_ttl_ns,omitempty"`
 
 	// BlockCooldown is the pause applied to all workers when Fragment
-	// answers with a bare "302 /" — a signal that is used both for rare
-	// reserved names and for throttling. Retries with a cool-down keep a
-	// transient rate limit from being misreported as "reserved".
+	// throttles this client: a bare "302 /" (used both for rare reserved
+	// names and for throttling) while a probe name is redirected to "/"
+	// as well. A reserved name alone does not pause anyone.
 	BlockCooldown time.Duration `json:"block_cooldown_ns,omitempty"`
 }
 
@@ -218,6 +218,13 @@ type Checker struct {
 	// blocked is set when it reaches ChallengeLimit.
 	challengeRun atomic.Int64
 	blocked      atomic.Bool
+
+	// The last probe (see probe): when it started and finished, and whether
+	// the probe name got a normal answer.
+	probeMu      sync.Mutex
+	probeStarted time.Time
+	probeDone    time.Time
+	probeOK      bool
 
 	// Until the first outcome that is not a challenge (an answer or a
 	// network error), requests go out one at a time through scout. A
@@ -409,15 +416,22 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 		if !retry {
 			return res
 		}
+		if res.Status == StatusReserved && !c.probe(ctx, probeReuse) {
+			// A bare "302 /", and a random free name is redirected to "/"
+			// too: the client is throttled. Pause every worker, then retry.
+			// For a reserved name nobody waits; the name is retried in its
+			// cookie session (a first "302 /" can also be a session start).
+			c.triggerBlock()
+		}
 		lastErr = errStr
 		lastRes = res
 	}
 	if lastRes.Status == StatusReserved {
 		// Distinguish a genuine reserved name from a throttled client by
-		// probing a random name that should be free. If the probe is also
-		// redirected to "/", the whole client is being limited and we must
-		// not report a false "reserved".
-		if c.probeHealthy(ctx) {
+		// probing a random name that should be free, now. If the probe is
+		// also redirected to "/", the whole client is being limited and we
+		// must not report a false "reserved".
+		if c.probe(ctx, 0) {
 			c.debugf("@%s: redirect to / persisted after %d attempts; probe healthy -> reserved", name, c.cfg.Retries+1)
 			lastRes.Evidence = fmt.Sprintf("redirect=/ after %d attempts; probe healthy -> reserved", c.cfg.Retries+1)
 			lastRes.Confidence = 60
@@ -536,8 +550,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		case isReservedRedirect(loc):
 			// A bare 302 to "/" is how Fragment answers both rare reserved
 			// names and rate-limited clients. Do not report it as reserved
-			// on the first attempt: pause all workers, then retry.
-			c.triggerBlock()
+			// on the first attempt: CheckOne probes and retries.
 			return Result{Username: name, Status: StatusReserved, Confidence: 35,
 				Evidence: "redirect=/ (reserved or throttled)"}, true, "redirect to /"
 		default:
@@ -1042,6 +1055,31 @@ func ParseNamesReader(r io.Reader) (names []string, rejected int, err error) {
 			}
 		}
 	}
+}
+
+// probeReuse is how old a probe result may be when a "302 /" only decides
+// whether to pause all workers. The verdict "reserved" always takes a new
+// probe, so a throttle that starts right after a healthy probe cannot turn
+// into false "reserved" results.
+const probeReuse = time.Second
+
+// probe reports whether a random free name gets a normal answer (the
+// client is not throttled). Concurrent callers share one request: a probe
+// that started after the caller asked is fresh by definition, and an older
+// result is reused when it is younger than maxAge (0 = always a new probe).
+// It used to be one request per caller, and every "302 /" also paused all
+// workers for BlockCooldown, about 3 s per attempt of a reserved name.
+func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
+	asked := time.Now()
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if c.probeStarted.After(asked) || (maxAge > 0 && !c.probeDone.IsZero() && time.Since(c.probeDone) < maxAge) {
+		return c.probeOK
+	}
+	c.probeStarted = time.Now()
+	c.probeOK = c.probeHealthy(ctx)
+	c.probeDone = time.Now()
+	return c.probeOK
 }
 
 // probeHealthy requests a random username that should resolve to free/taken.
