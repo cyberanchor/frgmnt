@@ -296,3 +296,26 @@ func TestStopThenResumeChecksInterruptedNames(t *testing.T) {
 		t.Errorf("after Stop + Resume, %d of %d names have no result (or more than one)", missing, len(all))
 	}
 }
+
+// Start writes w.cancel under w.mu while Stop, Delete and CloseAll read it
+// without the lock: a data race that `go test -race` reports. Run with -race.
+func TestStartStopConcurrentNoRace(t *testing.T) {
+	newFakeFragment(t, 50*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "racy", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(20)); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); _ = h.m.Start(ctx, w.ID(), StartOptions{}) }()
+	go func() { defer wg.Done(); _ = h.m.Stop(w.ID()) }()
+	go func() { defer wg.Done(); h.m.CloseAll() }()
+	wg.Wait()
+	_ = h.m.Stop(w.ID())
+	waitNotRunning(w, 10*time.Second)
+}

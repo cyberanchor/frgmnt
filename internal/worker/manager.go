@@ -205,7 +205,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	w.cancel()
+	w.stop()
 	if err := m.store.DeleteWorker(ctx, id); err != nil {
 		return err
 	}
@@ -282,7 +282,7 @@ func (m *Manager) Stop(id string) error {
 	if err != nil {
 		return err
 	}
-	w.cancel()
+	w.stop()
 	return nil
 }
 
@@ -307,7 +307,7 @@ func (m *Manager) CloseAll() {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, w := range m.workers {
-		w.cancel()
+		w.stop()
 	}
 }
 
@@ -390,6 +390,15 @@ func (w *Worker) StartedAt() time.Time {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.startedAt
+}
+
+// stop cancels the current run, if any. Start replaces w.cancel under w.mu,
+// so it is read under the same lock.
+func (w *Worker) stop() {
+	w.mu.RLock()
+	cancel := w.cancel
+	w.mu.RUnlock()
+	cancel()
 }
 
 func (w *Worker) setStatus(s Status) {
