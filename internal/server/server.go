@@ -173,11 +173,16 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/workers-bulk/stop", s.handleBulkStop)
 	s.mux.HandleFunc("/api/logs", s.handleLogs)
 	s.mux.HandleFunc("/api/logs/stream", s.handleLogStream)
+	// Unknown API paths get a JSON error like the rest of the API (they
+	// fell through to the UI handler's plain-text 404).
+	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "no such API endpoint: "+r.URL.Path)
+	})
 
 	// Static UI (embedded). The provided FS is already rooted at the
 	// asset directory; no fs.Sub here.
 	if s.staticFS != nil {
-		fileServer := http.FileServer(http.FS(s.staticFS))
+		fileServer := http.FileServer(noDirFS{http.FS(s.staticFS)})
 		s.mux.Handle("/static/", http.StripPrefix("/static/", fileServer))
 		s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			if r.URL.Path != "/" {
@@ -196,6 +201,22 @@ func (s *Server) routes() {
 			_, _ = w.Write(data)
 		})
 	}
+}
+
+// noDirFS serves files only. Opening a directory fails, so /static/ is a
+// 404 instead of a listing of the embedded files.
+type noDirFS struct{ http.FileSystem }
+
+func (f noDirFS) Open(name string) (http.File, error) {
+	file, err := f.FileSystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if st, err := file.Stat(); err != nil || st.IsDir() {
+		file.Close()
+		return nil, fs.ErrNotExist
+	}
+	return file, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -690,6 +711,10 @@ func (s *Server) handleWorkerClear(w http.ResponseWriter, r *http.Request, id st
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+// maxResultsPage caps ?limit= of the results list: any limit used to be
+// read into memory and sent in one response.
+const maxResultsPage = 5000
+
 func (s *Server) handleWorkerResults(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w, "GET")
@@ -700,10 +725,16 @@ func (s *Server) handleWorkerResults(w http.ResponseWriter, r *http.Request, id 
 	if limit <= 0 {
 		limit = 200
 	}
+	if limit > maxResultsPage {
+		limit = maxResultsPage // page with ?after=; the download has everything
+	}
 	rs, err := s.store.ListResults(r.Context(), id, after, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if rs == nil {
+		rs = []store.Result{} // "results": [] rather than null
 	}
 	counts, _ := s.store.CountByStatus(r.Context(), id)
 	writeJSON(w, http.StatusOK, map[string]any{

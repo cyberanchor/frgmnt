@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
@@ -449,5 +450,65 @@ func TestZeroConfigValuesUseDefaults(t *testing.T) {
 	cfg := decodeView(t, rec).Config
 	if def := checker.DefaultConfig(); cfg.Workers != def.Workers || cfg.Timeout != def.Timeout {
 		t.Errorf("workers=0 timeout=0 became %d / %v, want the defaults %d / %v", cfg.Workers, cfg.Timeout, def.Workers, def.Timeout)
+	}
+}
+
+// Small API rough edges: an empty result list came back as "results":
+// null, ?limit had no upper bound, an unknown /api/ path got the UI's
+// plain-text 404, and /static/ answered for the directory itself.
+func TestAPIRoughEdges(t *testing.T) {
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus := logbus.New(100, logbus.LevelInfo)
+	mgr := worker.New(st, bus)
+	mgr.ConfigureCache("", 0, 0, true)
+	t.Cleanup(func() { mgr.CloseAll(); bus.Close(); _ = st.Close() })
+	static := fstest.MapFS{
+		"index.html": {Data: []byte("<html></html>")},
+		"app.js":     {Data: []byte("1")},
+	}
+	s := New(Options{Addr: "127.0.0.1:0", Manager: mgr, Store: st, Bus: bus, StaticFS: static})
+
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w"}`, nil)
+	id := decodeView(t, rec).ID
+	rec = do(t, s, "GET", "/api/workers/"+id+"/results", "", "", nil)
+	if !strings.Contains(rec.Body.String(), `"results":[]`) {
+		t.Errorf("empty results: %s, want \"results\":[]", rec.Body.String())
+	}
+
+	names := seqNames("name", maxResultsPage+5)
+	if _, err := mgr.SetInput(context.Background(), id, names); err != nil {
+		t.Fatal(err)
+	}
+	batch := make([]store.Result, 0, len(names))
+	for _, n := range names {
+		batch = append(batch, store.Result{WorkerID: id, Username: n, Status: "free"})
+	}
+	if err := st.RecordResults(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, s, "GET", "/api/workers/"+id+"/results?limit=1000000", "", "", nil)
+	var page struct {
+		Results []store.Result `json:"results"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &page)
+	if len(page.Results) != maxResultsPage {
+		t.Errorf("?limit=1000000 returned %d results, want the cap %d", len(page.Results), maxResultsPage)
+	}
+
+	rec = do(t, s, "GET", "/api/nope", "", "", nil)
+	if rec.Code != http.StatusNotFound || !strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
+		t.Errorf("GET /api/nope: %d %q %s, want a JSON 404", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	if rec := do(t, s, "GET", "/static/", "", "", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("GET /static/: %d %s, want 404", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, s, "GET", "/static/app.js", "", "", nil); rec.Code != http.StatusOK {
+		t.Errorf("GET /static/app.js: %d", rec.Code)
+	}
+	if rec := do(t, s, "GET", "/", "", "", nil); rec.Code != http.StatusOK {
+		t.Errorf("GET /: %d", rec.Code)
 	}
 }
