@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS worker_inputs (
 CREATE INDEX IF NOT EXISTS idx_inputs_pending
     ON worker_inputs(worker_id, checked, seq);
 
+CREATE INDEX IF NOT EXISTS idx_inputs_user
+    ON worker_inputs(worker_id, username);
+
 CREATE TABLE IF NOT EXISTS results (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     worker_id    TEXT NOT NULL,
@@ -399,6 +402,18 @@ func (s *Store) InsertResult(ctx context.Context, r Result) (int64, error) {
 // layer batches results from the SSE stream to keep insertion costs low at
 // high throughput.
 func (s *Store) InsertResults(ctx context.Context, rs []Result) error {
+	return s.insertResults(ctx, rs, false)
+}
+
+// RecordResults appends a batch of rows and flags the matching inputs as
+// checked, in one transaction. Resume relies on the flag, so keeping both in
+// the same commit means a crash or a failed write can never leave a name
+// marked done without its result row: the name stays pending instead.
+func (s *Store) RecordResults(ctx context.Context, rs []Result) error {
+	return s.insertResults(ctx, rs, true)
+}
+
+func (s *Store) insertResults(ctx context.Context, rs []Result, markChecked bool) error {
 	if len(rs) == 0 {
 		return nil
 	}
@@ -414,11 +429,25 @@ func (s *Store) InsertResults(ctx context.Context, rs []Result) error {
 		return err
 	}
 	defer stmt.Close()
+	var mark *sql.Stmt
+	if markChecked {
+		mark, err = tx.PrepareContext(ctx,
+			`UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username = ?`)
+		if err != nil {
+			return err
+		}
+		defer mark.Close()
+	}
 	now := time.Now().UnixMilli()
 	for _, r := range rs {
 		if _, err := stmt.ExecContext(ctx, r.WorkerID, r.Username, r.Status, r.Error, r.TookNs, now,
 			r.Confidence, r.Evidence, r.Cached); err != nil {
 			return err
+		}
+		if mark != nil {
+			if _, err := mark.ExecContext(ctx, r.WorkerID, r.Username); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()

@@ -561,19 +561,14 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 		}
 		c, cancel := dbCtx()
 		defer cancel()
-		if err := m.store.InsertResults(c, batch); err != nil {
+		// The rows and the per-name "done" flags used by resume mode are
+		// written in one transaction (one commit per batch, not one per
+		// name). If the write fails, the names stay pending and a resume
+		// checks them again.
+		if err := m.store.RecordResults(c, batch); err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("persist: %v", err))
 		}
 		batch = batch[:0]
-	}
-
-	// markChecked records the per-name "done" flag used by resume mode.
-	// Errors are intentionally ignored: the row may have been deleted by
-	// the user (clear/reset) while a result was in flight.
-	markChecked := func(r checker.Result) {
-		c, cancel := dbCtx()
-		defer cancel()
-		_ = m.store.MarkInputChecked(c, w.id, r.Username)
 	}
 
 	for {
@@ -606,7 +601,6 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 				Evidence:   r.Evidence,
 				Cached:     r.Cached,
 			})
-			markChecked(r)
 			if len(batch) >= batchSize {
 				flush()
 			}
