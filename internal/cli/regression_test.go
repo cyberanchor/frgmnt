@@ -151,3 +151,16 @@ func TestChallengeIsRetriedAsError(t *testing.T) {
 		t.Errorf("challenge page: status=%q after %d requests, want error after 3", r.Status, srv.count("alice"))
 	}
 }
+
+// The web engine reads the Location of 301/302/303/307/308; the console
+// engine only of 301/302, so a 307 to /?query= (free) became "HTTP 307".
+func TestRedirectCodesLikeWeb(t *testing.T) {
+	for _, code := range []int{http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		r, _ := checkWith(t, 0, func(w http.ResponseWriter, r *http.Request, name string) {
+			http.Redirect(w, r, "/?query="+name, code)
+		})
+		if r.Status != StatusFree {
+			t.Errorf("%d -> /?query=: got %q (%s), want free", code, r.Status, r.Error)
+		}
+	}
+}

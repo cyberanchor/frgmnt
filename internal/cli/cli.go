@@ -1133,7 +1133,7 @@ func doRequest(ctx context.Context, name, reqURL string, client *http.Client, st
 
 	switch resp.StatusCode {
 
-	case 301, 302:
+	case 301, 302, 303, 307, 308: // the same set as the web engine
 		loc := resp.Header.Get("Location")
 		debugf("@%s REDIRECT -> %s", name, loc)
 		switch {
