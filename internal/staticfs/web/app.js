@@ -418,18 +418,20 @@ function nsToSec(ns) { return Math.round(Number(ns) / 1_000_000_000); }
 $("#worker-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const id = $("#worker-form-id").value;
-    const cfg = {
+    // The form shows only some fields. Start from the worker's current
+    // config so the others (read_limit, insecure_tls, rl_wait_max, cache
+    // settings) keep their values; a new worker gets them from the server.
+    // Saving used to reset them to 16384 / false / 30 s.
+    const cfg = id ? { ...(state.workers.get(id)?.config || {}) } : {};
+    Object.assign(cfg, {
         workers: +$("#worker-workers").value || 1,
         max_conns: +$("#worker-conns").value || 1,
         rate_rps: +$("#worker-rate").value || 0,
         retries: +$("#worker-retries").value || 0,
         retry_delay_ns: (+$("#worker-retry-delay").value || 500) * 1_000_000,
-        rl_wait_max_ns: 30_000_000_000,
         timeout_ns: (+$("#worker-timeout").value || 15) * 1_000_000_000,
-        read_limit: 16384,
         user_agent: $("#worker-ua").value.trim(),
-        insecure_tls: false,
-    };
+    });
     const body = { name: $("#worker-name").value.trim(), config: cfg };
     try {
         if (id) await api("PATCH", `/api/workers/${id}`, body);
