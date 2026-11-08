@@ -309,10 +309,14 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
-		var body struct {
+		// Decode onto the defaults: fields left out of the request keep
+		// the values from Settings (default_retries, default_rate_rps, ...)
+		// instead of becoming zero.
+		def := defaultConfigFromSettings(s.store.GetSettings())
+		body := struct {
 			Name   string         `json:"name"`
 			Config checker.Config `json:"config"`
-		}
+		}{Config: def}
 		if err := readJSON(r, &body); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -321,8 +325,8 @@ func (s *Server) handleWorkersCollection(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, "name is required")
 			return
 		}
-		// Apply defaults onto zero fields.
-		body.Config = mergeConfig(body.Config, defaultConfigFromSettings(s.store.GetSettings()))
+		// Zero counts and durations fall back to the defaults too.
+		body.Config = mergeConfig(body.Config, def)
 		if err := body.Config.Validate(); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -430,20 +434,23 @@ func (s *Server) handleWorkerCRUD(w http.ResponseWriter, r *http.Request, id str
 		}
 		writeJSON(w, http.StatusOK, toView(w2))
 	case http.MethodPatch, http.MethodPut:
-		var body struct {
-			Name   string         `json:"name"`
-			Config checker.Config `json:"config"`
-		}
-		if err := readJSON(r, &body); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		existing, err := s.mgr.Get(id)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		if body.Name == "" {
+		// A partial update: decode onto the current values, so fields that
+		// are not in the request (retries, rate_rps, insecure_tls, cache
+		// settings, ...) stay as they are.
+		body := struct {
+			Name   string         `json:"name"`
+			Config checker.Config `json:"config"`
+		}{Name: existing.Name(), Config: existing.Config()}
+		if err := readJSON(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if strings.TrimSpace(body.Name) == "" {
 			body.Name = existing.Name()
 		}
 		body.Config = mergeConfig(body.Config, existing.Config())

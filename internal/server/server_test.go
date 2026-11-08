@@ -156,3 +156,58 @@ func TestHostCheckOnlyForLoopbackListeners(t *testing.T) {
 		}
 	}
 }
+
+// PATCH {"name": ...} is a partial update, but the handler decoded the body
+// into a zero config and mergeConfig only backfilled some fields, so a
+// rename reset retries, rate_rps, insecure_tls and the cache settings.
+func TestPatchRenameKeepsConfig(t *testing.T) {
+	s, _ := newTestServer(t)
+	rec := do(t, s, "POST", "/api/workers", "application/json",
+		`{"name":"w","config":{"workers":5,"retries":5,"rate_rps":7,"insecure_tls":true,"cache_ttl_ns":60000000000}}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	created := decodeView(t, rec)
+	rec = do(t, s, "PATCH", "/api/workers/"+created.ID, "application/json", `{"name":"renamed"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+	v := decodeView(t, rec)
+	if v.Name != "renamed" {
+		t.Errorf("name = %q, want renamed", v.Name)
+	}
+	if v.Config != created.Config {
+		t.Errorf("rename changed the config:\n before %+v\n after  %+v", created.Config, v.Config)
+	}
+
+	rec = do(t, s, "PATCH", "/api/workers/"+created.ID, "application/json", `{"config":{"retries":0}}`, nil)
+	v = decodeView(t, rec)
+	if v.Config.Retries != 0 || v.Config.RateRPS != 7 || v.Name != "renamed" {
+		t.Errorf("PATCH retries=0: retries=%d rate_rps=%d name=%q, want 0/7/renamed", v.Config.Retries, v.Config.RateRPS, v.Name)
+	}
+}
+
+// default_retries and default_rate_rps in Settings are the defaults for new
+// workers, but POST /api/workers ignored them for fields left out.
+func TestCreateUsesSettingsDefaults(t *testing.T) {
+	s, st := newTestServer(t)
+	set := st.GetSettings()
+	set.DefaultRetries = 4
+	set.DefaultRateRPS = 9
+	if err := st.PutSettings(set); err != nil {
+		t.Fatal(err)
+	}
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"w","config":{}}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	got := decodeView(t, rec).Config
+	if got.Retries != 4 || got.RateRPS != 9 {
+		t.Errorf("new worker: retries=%d rate_rps=%d, want the settings defaults 4/9", got.Retries, got.RateRPS)
+	}
+	rec = do(t, s, "POST", "/api/workers", "application/json", `{"name":"w2","config":{"retries":0,"rate_rps":0}}`, nil)
+	got = decodeView(t, rec).Config
+	if got.Retries != 0 || got.RateRPS != 0 {
+		t.Errorf("explicit retries=0 rate_rps=0 became %d/%d", got.Retries, got.RateRPS)
+	}
+}
