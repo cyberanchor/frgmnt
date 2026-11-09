@@ -629,3 +629,54 @@ func TestClearThenResumeChecksAgain(t *testing.T) {
 		t.Errorf("after Clear and Resume: %d results, want 6", rows)
 	}
 }
+
+// Storing a big list takes seconds. A Start in that time used to pass the
+// status check and begin a run that read the list while it was replaced;
+// a second upload could interleave the same way. Both are refused now
+// until the list is stored.
+func TestStartRefusedWhileListIsStored(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	w, err := h.m.Create(ctx, "loader", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(3)); err != nil {
+		t.Fatal(err)
+	}
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.m.SetInputFrom(ctx, w.ID(), func(add func(string) error) error {
+			if err := add("first"); err != nil {
+				return err
+			}
+			close(inside)
+			<-release
+			return add("second")
+		})
+		done <- err
+	}()
+	<-inside
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != ErrWorkerBusy {
+		t.Errorf("Start while a list is stored: %v, want ErrWorkerBusy", err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(5)); err != ErrWorkerBusy {
+		t.Errorf("second list while one is stored: %v, want ErrWorkerBusy", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := h.st.InputCount(ctx, w.ID()); n != 2 {
+		t.Errorf("%d names stored, want 2", n)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatalf("Start after the list was stored: %v", err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+}

@@ -40,8 +40,19 @@ func Open(dataDir string) (*Store, error) {
 	// which capped the result writer at ~2,300 rows/s). The database
 	// cannot be corrupted this way; a power loss can only undo the last
 	// commits, and those names stay pending for Resume.
+	//
+	// cache_size(-16384): a 16 MB page cache instead of SQLite's 2 MB.
+	// Names of a real list come in random order, so every insert lands
+	// somewhere else in idx_inputs_user; storing 500,000 shuffled names took
+	// 15.7 s with 2 MB and 10.1 s with 16 MB (64 MB gave no more).
+	//
+	// journal_size_limit(16 MB): after a big transaction (a list of a
+	// million names writes ~140 MB of log) the WAL file kept that size on
+	// disk for as long as the panel ran; now it is cut back when the log
+	// is next reset.
 	dsn := "file:" + filepath.Join(dataDir, "data.db") +
-		"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+		"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)" +
+		"&_pragma=cache_size(-16384)&_pragma=journal_size_limit(16777216)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -285,45 +296,67 @@ var ErrNotFound = errors.New("not found")
 // deleted. The old results used to stay as they were: a resume after a new
 // list mixed both lists in the results and in the download.
 func (s *Store) ReplaceInputs(ctx context.Context, workerID string, names []string) error {
+	_, err := s.ReplaceInputsFrom(ctx, workerID, func(add func(name string) error) error {
+		for _, n := range names {
+			if err := add(n); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err
+}
+
+// ReplaceInputsFrom is ReplaceInputs for a list that is not held in a
+// slice: each calls add once per name, in upload order, and the names are
+// written in chunks as they come. It returns how many names were stored.
+// Everything happens in one transaction, so a failure (or an error from
+// each) leaves the previous list as it was.
+func (s *Store) ReplaceInputsFrom(ctx context.Context, workerID string, each func(add func(name string) error) error) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `DELETE FROM worker_inputs WHERE worker_id = ?`, workerID); err != nil {
-		return err
+		return 0, err
 	}
 	ins := newBatchInsert(tx, insertInputsHead, 3, inputChunk)
 	defer ins.Close()
-	for i, n := range names {
-		if err := ins.Add(ctx, workerID, i, n); err != nil {
+	var n int64
+	if err := each(func(name string) error {
+		if err := ins.Add(ctx, workerID, n, name); err != nil {
 			return err
 		}
+		n++
+		return nil
+	}); err != nil {
+		return 0, err
 	}
 	if err := ins.Flush(ctx); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM results WHERE worker_id = ? AND username NOT IN
 		     (SELECT username FROM worker_inputs WHERE worker_id = ?)`,
 		workerID, workerID,
 	); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username IN
 		     (SELECT username FROM results WHERE worker_id = ?)`,
 		workerID, workerID,
 	); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE workers SET total = ?, updated_at = ? WHERE id = ?`,
-		len(names), time.Now().UnixMilli(), workerID,
+		n, time.Now().UnixMilli(), workerID,
 	); err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Commit()
+	return n, tx.Commit()
 }
 
 // InputCount returns how many usernames are queued for the worker.

@@ -221,31 +221,48 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 // SetInput replaces the input list of a worker. Allowed only when the
 // worker is not currently running.
 func (m *Manager) SetInput(ctx context.Context, id string, names []string) (int64, error) {
+	return m.SetInputFrom(ctx, id, func(add func(name string) error) error {
+		for _, n := range names {
+			if err := add(n); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// SetInputFrom is SetInput for a list that is not held in a slice (see
+// store.ReplaceInputsFrom). Storing a big list takes seconds; meanwhile
+// the worker cannot be started and a second list is refused, so a run
+// never reads a list that is being replaced.
+func (m *Manager) SetInputFrom(ctx context.Context, id string, each func(add func(name string) error) error) (int64, error) {
 	w, err := m.Get(id)
 	if err != nil {
 		return 0, err
 	}
-	if w.Status() == StatusRunning {
+	if !w.beginLoad() {
 		return 0, ErrWorkerBusy
 	}
-	if err := m.store.ReplaceInputs(ctx, id, names); err != nil {
+	defer w.endLoad()
+	n, err := m.store.ReplaceInputsFrom(ctx, id, each)
+	if err != nil {
 		return 0, err
 	}
 	m.refreshProgress(ctx, w)
 	switch checked := w.checkedCount(); {
-	case len(names) == 0:
+	case n == 0:
 		w.setStatus(StatusIdle)
-	case checked >= int64(len(names)):
+	case checked >= n:
 		w.setStatus(StatusDone) // every name already has a result
 	default:
 		w.setStatus(StatusReady)
 	}
-	msg := fmt.Sprintf("input loaded: %d usernames", len(names))
+	msg := fmt.Sprintf("input loaded: %d usernames", n)
 	if checked := w.checkedCount(); checked > 0 {
 		msg += fmt.Sprintf(" (%d already have a result and are kept)", checked)
 	}
 	m.bus.Publish(logbus.LevelInfo, id, msg)
-	return int64(len(names)), nil
+	return n, nil
 }
 
 // StartOptions controls Start behaviour.
@@ -262,13 +279,8 @@ func (m *Manager) Start(ctx context.Context, id string, opt StartOptions) error 
 	if err != nil {
 		return err
 	}
-	if !w.compareAndSwapStatus(StatusReady, StatusRunning) &&
-		!w.compareAndSwapStatus(StatusDone, StatusRunning) &&
-		!w.compareAndSwapStatus(StatusError, StatusRunning) {
-		if w.Status() == StatusRunning {
-			return ErrWorkerBusy
-		}
-		return ErrNotReady
+	if err := w.tryStart(); err != nil {
+		return err
 	}
 
 	// Use a context derived from the manager-level background context,
@@ -382,6 +394,7 @@ type Worker struct {
 	total     int64
 	startedAt time.Time
 	resume    bool // set by Start; consumed by run
+	loading   bool // SetInputFrom is storing a new list; Start waits for it
 	cancel    context.CancelFunc
 	done      chan struct{}    // closed when the current run returns; nil before the first Start
 	chk       *checker.Checker // non-nil while running
@@ -556,17 +569,45 @@ func (w *Worker) setStatus(s Status) {
 	}
 }
 
-func (w *Worker) compareAndSwapStatus(from, to Status) bool {
+// tryStart moves a ready, finished or failed worker to running, under one
+// lock with the check for a list being stored. The status is saved after
+// the lock is released: a Start during a long upload used to wait for the
+// database while holding the lock, which also stalled every read of the
+// tile.
+func (w *Worker) tryStart() error {
+	w.mu.Lock()
+	switch {
+	case w.status == StatusRunning, w.loading:
+		w.mu.Unlock()
+		return ErrWorkerBusy
+	case w.status != StatusReady && w.status != StatusDone && w.status != StatusError:
+		w.mu.Unlock()
+		return ErrNotReady
+	}
+	w.status = StatusRunning
+	w.mu.Unlock()
+	if w.manager != nil && w.manager.store != nil {
+		_ = w.manager.store.SetWorkerStatus(context.Background(), w.id, string(StatusRunning))
+	}
+	return nil
+}
+
+// beginLoad marks the worker as storing a new list. It fails while the
+// worker runs or another list is being stored.
+func (w *Worker) beginLoad() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.status != from {
+	if w.loading || w.status == StatusRunning {
 		return false
 	}
-	w.status = to
-	if w.manager != nil && w.manager.store != nil {
-		_ = w.manager.store.SetWorkerStatus(context.Background(), w.id, string(to))
-	}
+	w.loading = true
 	return true
+}
+
+func (w *Worker) endLoad() {
+	w.mu.Lock()
+	w.loading = false
+	w.mu.Unlock()
 }
 
 // -----------------------------------------------------------------------------

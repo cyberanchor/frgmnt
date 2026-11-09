@@ -194,6 +194,16 @@ func FuzzParseNamesReaderMatchesParseNames(f *testing.F) {
 		if !reflect.DeepEqual(a, b) || ra != rb {
 			t.Errorf("ParseNames %q -> %v (rejected %d), ParseNamesReader -> %v (rejected %d)", blob, a, ra, b, rb)
 		}
+		// The panel's upload path keeps the names in a NameList instead.
+		list, rc, err := CollectNames(strings.NewReader(blob))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var c []string
+		_ = list.Each(func(name string) error { c = append(c, name); return nil })
+		if !reflect.DeepEqual(a, c) || ra != rc || list.Len() != len(c) {
+			t.Errorf("ParseNames %q -> %v (rejected %d), CollectNames -> %v (rejected %d, Len %d)", blob, a, ra, c, rc, list.Len())
+		}
 	})
 }
 

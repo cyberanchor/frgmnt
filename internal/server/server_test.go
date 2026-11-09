@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -669,5 +670,71 @@ func TestCacheDirNotSettableThroughAPI(t *testing.T) {
 	}
 	if rec := do(t, s, "PATCH", "/api/workers/"+old.ID(), "application/json", `{"name":"renamed"}`, nil); rec.Code != http.StatusOK {
 		t.Errorf("PATCH name of a worker with a cache_dir: %d %s, want 200", rec.Code, rec.Body.String())
+	}
+}
+
+// The upload read the whole multipart form first (a temporary file for
+// anything over 10 MB) and then held the names in a []string and a map.
+// Now the "file" part is parsed as it arrives; other fields before it are
+// skipped, and an upload over the cap gets 413 instead of a parse error.
+func TestUploadStreamsTheFilePart(t *testing.T) {
+	s, st := newTestServer(t)
+	rec := do(t, s, "POST", "/api/workers", "application/json", `{"name":"up","config":{}}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	id := decodeView(t, rec).ID
+
+	upload := func(fields map[string]string, order []string) *httptest.ResponseRecorder {
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		for _, name := range order {
+			if name == "file" {
+				fw, err := mw.CreateFormFile("file", "names.txt")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, _ = fw.Write([]byte(fields[name]))
+				continue
+			}
+			_ = mw.WriteField(name, fields[name])
+		}
+		_ = mw.Close()
+		return do(t, s, "POST", "/api/workers/"+id+"/input/upload", mw.FormDataContentType(), buf.String(), nil)
+	}
+
+	rec = upload(map[string]string{"note": "ignored", "file": "alice\nBobby, alice;bad-name\n@carol | free\ndave"},
+		[]string{"note", "file"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload: %d %s", rec.Code, rec.Body.String())
+	}
+	var got struct{ Accepted, Rejected int }
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Accepted != 4 || got.Rejected != 1 {
+		t.Errorf("accepted %d, rejected %d; want 4 and 1", got.Accepted, got.Rejected)
+	}
+	var names []string
+	if err := st.IterInputs(context.Background(), id, func(n string) error { names = append(names, n); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(names, ",") != "alice,bobby,carol,dave" {
+		t.Errorf("stored list %v, want alice,bobby,carol,dave in order", names)
+	}
+
+	if rec := upload(map[string]string{"note": "x"}, []string{"note"}); rec.Code != http.StatusBadRequest {
+		t.Errorf("upload without a file field: %d, want 400", rec.Code)
+	}
+
+	old := maxUploadBytes
+	maxUploadBytes = 1 << 10
+	t.Cleanup(func() { maxUploadBytes = old })
+	if rec := upload(map[string]string{"file": strings.Repeat("abcdefgh\n", 500)}, []string{"file"}); rec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("upload over the cap: %d %s, want 413", rec.Code, rec.Body.String())
+	}
+	// The list stored before the refused upload is still there.
+	if n, _ := st.InputCount(context.Background(), id); n != 4 {
+		t.Errorf("%d names after a refused upload, want the previous 4", n)
 	}
 }

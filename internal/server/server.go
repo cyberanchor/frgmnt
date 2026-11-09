@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -788,8 +789,17 @@ func (s *Server) handleWorkerInput(w http.ResponseWriter, r *http.Request, id st
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	names, rejected := checker.ParseNames(body.Text)
-	n, err := s.mgr.SetInput(r.Context(), id, names)
+	list, rejected, _ := checker.CollectNames(strings.NewReader(body.Text))
+	body.Text = "" // the list holds the names now
+	s.storeInput(w, r, id, list, rejected)
+}
+
+// storeInput replaces the worker's list with list and answers with the
+// counts. The names are parsed before this point, so the database is only
+// held for the write itself and never while a slow client is still
+// sending the file.
+func (s *Server) storeInput(w http.ResponseWriter, r *http.Request, id string, list *checker.NameList, rejected int) {
+	n, err := s.mgr.SetInputFrom(r.Context(), id, list.Each)
 	if err != nil {
 		if errors.Is(err, worker.ErrWorkerBusy) {
 			writeError(w, http.StatusConflict, err.Error())
@@ -809,35 +819,55 @@ func (s *Server) handleWorkerInputUpload(w http.ResponseWriter, r *http.Request,
 		methodNotAllowed(w, "POST")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 100<<20) // 100 MB cap
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	// The file part is read straight from the request: ParseMultipartForm
+	// copied an upload over 10 MB into a temporary file first, and the
+	// names then went into a []string plus a map (about 170 MB per million
+	// names); CollectNames keeps them in a compact list instead.
+	mr, err := r.MultipartReader()
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "parse multipart: "+err.Error())
 		return
 	}
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "missing file: "+err.Error())
-		return
-	}
-	defer file.Close()
-	names, rejected, err := checker.ParseNamesReader(file)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "parse file: "+err.Error())
-		return
-	}
-	n, err := s.mgr.SetInput(r.Context(), id, names)
-	if err != nil {
-		if errors.Is(err, worker.ErrWorkerBusy) {
-			writeError(w, http.StatusConflict, err.Error())
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "missing file: no \"file\" field in the upload")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
+		if err != nil {
+			writeUploadError(w, "parse multipart", err)
+			return
+		}
+		if part.FormName() != "file" {
+			_ = part.Close() // another form field: skip it
+			continue
+		}
+		list, rejected, err := checker.CollectNames(part)
+		_ = part.Close()
+		if err != nil {
+			writeUploadError(w, "parse file", err)
+			return
+		}
+		s.storeInput(w, r, id, list, rejected)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"accepted": n,
-		"rejected": rejected,
-	})
+}
+
+// maxUploadBytes caps a list upload (about 10 million names). A variable
+// so tests can lower it.
+var maxUploadBytes int64 = 100 << 20
+
+// writeUploadError answers a failed upload: 413 when the file is over
+// maxUploadBytes, 400 otherwise.
+func writeUploadError(w http.ResponseWriter, what string, err error) {
+	var tooBig *http.MaxBytesError
+	if errors.As(err, &tooBig) {
+		writeError(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("%s: the file is larger than %d MB", what, maxUploadBytes>>20))
+		return
+	}
+	writeError(w, http.StatusBadRequest, what+": "+err.Error())
 }
 
 func (s *Server) handleWorkerStart(w http.ResponseWriter, r *http.Request, id string) {
