@@ -35,7 +35,13 @@ func Open(dataDir string) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
-	dsn := "file:" + filepath.Join(dataDir, "data.db") + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	// synchronous(NORMAL): in WAL mode a commit no longer waits for an
+	// fsync of the log (the default FULL did, about 14 ms per commit here,
+	// which capped the result writer at ~2,300 rows/s). The database
+	// cannot be corrupted this way; a power loss can only undo the last
+	// commits, and those names stay pending for Resume.
+	dsn := "file:" + filepath.Join(dataDir, "data.db") +
+		"?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -287,15 +293,15 @@ func (s *Store) ReplaceInputs(ctx context.Context, workerID string, names []stri
 	if _, err := tx.ExecContext(ctx, `DELETE FROM worker_inputs WHERE worker_id = ?`, workerID); err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO worker_inputs (worker_id, seq, username) VALUES (?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	ins := newBatchInsert(tx, insertInputsHead, 3, inputChunk)
+	defer ins.Close()
 	for i, n := range names {
-		if _, err := stmt.ExecContext(ctx, workerID, i, n); err != nil {
+		if err := ins.Add(ctx, workerID, i, n); err != nil {
 			return err
 		}
+	}
+	if err := ins.Flush(ctx); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM results WHERE worker_id = ? AND username NOT IN
@@ -497,35 +503,142 @@ func (s *Store) insertResults(ctx context.Context, rs []Result, markChecked bool
 		return err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO results (worker_id, username, status, error, took_ns, checked_at, confidence, evidence, cached)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	var mark *sql.Stmt
-	if markChecked {
-		mark, err = tx.PrepareContext(ctx,
-			`UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username = ?`)
-		if err != nil {
-			return err
-		}
-		defer mark.Close()
-	}
+	ins := newBatchInsert(tx, insertResultsHead, 9, resultChunk)
+	defer ins.Close()
 	now := time.Now().UnixMilli()
 	for _, r := range rs {
-		if _, err := stmt.ExecContext(ctx, r.WorkerID, r.Username, r.Status, r.Error, r.TookNs, now,
+		if err := ins.Add(ctx, r.WorkerID, r.Username, r.Status, r.Error, r.TookNs, now,
 			r.Confidence, r.Evidence, r.Cached); err != nil {
 			return err
 		}
-		if mark != nil {
-			if _, err := mark.ExecContext(ctx, r.WorkerID, r.Username); err != nil {
-				return err
-			}
+	}
+	if err := ins.Flush(ctx); err != nil {
+		return err
+	}
+	if markChecked {
+		if err := markInputsChecked(ctx, tx, rs); err != nil {
+			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// -----------------------------------------------------------------------------
+// Multi-row statements
+// -----------------------------------------------------------------------------
+
+// modernc's SQLite is pure Go and pays a lot per statement, so a prepared
+// single-row INSERT run once per row was the bottleneck of both writers:
+// 200,000 names took 7.3 s, and a results batch of 32 rows cost 64
+// statements (an INSERT and an UPDATE per row). One INSERT now carries a
+// chunk of rows and one UPDATE flags a chunk of names. The chunks stay far
+// below SQLite's limit of 32,766 parameters per statement.
+const (
+	inputChunk  = 200 // rows per INSERT INTO worker_inputs (3 parameters each)
+	resultChunk = 64  // rows per INSERT INTO results (9 parameters each), names per checked-flag UPDATE
+
+	insertInputsHead  = `INSERT INTO worker_inputs (worker_id, seq, username)`
+	insertResultsHead = `INSERT INTO results (worker_id, username, status, error, took_ns, checked_at, confidence, evidence, cached)`
+)
+
+// valuesSQL returns head followed by " VALUES (?,…),(?,…)…" for rows rows
+// of cols parameters each.
+func valuesSQL(head string, rows, cols int) string {
+	group := "(" + strings.TrimSuffix(strings.Repeat("?,", cols), ",") + ")"
+	var b strings.Builder
+	b.Grow(len(head) + 8 + rows*(len(group)+1))
+	b.WriteString(head)
+	b.WriteString(" VALUES ")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(group)
+	}
+	return b.String()
+}
+
+// batchInsert queues rows and writes them with one multi-row INSERT per
+// chunk. The statement for a full chunk is prepared on first use and
+// reused; a shorter tail (Flush) runs unprepared. Not safe for concurrent
+// use.
+type batchInsert struct {
+	tx    *sql.Tx
+	head  string
+	cols  int
+	chunk int
+	full  *sql.Stmt
+	args  []any
+}
+
+func newBatchInsert(tx *sql.Tx, head string, cols, chunk int) *batchInsert {
+	return &batchInsert{tx: tx, head: head, cols: cols, chunk: chunk, args: make([]any, 0, cols*chunk)}
+}
+
+// Add queues one row (cols values) and writes the chunk once it is full.
+func (b *batchInsert) Add(ctx context.Context, vals ...any) error {
+	b.args = append(b.args, vals...)
+	if len(b.args) < b.cols*b.chunk {
+		return nil
+	}
+	if b.full == nil {
+		stmt, err := b.tx.PrepareContext(ctx, valuesSQL(b.head, b.chunk, b.cols))
+		if err != nil {
+			return err
+		}
+		b.full = stmt
+	}
+	_, err := b.full.ExecContext(ctx, b.args...)
+	b.args = b.args[:0]
+	return err
+}
+
+// Flush writes the queued rows of an incomplete chunk.
+func (b *batchInsert) Flush(ctx context.Context) error {
+	n := len(b.args) / b.cols
+	if n == 0 {
+		return nil
+	}
+	_, err := b.tx.ExecContext(ctx, valuesSQL(b.head, n, b.cols), b.args...)
+	b.args = b.args[:0]
+	return err
+}
+
+// Close releases the prepared statement, if any.
+func (b *batchInsert) Close() {
+	if b.full != nil {
+		_ = b.full.Close()
+	}
+}
+
+// markCheckedSQL flags n names of one worker as checked. The IN list is
+// resolved through idx_inputs_user, one index lookup per name, like the
+// single-name form.
+func markCheckedSQL(n int) string {
+	return `UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username IN (` +
+		strings.TrimSuffix(strings.Repeat("?,", n), ",") + `)`
+}
+
+// markInputsChecked flags the inputs of rs as checked, up to resultChunk
+// names per statement. Rows are grouped by worker, in order.
+func markInputsChecked(ctx context.Context, tx *sql.Tx, rs []Result) error {
+	args := make([]any, 0, resultChunk+1)
+	for start := 0; start < len(rs); {
+		wid := rs[start].WorkerID
+		end := start
+		for end < len(rs) && end-start < resultChunk && rs[end].WorkerID == wid {
+			end++
+		}
+		args = append(args[:0], wid)
+		for _, r := range rs[start:end] {
+			args = append(args, r.Username)
+		}
+		if _, err := tx.ExecContext(ctx, markCheckedSQL(end-start), args...); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
 }
 
 // ClearResults removes every result for a worker and makes every name

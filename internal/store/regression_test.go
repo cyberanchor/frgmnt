@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -72,8 +73,8 @@ func TestRecordResultsMarksInputsCheckedAtomically(t *testing.T) {
 // result scanned all inputs of the worker.
 func TestCheckedFlagUpdateUsesIndex(t *testing.T) {
 	s := openTestStore(t)
-	rows, err := s.db.Query(`EXPLAIN QUERY PLAN
-		UPDATE worker_inputs SET checked = 1 WHERE worker_id = ? AND username = ?`, "w", "alice")
+	// The statement the result writer runs: many names per UPDATE.
+	rows, err := s.db.Query(`EXPLAIN QUERY PLAN `+markCheckedSQL(3), "w", "alice", "bob", "carol")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,3 +234,55 @@ func TestClearResultsMakesNamesPending(t *testing.T) {
 		t.Errorf("pending after Clear: %v, want both names", got)
 	}
 }
+
+// Inputs and results are written with multi-row statements in chunks
+// (inputChunk, resultChunk). Sizes around the chunk boundaries must keep
+// every row, in order, and flag exactly the names that got a result.
+func TestBatchedWritesKeepEveryRowInOrder(t *testing.T) {
+	ctx := context.Background()
+	for _, n := range []int{1, inputChunk - 1, inputChunk, inputChunk + 1, 2*inputChunk + 7} {
+		s := openTestStore(t)
+		if err := s.CreateWorker(ctx, Worker{ID: "w", Name: "w", ConfigJSON: "{}"}); err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, n)
+		for i := range names {
+			names[i] = "name" + strings.Repeat("x", i%3) + string(rune('a'+i%26)) + itoa(i)
+		}
+		if err := s.ReplaceInputs(ctx, "w", names); err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		if got := pendingNames(t, s, "w"); !equalStrSlice(got, names) {
+			t.Fatalf("n=%d: %d pending names, want all %d in upload order", n, len(got), n)
+		}
+		// Results for every other name, a batch larger than resultChunk.
+		var rs []Result
+		for i := 0; i < n; i += 2 {
+			rs = append(rs, Result{WorkerID: "w", Username: names[i], Status: "free", Evidence: "e" + itoa(i)})
+		}
+		if err := s.RecordResults(ctx, rs); err != nil {
+			t.Fatalf("n=%d: %v", n, err)
+		}
+		got, err := s.ListResults(ctx, "w", 0, 10*n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(rs) {
+			t.Fatalf("n=%d: %d result rows, want %d", n, len(got), len(rs))
+		}
+		for i, r := range got {
+			if r.Username != rs[i].Username || r.Evidence != rs[i].Evidence {
+				t.Fatalf("n=%d: row %d = %s/%s, want %s/%s", n, i, r.Username, r.Evidence, rs[i].Username, rs[i].Evidence)
+			}
+		}
+		var want []string
+		for i := 1; i < n; i += 2 {
+			want = append(want, names[i])
+		}
+		if got := pendingNames(t, s, "w"); !equalStrSlice(got, want) {
+			t.Fatalf("n=%d: %d pending after results, want %d", n, len(got), len(want))
+		}
+	}
+}
+
+func itoa(i int) string { return strconv.Itoa(i) }
