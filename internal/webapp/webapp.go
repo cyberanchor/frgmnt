@@ -32,11 +32,12 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/server"
 	"github.com/cyberanchor/frgmnt/internal/staticfs"
 	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/version"
 	"github.com/cyberanchor/frgmnt/internal/worker"
 )
 
-// version is the human-readable release tag.
-const Version = "0.3.0"
+// Version is the release of frgmnt (internal/version).
+const Version = version.Version
 
 // ProgName is used in logs and -version; the unified binary sets it to
 // "frgmnt web".

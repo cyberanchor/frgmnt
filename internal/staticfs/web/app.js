@@ -160,7 +160,8 @@ $$(".tab").forEach((btn) => {
 
 async function pollHealth() {
     try {
-        await api("GET", "/api/health");
+        const h = await api("GET", "/api/health");
+        if (h && h.version) $("#version-tag").textContent = "v" + h.version;
         $("#health-dot").classList.remove("bad");
         $("#health-dot").classList.add("ok");
     } catch {

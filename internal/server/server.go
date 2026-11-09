@@ -23,6 +23,7 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/version"
 	"github.com/cyberanchor/frgmnt/internal/worker"
 )
 
@@ -472,6 +473,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"time":      time.Now(),
 		"workers":   len(s.mgr.List()),
 		"log_level": s.bus.Level().String(),
+		"version":   version.Version,
 	})
 }
 

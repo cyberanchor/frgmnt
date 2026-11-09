@@ -16,11 +16,13 @@ import (
 	"strings"
 
 	"github.com/cyberanchor/frgmnt/internal/cli"
+	appversion "github.com/cyberanchor/frgmnt/internal/version"
 	"github.com/cyberanchor/frgmnt/internal/webapp"
 )
 
-// version is the unified binary version. Component versions are independent.
-const version = "1.0.0"
+// version is the release of frgmnt; the console and the web panel report
+// the same one.
+const version = appversion.Version
 
 func main() { os.Exit(run(os.Args[1:])) }
 
@@ -41,7 +43,7 @@ func run(args []string) int {
 		webapp.ProgName = "frgmnt"
 		return webapp.TokenMain(args[1:])
 	case "version", "-version", "--version":
-		fmt.Printf("frgmnt %s (cli %s, web %s)\n", version, cli.Version, webapp.Version)
+		fmt.Printf("frgmnt %s\n", version)
 		return 0
 	case "help", "-h", "--help":
 		usage(os.Stdout)

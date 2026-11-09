@@ -47,10 +47,11 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/version"
 )
 
-// Version is the human-readable release tag printed on startup.
-const Version = "3.1"
+// Version is the release of frgmnt (internal/version).
+const Version = version.Version
 
 // ProgName is used in usage text and -version; the unified binary sets it
 // to "frgmnt check".

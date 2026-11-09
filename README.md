@@ -40,7 +40,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
 ```
 
 Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
-`frgmnt 1.0.0 (cli 3.1, web 0.3.0)`; `./frgmnt help`, `./frgmnt check -h` and
+`frgmnt 2.0.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
 `./frgmnt web -h` and `./frgmnt token -h` list every flag. The old shorthands still work:
 `./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
 
@@ -269,6 +269,56 @@ data/
   pagecache/       # gzipped Fragment pages + JSON metadata, two-level shards
 ```
 
+## Large lists and load
+
+Both modes run a list through the same pipeline; nothing waits for a batch
+to finish, and memory does not grow with the length of the list.
+
+```
+file --64 KB chunks--> names --> dedup, -resume skip --> queue (4,096) --> N workers --> queue (4,096) --> writer
+                                 (compact NameSet)                         gate, pause, -rate             file and screen
+```
+
+1. **Reading.** The list is read in 64 KB chunks and split as it comes
+   (new lines, spaces, commas, semicolons; `|` ends the names of a line); it
+   is never loaded whole. About 250 MB/s.
+2. **Dedup and `-resume`.** A name of up to 12 characters is kept as an
+   exact 8-byte key, a longer one as a string: about 68 MB per million unique
+   names. `-no-dedup` keeps memory flat.
+3. **Queue.** The reader stays at most 4,096 names ahead of the workers and
+   waits when they are slower. The console counts the file first, so the
+   progress line shows the real size of the run and an ETA.
+4. **Workers.** N goroutines take names one by one, each as soon as it is
+   free. A name is checked against the Telegram rules and the page cache
+   without a request; a request then waits for the gate (one at a time until
+   the first answer, and again after a throttle pause), for the shared pause
+   and for its `-rate` start. `-rate` counts requests, retries included, and
+   spaces them evenly.
+5. **Writer.** One goroutine writes the results file and the screen as
+   results arrive (at most ten flushes a second under a fast stream).
+
+In the panel an uploaded list is parsed while it arrives into a compact
+list, then stored in one transaction; a run reads it from the database 500
+names at a time into a 1,024-name queue, and results are saved in batches
+of 32 rows or every 250 ms. When the database is busy (another tile stores a
+big list) the writer keeps its rows and tries again, and the checks wait
+for it instead of losing results.
+
+Measured on a VM with one CPU and 1 GB of RAM:
+
+| | |
+| --- | --- |
+| 1,000,000 names in the console, no network | 1.6 s and about 80 MB with dedup, 1.3 s and about 16 MB with `-no-dedup` |
+| 500,000 shuffled names uploaded to the panel | 12.6 s, 89 MB at the peak |
+| results saved by the panel | about 18,000 rows/s |
+| panel database | about 140 MB per million names in the lists, plus the results |
+
+The speed of a run is set by Fragment, not by the program: at `-rate 3` a
+million names take almost four days. Workers beyond `rate × answer time × 2`
+(5 workers for `-rate 5` and half-second answers) only wait for starts. For
+lists of several million names use `-no-dedup` in the console; in the panel
+the database is the limit on a small disk.
+
 ## Page cache
 
 Fetched pages are stored gzipped under `.fragment_cache/` (console) or
@@ -322,6 +372,7 @@ internal/worker/     worker tiles: lifecycle, input producer, result writer
 internal/server/     REST + SSE, request guard
 internal/store/      SQLite schema, migrations, settings.json
 internal/logbus/     in-memory log ring and SSE fan-out
+internal/version/    the one version number of every mode
 internal/staticfs/   embedded panel (index.html, styles.css, app.js)
 tests/               black-box suite and HTML fixtures
 ```
