@@ -40,6 +40,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -150,6 +151,13 @@ type Stats struct {
 	total           int64
 	statusOffsetMax int64
 
+	// listNames is the number of names in the input file, counted before
+	// the run (-1: unknown, the input is a pipe); dropped counts the names
+	// the producer left out so far (duplicates, -resume skips). The names
+	// left to queue are listNames - dropped - total.
+	listNames int64
+	dropped   int64
+
 	freeCount    int64
 	freeSumUs    int64
 	freeMinUs    int64
@@ -169,7 +177,42 @@ func newStats() *Stats {
 		startTime:    time.Now(),
 		freeMinUs:    math.MaxInt64,
 		nonfreeMinUs: math.MaxInt64,
+		listNames:    -1,
 	}
+}
+
+// progressTotal returns the size of the run for the progress line and
+// whether it is final. With a counted file it is the names of the file
+// minus the ones left out so far, which becomes exact once the whole file
+// is read; it used to be the names read so far (the producer is at most
+// 4096 names ahead), so a list of 9,995 names showed "1290/5396". From a
+// pipe only the names read so far are known.
+func (s *Stats) progressTotal(checked int64) (total int64, known bool) {
+	total = atomic.LoadInt64(&s.total)
+	if n := atomic.LoadInt64(&s.listNames); n >= 0 {
+		if est := n - atomic.LoadInt64(&s.dropped); est > total {
+			total = est
+		}
+		known = true
+	}
+	if total < checked {
+		total = checked
+	}
+	return total, known
+}
+
+// countListNames counts the names ScanNames reads from f and rewinds it,
+// so the progress line can show the size of the run from the start. It
+// keeps no names (about 250 MB/s). ok is false when f cannot be read
+// twice.
+func countListNames(f *os.File) (n int64, ok bool) {
+	if err := checker.ScanNames(f, func(string) error { n++; return nil }); err != nil {
+		return 0, false
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // atomicMin sets *p = min(*p, v) using a CAS loop.
@@ -230,12 +273,33 @@ func (s *Stats) snapshot(e checker.Stats) string {
 	if elapsed > 0 {
 		rps = float64(e.Checked) / elapsed
 	}
+	total, known := s.progressTotal(e.Checked)
+	size := strconv.FormatInt(total, 10)
+	if !known {
+		size += "+" // a pipe: more names may come
+	}
+	eta := ""
+	if known && rps > 0 && total > e.Checked {
+		eta = ", eta " + formatETA(time.Duration(float64(total-e.Checked)/rps*float64(time.Second)))
+	}
 	return fmt.Sprintf(
-		"%d/%d (%.1f req/s) | free=%d reserved=%d auction=%d available=%d taken=%d sold=%d unknown=%d err=%d | new=%d reuse=%d | 429=%d retry=%d pause=%d",
-		e.Checked, atomic.LoadInt64(&s.total), rps,
+		"%d/%s (%.1f req/s%s) | free=%d reserved=%d auction=%d available=%d taken=%d sold=%d unknown=%d err=%d | new=%d reuse=%d | 429=%d retry=%d pause=%d",
+		e.Checked, size, rps, eta,
 		e.Free, e.Reserved, e.Auction, e.Available, e.Taken, e.Sold, e.Unknown, e.Errors,
 		e.ConnNew, e.ConnReuse, e.RateLimit, e.Retries, e.Pauses,
 	)
+}
+
+// formatETA rounds d for the progress line: 45s, 12m, 3h05m.
+func formatETA(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		return fmt.Sprintf("%dh%02dm", int(d.Hours()), int(d.Minutes())%60)
+	}
 }
 
 // finalSummary returns the multi-line summary printed at shutdown.
@@ -306,10 +370,12 @@ func produceUsernames(
 	var seen checker.NameSet
 	err = checker.ScanNames(src, func(name string) error {
 		if dedup && !seen.Add(name) {
+			atomic.AddInt64(&stats.dropped, 1)
 			return nil
 		}
 		if skip.Has(name) {
 			rejected++
+			atomic.AddInt64(&stats.dropped, 1)
 			return nil
 		}
 		select {
@@ -629,6 +695,7 @@ func Main(args []string) int {
 	}
 
 	// --- Open input ---
+	listNames := int64(-1) // names in the input file, counted up front (-1: a pipe)
 	var inReader io.Reader
 	var inInfo os.FileInfo
 	if *inputPath == "-" {
@@ -642,6 +709,11 @@ func Main(args []string) int {
 		defer f.Close()
 		inReader = f
 		inInfo, _ = f.Stat()
+		if inInfo != nil && inInfo.Mode().IsRegular() {
+			if n, ok := countListNames(f); ok {
+				listNames = n
+			}
+		}
 	}
 	// Opening the output truncates it. When it is the input file (also via
 	// another path, a symlink or "-input - < file"), the list was gone before
@@ -762,6 +834,7 @@ func Main(args []string) int {
 	}()
 
 	stats := newStats()
+	stats.listNames = listNames
 	tasks := make(chan string, tasksChanCap)
 	results := make(chan checker.Result, resultsChanCap)
 

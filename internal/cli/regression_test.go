@@ -587,3 +587,56 @@ func TestThrottledRunExitCodeAndResume(t *testing.T) {
 		t.Errorf("%d free lines after -resume, want 50", free)
 	}
 }
+
+// The progress line divided by the names read so far: the producer runs
+// at most 4096 names ahead of the workers, so a list of 9,995 names showed
+// "1290/5396" (1290 checked + 4096 queued + 10 in the workers). A file is
+// counted up front now, and the duplicates and -resume skips found so far
+// are taken off; from a pipe the size is unknown and marked with "+".
+func TestProgressShowsTheListSize(t *testing.T) {
+	st := newStats()
+	st.listNames = 10000
+	atomic.StoreInt64(&st.total, 5396) // queued so far
+	atomic.StoreInt64(&st.dropped, 5)  // duplicates seen so far
+	if total, known := st.progressTotal(1290); total != 9995 || !known {
+		t.Errorf("file: total %d (known %v), want 9995", total, known)
+	}
+	st.startTime = time.Now().Add(-100 * time.Second) // 1290 names in 100 s: 12.9/s
+	line := st.snapshot(checker.Stats{Checked: 1290})
+	if !strings.Contains(line, "1290/9995 (12.9 req/s, eta 11m)") {
+		t.Errorf("progress line %q, want 1290/9995 with an eta of 11m", line)
+	}
+
+	pipe := newStats()
+	atomic.StoreInt64(&pipe.total, 5396)
+	if total, known := pipe.progressTotal(1290); total != 5396 || known {
+		t.Errorf("pipe: total %d (known %v), want 5396 and unknown", total, known)
+	}
+	if line := pipe.snapshot(checker.Stats{Checked: 1290}); !strings.Contains(line, "1290/5396+") || strings.Contains(line, "eta") {
+		t.Errorf("pipe progress line %q, want 1290/5396+ without an eta", line)
+	}
+
+	path := filepath.Join(t.TempDir(), "names.txt")
+	if err := os.WriteFile(path, []byte("@alice, bob\ncarol | free\nalice\ndave"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if n, ok := countListNames(f); n != 5 || !ok {
+		t.Errorf("countListNames = %d, %v; want 5 (alice twice)", n, ok)
+	}
+	rest, _ := io.ReadAll(f)
+	if !strings.HasPrefix(string(rest), "@alice") {
+		t.Errorf("file not rewound after counting: %q", rest)
+	}
+
+	for d, want := range map[time.Duration]string{45 * time.Second: "45s", 12 * time.Minute: "12m",
+		3*time.Hour + 5*time.Minute: "3h05m"} {
+		if got := formatETA(d); got != want {
+			t.Errorf("formatETA(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
