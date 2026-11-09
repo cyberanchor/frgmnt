@@ -729,3 +729,48 @@ func TestResultsSurviveABusyDatabase(t *testing.T) {
 		t.Errorf("%d result rows and %d names flagged checked, want 300 and 300 (last error: %q)", rows, checked, h.lastError())
 	}
 }
+
+// The per-result debug event is built only when the bus passes debug
+// entries on; at info it cost 2.7 µs and 24 allocations per result and
+// was dropped right away.
+func TestResultEventsOnlyAtDebugLevel(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	events, cancel := h.bus.Subscribe("", 1024)
+	defer cancel()
+	var seen atomic.Int64
+	go func() {
+		for e := range events {
+			if strings.Contains(e.Message, `"event":"result"`) {
+				seen.Add(1)
+			}
+		}
+	}()
+	w, err := h.m.Create(ctx, "events", testConfig(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(5)); err != nil {
+		t.Fatal(err)
+	}
+	runOnce := func(resume bool) {
+		t.Helper()
+		if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: resume}); err != nil {
+			t.Fatal(err)
+		}
+		if !waitNotRunning(w, 10*time.Second) {
+			t.Fatal("run did not finish")
+		}
+		time.Sleep(50 * time.Millisecond) // let the subscriber catch up
+	}
+	runOnce(false)
+	if n := seen.Load(); n != 0 {
+		t.Errorf("%d result events at info level, want 0", n)
+	}
+	h.bus.SetLevel(logbus.LevelDebug)
+	runOnce(false)
+	if n := seen.Load(); n != 5 {
+		t.Errorf("%d result events at debug level, want 5", n)
+	}
+}
