@@ -3,6 +3,8 @@
 package cli
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -638,5 +640,47 @@ func TestProgressShowsTheListSize(t *testing.T) {
 		if got := formatETA(d); got != want {
 			t.Errorf("formatETA(%v) = %q, want %q", d, got, want)
 		}
+	}
+}
+
+// lockedBuffer is a bytes.Buffer safe for the writer goroutine and the
+// test to use together.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// Results reached the screen and the file only every 2 s (the flush
+// ticker), so at network speed they showed up in bursts. A result is
+// flushed as soon as no other one is waiting now.
+func TestResultsAreWrittenWhenTheyArrive(t *testing.T) {
+	var file, stdout lockedBuffer
+	out := outputs{file: bufio.NewWriter(&file), stdout: bufio.NewWriter(&stdout)}
+	results := make(chan checker.Result, 4)
+	done := make(chan error, 1)
+	go func() { done <- writeResults(results, out, nil, false, newStats()) }()
+	results <- checker.Result{Username: "alice", Status: StatusFree}
+	deadline := time.Now().Add(time.Second) // well before the 2 s ticker
+	for !strings.Contains(stdout.String(), "@alice | free") || !strings.Contains(file.String(), "@alice | free") {
+		if time.Now().After(deadline) {
+			t.Fatalf("after 1 s: stdout %q, file %q; the result must be written at once", stdout.String(), file.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(results)
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

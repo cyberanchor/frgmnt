@@ -77,7 +77,7 @@ const (
 	resultsChanCap = 4096
 
 	progressInterval = 1 * time.Second
-	flushInterval    = 2 * time.Second
+	flushInterval    = 100 * time.Millisecond
 )
 
 // -----------------------------------------------------------------------------
@@ -511,8 +511,13 @@ func (o outputs) flush() error {
 }
 
 // writeResults writes every result to the output file and stdout until
-// results is closed, flushing both every flushInterval so the file fills in
-// real time. With -filter it also lists every name that got a verdict in
+// results is closed. When no other result is waiting and the last flush
+// was at least flushInterval (100 ms) ago it flushes at once, so at
+// network speed a line shows up when its check ends; otherwise the ticker
+// flushes within 100 ms, so a fast stream (answers from the page cache)
+// still makes at most ten flushes a second instead of one write per line.
+// It used to flush every 2 s only, and the screen showed results in
+// bursts. With -filter it also lists every name that got a verdict in
 // <output>.checked, so -resume can skip the names the filter left out of
 // the results file. It does not react to Ctrl+C on purpose: every result
 // the engine counted must land on disk. A failed final flush (disk full,
@@ -521,10 +526,12 @@ func writeResults(results <-chan checker.Result, out outputs, filter map[Status]
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
 	const resetColor = "\033[0m"
+	var lastFlush time.Time
 	for {
 		select {
 		case <-ticker.C:
 			_ = out.flush()
+			lastFlush = time.Now()
 		case r, ok := <-results:
 			if !ok {
 				return out.flush()
@@ -545,6 +552,10 @@ func writeResults(results <-chan checker.Result, out outputs, filter map[Status]
 				} else {
 					_, _ = out.stdout.WriteString(stdoutLine + "\n")
 				}
+			}
+			if len(results) == 0 && time.Since(lastFlush) >= flushInterval {
+				_ = out.flush() // nothing else waiting: show it now
+				lastFlush = time.Now()
 			}
 		}
 	}
