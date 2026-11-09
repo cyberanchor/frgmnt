@@ -934,6 +934,9 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 					"status":     string(r.Status),
 					"error":      r.Error,
 					"took_ms":    r.Took.Milliseconds(),
+					"net_ms":     r.Net.Milliseconds(),
+					"wait_ms":    r.Wait.Milliseconds(),
+					"attempts":   r.Attempts,
 					"confidence": r.Confidence,
 					"evidence":   r.Evidence,
 					"cached":     r.Cached,
@@ -950,6 +953,9 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 				Confidence: r.Confidence,
 				Evidence:   r.Evidence,
 				Cached:     r.Cached,
+				NetNs:      r.Net.Nanoseconds(),
+				WaitNs:     r.Wait.Nanoseconds(),
+				Attempts:   r.Attempts,
 			})
 			if len(batch) >= batchSize && !time.Now().Before(retryAt) {
 				flush()

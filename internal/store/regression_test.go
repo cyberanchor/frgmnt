@@ -315,3 +315,57 @@ func TestIsTransient(t *testing.T) {
 		t.Errorf("write to a closed database: %v, transient=%v; want a permanent error", err, IsTransient(err))
 	}
 }
+
+// A result row kept only the whole time of a name (took_ns). It keeps the
+// split too now, network and waiting time and the number of tries, also
+// in a database made before these columns existed.
+func TestResultsKeepNetworkWaitAndTries(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "data.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := `
+CREATE TABLE workers (id TEXT PRIMARY KEY, name TEXT NOT NULL, config_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'idle', total INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+CREATE TABLE worker_inputs (worker_id TEXT NOT NULL, seq INTEGER NOT NULL, username TEXT NOT NULL,
+  PRIMARY KEY (worker_id, seq));
+CREATE TABLE results (id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id TEXT NOT NULL,
+  username TEXT NOT NULL, status TEXT NOT NULL, error TEXT, took_ns INTEGER NOT NULL,
+  checked_at INTEGER NOT NULL);
+INSERT INTO workers VALUES ('w1','old','{}','idle',2,1,1);
+INSERT INTO worker_inputs VALUES ('w1',0,'alice');
+INSERT INTO worker_inputs VALUES ('w1',1,'bobby');
+INSERT INTO results (worker_id, username, status, took_ns, checked_at) VALUES ('w1','alice','free',5,1);`
+	if _, err := db.Exec(old); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Open on an old database: %v", err)
+	}
+	defer s.Close()
+	if err := s.RecordResults(context.Background(), []Result{{WorkerID: "w1", Username: "bobby", Status: "taken",
+		TookNs: 900, NetNs: 200, WaitNs: 700, Attempts: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	rs, err := s.ListResults(context.Background(), "w1", 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rs) != 2 {
+		t.Fatalf("%d rows, want 2", len(rs))
+	}
+	if r := rs[0]; r.Username != "alice" || r.NetNs != 0 || r.Attempts != 0 {
+		t.Errorf("old row %+v, want the new columns at 0", r)
+	}
+	if r := rs[1]; r.NetNs != 200 || r.WaitNs != 700 || r.Attempts != 2 || r.TookNs != 900 {
+		t.Errorf("new row %+v, want net 200, wait 700, 2 tries", r)
+	}
+}

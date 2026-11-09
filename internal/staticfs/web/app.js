@@ -570,13 +570,31 @@ function renderDetailsCounts(id) {
     $("#details-counts").textContent = `(${total} total · ${parts.join(", ")})`;
 }
 
+// fmtMs prints nanoseconds as "0.4 ms", "230 ms" or "1.2 s".
+function fmtMs(ns) {
+    const ms = Number(ns) / 1e6;
+    if (ms < 10) return `${ms.toFixed(1)} ms`;
+    if (ms < 1000) return `${Math.round(ms)} ms`;
+    return `${(ms / 1000).toFixed(1)} s`;
+}
+
 function buildResultRow(r) {
     const div = document.createElement("div");
     div.className = "result-row";
     div.dataset.s = r.status;
     const conf = r.confidence ? ` <span class="muted">${r.confidence}%</span>` : "";
     const cache = r.cached ? ` <span class="muted" title="served from page cache">cache</span>` : "";
-    const evidence = r.evidence ? ` title="${escapeHTML(r.evidence)}"` : "";
+    // The tooltip: what the parser saw, then where the time went (older
+    // results have no split).
+    const tip = [];
+    if (r.evidence) tip.push(r.evidence);
+    if (r.took_ns) {
+        let t = `took ${fmtMs(r.took_ns)}`;
+        if (r.net_ns || r.wait_ns) t += ` (network ${fmtMs(r.net_ns || 0)}, waiting ${fmtMs(r.wait_ns || 0)})`;
+        if (r.attempts) t += `, ${r.attempts} ${r.attempts === 1 ? "try" : "tries"}`;
+        tip.push(t);
+    }
+    const evidence = tip.length ? ` title="${escapeHTML(tip.join("\n"))}"` : "";
     div.innerHTML = `
         <span class="rname"${evidence}>@${escapeHTML(r.username)}${cache}${r.error ? ` <span class="muted">${escapeHTML(r.error)}</span>` : ""}</span>
         <span class="rstatus">${r.status}${conf}</span>

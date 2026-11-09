@@ -981,3 +981,41 @@ func TestTileTraceFile(t *testing.T) {
 		t.Errorf("trace file after Delete: %v, want gone", err)
 	}
 }
+
+// The rows a run saves carry the split of the time and the tries.
+func TestSavedResultsCarryTheTimeSplit(t *testing.T) {
+	newFakeFragment(t, 20*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg := testConfig(1)
+	cfg.RateRPS = 10 // one start per 100 ms: every name but the first waits
+	w, err := h.m.Create(ctx, "split", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(3)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+	rs, err := h.st.ListResults(ctx, w.ID(), 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := 0
+	for _, r := range rs {
+		if r.Attempts != 1 || r.NetNs < int64(20*time.Millisecond) || r.TookNs < r.NetNs {
+			t.Errorf("%s: took %d net %d wait %d tries %d", r.Username, r.TookNs, r.NetNs, r.WaitNs, r.Attempts)
+		}
+		if r.WaitNs >= int64(50*time.Millisecond) {
+			waited++
+		}
+	}
+	if len(rs) != 3 || waited < 2 {
+		t.Errorf("%d rows, %d waited for a -rate start; want 3 and 2", len(rs), waited)
+	}
+}
