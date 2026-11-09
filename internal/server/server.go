@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -713,6 +714,8 @@ func (s *Server) handleWorkerItem(w http.ResponseWriter, r *http.Request) {
 		s.handleWorkerResults(w, r, id)
 	case "results/download":
 		s.handleWorkerResultsDownload(w, r, id)
+	case "trace":
+		s.handleWorkerTrace(w, r, id)
 	case "events":
 		s.handleWorkerEvents(w, r, id)
 	default:
@@ -1002,6 +1005,49 @@ func (s *Server) handleWorkerResults(w http.ResponseWriter, r *http.Request, id 
 		"results": rs,
 		"counts":  counts,
 	})
+}
+
+// handleWorkerTrace downloads (GET) or deletes (DELETE) the structured
+// trace of a worker's runs: JSON Lines, written while the worker's config
+// has trace on. A trace that is being written can be downloaded (it is
+// flushed every second); it cannot be deleted while the worker runs.
+func (s *Server) handleWorkerTrace(w http.ResponseWriter, r *http.Request, id string) {
+	wk, err := s.mgr.Get(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	path := s.mgr.TracePath(id)
+	switch r.Method {
+	case http.MethodGet:
+		f, err := os.Open(path)
+		if err != nil {
+			writeError(w, http.StatusNotFound,
+				"no trace for this worker: turn on \"Write a trace\" in its settings and run it")
+			return
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s-trace.jsonl"`, safeFilename(wk.Name())))
+		http.ServeContent(w, r, "", fi.ModTime(), f)
+	case http.MethodDelete:
+		if wk.Status() == worker.StatusRunning {
+			writeError(w, http.StatusConflict, "worker is running; stop it before deleting its trace")
+			return
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		methodNotAllowed(w, "GET, DELETE")
+	}
 }
 
 func (s *Server) handleWorkerResultsDownload(w http.ResponseWriter, r *http.Request, id string) {

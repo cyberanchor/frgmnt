@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/tracelog"
 	"github.com/cyberanchor/frgmnt/internal/version"
 )
 
@@ -803,19 +804,19 @@ func Main(args []string) int {
 	if logLevel >= LevelTrace {
 		logger.Tracef = tracef
 	}
-	var trace *traceFile
+	var trace *tracelog.Writer
 	if *traceOut != "" {
-		trace, err = openTraceFile(*traceOut, *appendFlag || *resume)
+		trace, err = tracelog.Open(*traceOut, *appendFlag || *resume, 0)
 		if err != nil {
 			log.Printf("[ERROR] -trace-file: %v", err)
 			return 2
 		}
-		logger.Event = trace.write
+		logger.Event = trace.Write
 	}
 	chk.SetLogger(logger)
 	eff := chk.Config()
 	if trace != nil {
-		trace.write(checker.TraceEvent{Time: time.Now(), Kind: "run_start", Info: map[string]any{
+		trace.Write(checker.TraceEvent{Time: time.Now(), Kind: "run_start", Info: map[string]any{
 			"program": ProgName, "version": Version, "input": *inputPath, "output": *outputPath,
 			"list_names": listNames, "resume": *resume, "dedup": !*noDedup, "filter": *filterRaw,
 			"workers": eff.Workers, "max_conns": eff.MaxConns, "rate_rps": eff.RateRPS, "retries": eff.Retries,
@@ -958,17 +959,14 @@ func Main(args []string) int {
 		}
 	}
 	if trace != nil {
-		info := statsInfo(final)
+		info := tracelog.StatsInfo(final)
 		info["elapsed_ms"] = time.Since(stats.startTime).Milliseconds()
 		info["exit_code"] = exitCode
-		switch chk.BlockedBy() {
-		case checker.BlockedByChallenge:
-			info["blocked"] = "challenge"
-		case checker.BlockedByThrottle:
-			info["blocked"] = "throttle"
+		if b := tracelog.BlockedName(chk.BlockedBy()); b != "" {
+			info["blocked"] = b
 		}
-		trace.write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
-		n, err := trace.Close()
+		trace.Write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
+		n, _, err := trace.Close()
 		if err != nil {
 			log.Printf("[ERROR] -trace-file %s: %v (the trace is incomplete)", *traceOut, err)
 		} else {

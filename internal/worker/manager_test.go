@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -892,5 +894,90 @@ func TestEngineDetailFollowsTheLogLevel(t *testing.T) {
 	run()
 	if count("TRACE") == 0 {
 		t.Error("no trace lines at the trace level")
+	}
+}
+
+// A worker whose config has trace on writes the structured trace of its
+// runs to <data>/traces/<id>.jsonl: a fresh start begins the file again,
+// Resume appends, deleting the worker deletes it, and the file stops at
+// maxTraceBytes with a trace_truncated line.
+func TestTileTraceFile(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg := testConfig(2)
+	cfg.Trace = true
+	w, err := h.m.Create(ctx, "traced", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(5)); err != nil {
+		t.Fatal(err)
+	}
+	run := func(resume bool) {
+		t.Helper()
+		if err := h.m.Start(ctx, w.ID(), StartOptions{Resume: resume}); err != nil {
+			t.Fatal(err)
+		}
+		if !waitNotRunning(w, 10*time.Second) {
+			t.Fatal("run did not finish")
+		}
+	}
+	kinds := func() map[string]int {
+		t.Helper()
+		raw, err := os.ReadFile(h.m.TracePath(w.ID()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]int{}
+		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			var e checker.TraceEvent
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Fatalf("not JSON: %q", line)
+			}
+			out[e.Kind]++
+			if e.Kind == "run_start" && e.Info["worker"] != w.ID() {
+				t.Errorf("run_start info %v", e.Info)
+			}
+		}
+		return out
+	}
+	run(false)
+	if k := kinds(); k["run_start"] != 1 || k["run_end"] != 1 || k["attempt"] != 5 || k["result"] != 5 {
+		t.Errorf("first run: %v", k)
+	}
+	if fi, err := os.Stat(h.m.TracePath(w.ID())); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Errorf("trace file: %v %v", err, fi.Mode().Perm())
+	}
+	run(false) // a fresh start: a new file
+	if k := kinds(); k["run_start"] != 1 {
+		t.Errorf("after a fresh start: %d run_start, want 1", k["run_start"])
+	}
+	// Two more names: the five checked keep their results, Resume checks
+	// the new ones and appends to the trace.
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(7)); err != nil {
+		t.Fatal(err)
+	}
+	run(true)
+	if k := kinds(); k["run_start"] != 2 || k["result"] != 7 {
+		t.Errorf("after Resume: %v, want 2 run_start and 5+2 results (appended)", k)
+	}
+
+	old := maxTraceBytes
+	maxTraceBytes = 2 << 10
+	t.Cleanup(func() { maxTraceBytes = old })
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(40)); err != nil {
+		t.Fatal(err)
+	}
+	run(false)
+	if k := kinds(); k["trace_truncated"] != 1 || k["run_end"] != 0 {
+		t.Errorf("over the limit: %v, want one trace_truncated and nothing after it", k)
+	}
+
+	if err := h.m.Delete(ctx, w.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(h.m.TracePath(w.ID())); !os.IsNotExist(err) {
+		t.Errorf("trace file after Delete: %v, want gone", err)
 	}
 }

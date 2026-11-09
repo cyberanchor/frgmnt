@@ -738,3 +738,53 @@ func TestUploadStreamsTheFilePart(t *testing.T) {
 		t.Errorf("%d names after a refused upload, want the previous 4", n)
 	}
 }
+
+// GET /api/workers/{id}/trace downloads the structured trace of a worker
+// (JSON Lines) and DELETE removes it; without a trace GET says how to get
+// one, and a running worker's trace cannot be deleted.
+func TestTraceDownloadAPI(t *testing.T) {
+	fake := newFakeFragment(t, 300*time.Millisecond)
+	s, _ := newTestServer(t)
+	id := newWorkerWithInput(t, s, "traced", `{"workers":2,"retries":0,"trace":true}`, []string{"alpha001", "slowname"})
+	if rec := do(t, s, "GET", "/api/workers/"+id+"/trace", "", "", nil); rec.Code != http.StatusNotFound ||
+		!strings.Contains(rec.Body.String(), "Write a trace") {
+		t.Errorf("before a run: %d %s, want 404 with a hint", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, s, "POST", "/api/workers/"+id+"/start", "", "", nil); rec.Code >= 300 {
+		t.Fatalf("start: %d %s", rec.Code, rec.Body.String())
+	}
+	for deadline := time.Now().Add(5 * time.Second); fake.hitsFor("slowname") == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if rec := do(t, s, "DELETE", "/api/workers/"+id+"/trace", "", "", nil); rec.Code != http.StatusConflict {
+		t.Errorf("DELETE while running: %d, want 409", rec.Code)
+	}
+	if st := waitStopped(t, s, id); st != worker.StatusDone {
+		t.Fatalf("status %s", st)
+	}
+	rec := do(t, s, "GET", "/api/workers/"+id+"/trace", "", "", nil)
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/x-ndjson" ||
+		!strings.Contains(rec.Header().Get("Content-Disposition"), "traced-trace.jsonl") {
+		t.Fatalf("GET: %d %v", rec.Code, rec.Header())
+	}
+	kinds := map[string]int{}
+	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
+		var e checker.TraceEvent
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("not JSON: %q", line)
+		}
+		kinds[e.Kind]++
+	}
+	if kinds["run_start"] != 1 || kinds["result"] != 2 || kinds["run_end"] != 1 {
+		t.Errorf("trace kinds %v", kinds)
+	}
+	if rec := do(t, s, "DELETE", "/api/workers/"+id+"/trace", "", "", nil); rec.Code != http.StatusNoContent {
+		t.Errorf("DELETE: %d", rec.Code)
+	}
+	if rec := do(t, s, "GET", "/api/workers/"+id+"/trace", "", "", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("GET after DELETE: %d, want 404", rec.Code)
+	}
+	if rec := do(t, s, "GET", "/api/workers/nosuchworker/trace", "", "", nil); rec.Code != http.StatusNotFound {
+		t.Errorf("unknown worker: %d, want 404", rec.Code)
+	}
+}

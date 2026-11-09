@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -18,6 +19,8 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/tracelog"
+	"github.com/cyberanchor/frgmnt/internal/version"
 )
 
 // Status reflects the runtime state of one tile.
@@ -214,9 +217,20 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if err := m.store.DeleteWorker(ctx, id); err != nil {
 		return err
 	}
+	_ = os.Remove(m.TracePath(id))
 	m.bus.Publish(logbus.LevelInfo, id, "worker deleted")
 	return nil
 }
+
+// TracePath is where the structured trace of a worker's runs is written
+// when its config has trace on.
+func (m *Manager) TracePath(id string) string {
+	return filepath.Join(m.store.DataDir(), "traces", id+".jsonl")
+}
+
+// maxTraceBytes caps the trace file of a worker (about 200,000 requests);
+// a variable so tests can lower it.
+var maxTraceBytes int64 = 100 << 20
 
 // SetInput replaces the input list of a worker. Allowed only when the
 // worker is not currently running.
@@ -627,7 +641,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	// per HTTP try with its timings, at trace every step of every request.
 	// The panel got only the warnings, and before 2.0.0 nothing at all, so
 	// its debug and trace levels showed no HTTP detail.
-	chk.SetLogger(checker.Logger{
+	lg := checker.Logger{
 		Warnf: func(format string, args ...any) {
 			m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(format, args...))
 		},
@@ -646,7 +660,8 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 			}
 			return checker.LogInfo
 		},
-	})
+	}
+	chk.SetLogger(lg)
 	w.mu.Lock()
 	w.chk = chk
 	w.mu.Unlock()
@@ -703,6 +718,33 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	chk.SetTotal(queued)
 	m.refreshProgress(ctx, w)
 
+	// The structured trace of the run, when the worker asks for it: a fresh
+	// start begins a new file, Resume appends to it.
+	var trace *tracelog.Writer
+	runStart := time.Now()
+	if cfg.Trace {
+		path := m.TracePath(w.id)
+		var err error
+		if err = os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
+			trace, err = tracelog.Open(path, resume, maxTraceBytes)
+		}
+		if err != nil {
+			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("trace: %v (the run goes on without it)", err))
+		} else {
+			lg.Event = trace.Write
+			chk.SetLogger(lg)
+			trace.Write(checker.TraceEvent{Time: runStart, Kind: "run_start", Info: map[string]any{
+				"program": "frgmnt web", "version": version.Version, "worker": w.id, "worker_name": w.Name(),
+				"resume": resume, "list_names": total, "queued": queued,
+				"workers": cfg.Workers, "max_conns": cfg.MaxConns, "rate_rps": cfg.RateRPS, "retries": cfg.Retries,
+				"retry_delay_ms": cfg.RetryDelay.Milliseconds(), "timeout_ms": cfg.Timeout.Milliseconds(),
+				"read_limit": cfg.ReadLimit, "rl_wait_max_ms": cfg.RLWaitMax.Milliseconds(),
+				"block_cooldown_ms": cfg.BlockCooldown.Milliseconds(), "throttle_max_ms": cfg.ThrottleMax.Milliseconds(),
+				"cache_dir": cfg.CacheDir, "log": m.bus.Level().String(),
+			}})
+		}
+	}
+
 	in := make(chan string, 1024)
 	out := make(chan checker.Result, 1024)
 
@@ -750,6 +792,26 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	w.mu.Lock()
 	w.lastStats = final
 	w.mu.Unlock()
+	if trace != nil {
+		info := tracelog.StatsInfo(final)
+		info["elapsed_ms"] = time.Since(runStart).Milliseconds()
+		switch {
+		case blocked:
+			info["blocked"] = tracelog.BlockedName(chk.BlockedBy())
+		case ctx.Err() != nil:
+			info["stopped"] = true
+		}
+		trace.Write(checker.TraceEvent{Kind: "run_end", Info: info})
+		if n, dropped, err := trace.Close(); err != nil {
+			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("trace: %v (the trace is incomplete)", err))
+		} else {
+			msg := fmt.Sprintf("trace: %d events written", n)
+			if dropped > 0 {
+				msg += fmt.Sprintf(", %d dropped over the %d MB limit", dropped, maxTraceBytes>>20)
+			}
+			m.bus.Publish(logbus.LevelInfo, w.id, msg)
+		}
+	}
 
 	if blocked {
 		msg := fmt.Sprintf("stopped: Fragment answered %d requests in a row with a Cloudflare challenge "+

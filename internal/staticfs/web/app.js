@@ -428,6 +428,7 @@ function openWorkerModal(w) {
     $("#worker-retry-delay").value = nsToMs(cfg.retry_delay_ns ?? def.retry_delay_ns ?? 500_000_000);
     $("#worker-timeout").value = nsToSec(cfg.timeout_ns ?? def.timeout_ns ?? 15_000_000_000);
     $("#worker-ua").value = cfg.user_agent ?? "";
+    $("#worker-trace").checked = !!cfg.trace;
 
     workerModal.removeAttribute("hidden");
     setTimeout(() => $("#worker-name").focus(), 30);
@@ -473,6 +474,7 @@ $("#worker-form").addEventListener("submit", async (ev) => {
         retry_delay_ns: (+$("#worker-retry-delay").value || 500) * 1_000_000,
         timeout_ns: (+$("#worker-timeout").value || 15) * 1_000_000_000,
         user_agent: $("#worker-ua").value.trim(),
+        trace: $("#worker-trace").checked,
     });
     const body = { name: $("#worker-name").value.trim(), config: cfg };
     try {
@@ -528,6 +530,7 @@ async function openDetails(id) {
         c.classList.toggle("active", c.dataset.filter === "all"));
 
     $("#details-download").href = `/api/workers/${id}/results/download`;
+    $("#details-trace").href = `/api/workers/${id}/trace`;
 
     detailsModal.removeAttribute("hidden");
     await loadDetailsResults(id);

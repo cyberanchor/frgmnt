@@ -141,6 +141,11 @@ type Config struct {
 	// Run stops and leaves the rest of the names pending. Meanwhile the
 	// shared pause grows from BlockCooldown up to two minutes.
 	ThrottleMax time.Duration `json:"throttle_max_ns,omitempty"`
+
+	// Trace is for the web panel: it writes the structured trace of this
+	// worker's runs to <data>/traces/<id>.jsonl. The engine does not read
+	// it (the console has -trace-file).
+	Trace bool `json:"trace,omitempty"`
 }
 
 // Upper bounds for Config values. The web API rejects values above them;
