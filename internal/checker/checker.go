@@ -76,6 +76,16 @@ type Result struct {
 	Error    string        `json:"error,omitempty"`
 	Took     time.Duration `json:"took_ns"`
 
+	// Took splits into Net, the time of the name's own HTTP requests
+	// (connecting, sending, waiting for the answer, reading the body), and
+	// Wait, everything else: a -rate start, the gate, a shared pause, the
+	// delay before a retry, a probe. Took used to be the only figure, so
+	// the -debug timings mixed the network with the queue. Attempts counts
+	// the HTTP tries of the name, throttled ones included.
+	Net      time.Duration `json:"net_ns,omitempty"`
+	Wait     time.Duration `json:"wait_ns,omitempty"`
+	Attempts int           `json:"attempts,omitempty"`
+
 	// Confidence is 0..100 and explains how certain the parser is.
 	// Cached is true when the answer came from the on-disk page cache.
 	// Stale is true when a stale cache entry was used because the network
@@ -386,9 +396,7 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 			if !ok {
 				return
 			}
-			start := time.Now()
 			r := c.CheckOne(ctx, name)
-			r.Took = time.Since(start)
 			if ctx.Err() != nil && r.Status == StatusError {
 				// Stop or shutdown cut this check short, so there is no
 				// verdict. Reporting it as an error used to store the name
@@ -419,7 +427,16 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 // CheckOne resolves a single username with the configured retry policy.
 // Fresh cached pages are answered without any network request; stale cache
 // entries are used as a fallback if the network ultimately fails.
-func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
+func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
+	start := time.Now()
+	var net time.Duration // the time of this name's own requests
+	tries := 0
+	defer func() {
+		res.Took = time.Since(start)
+		res.Net = net
+		res.Wait = res.Took - net
+		res.Attempts = tries
+	}()
 	name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "@")))
 	if err := ValidateUsername(name); err != nil {
 		return Result{Username: raw, Status: StatusError, Error: "invalid: " + err.Error()}
@@ -435,7 +452,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			if !pi.Found {
 				st, conf, ev = ent.Status, ent.Confidence, ent.Evidence
 			}
-			res := Result{
+			cached := Result{
 				Username:   name,
 				Status:     st,
 				Confidence: conf,
@@ -445,7 +462,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			if c.cache.fresh(st, ent.FetchedAt) {
 				atomic.AddInt64(&c.stats.cacheHits, 1)
 				c.debugf("cache hit: %s -> %s (confidence=%d; %s)", name, st, conf, ev)
-				return res
+				return cached
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
 			c.debugf("cache stale: %s -> %s; re-checking", name, st)
@@ -453,8 +470,8 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			// sold or taken name rarely changes, while an auction or a sale
 			// seen days ago is likely over.
 			if st == StatusSold || st == StatusTaken {
-				res.Stale = true
-				stale = &res
+				cached.Stale = true
+				stale = &cached
 			}
 		} else {
 			atomic.AddInt64(&c.stats.cacheMisses, 1)
@@ -471,26 +488,28 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 		var lastRes Result
 		attempts := 0
 		for {
-			res, retry, errStr := c.doRequest(ctx, name, reqURL)
+			tries++
+			r, retry, errStr := c.doRequest(ctx, name, reqURL)
+			net += r.Net
 			if !retry {
-				return res
+				return r
 			}
-			if res.throttleWait > 0 || (res.Status == StatusReserved && !c.probe(ctx, probeReuse)) {
+			if r.throttleWait > 0 || (r.Status == StatusReserved && !c.probe(ctx, probeReuse)) {
 				// HTTP 429, or a bare "302 /" while a random free name is
 				// redirected to "/" too: the client is throttled.
-				if c.throttled(res.throttleWait) {
+				if c.throttled(r.throttleWait) {
 					return Result{Username: name, Status: StatusError, Error: c.blockedError(), notSent: true}
 				}
 				continue
 			}
-			if res.Status == StatusReserved {
+			if r.Status == StatusReserved {
 				// The probe is healthy, so Fragment serves this client: open
 				// the gate that the "302 /" left closed. For a reserved name
 				// nobody waits; it is retried in its cookie session (a first
 				// "302 /" can also be a session start).
 				c.gate.Open()
 			}
-			lastErr, lastRes = errStr, res
+			lastErr, lastRes = errStr, r
 			attempts++
 			if attempts > c.cfg.Retries || c.blocked.Load() {
 				break // no point in retrying when every answer is a challenge
@@ -528,11 +547,11 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 		}
 		if stale != nil {
 			c.debugf("network failed (%s); serving stale cache for %s", lastErr, name)
-			res := *stale
-			res.Confidence = 30
-			res.Evidence = "stale-cache; " + res.Evidence
-			res.Error = "network failed (" + lastErr + "); served stale cache"
-			return res
+			served := *stale
+			served.Confidence = 30
+			served.Evidence = "stale-cache; " + served.Evidence
+			served.Error = "network failed (" + lastErr + "); served stale cache"
+			return served
 		}
 		return Result{Username: name, Status: StatusError, Error: "retries exhausted: " + lastErr}
 	}
@@ -583,6 +602,14 @@ func (c *Checker) blockedError() string {
 }
 
 func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
+	// Registered first, so it runs last: the network time of this try
+	// includes draining and closing the body.
+	var start time.Time
+	defer func() {
+		if !start.IsZero() {
+			res.Net = time.Since(start)
+		}
+	}()
 	release, err := c.admit(ctx)
 	if errors.Is(err, errBlocked) {
 		msg := c.blockedError()
@@ -611,7 +638,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	start := time.Now()
+	start = time.Now()
 	ct, tr := c.clientTrace(name, start)
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), ct))
 

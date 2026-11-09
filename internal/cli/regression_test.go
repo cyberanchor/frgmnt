@@ -7,10 +7,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -682,5 +685,82 @@ func TestResultsAreWrittenWhenTheyArrive(t *testing.T) {
 	close(results)
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The histogram of the -debug summary: quantiles at most ~9% high, never
+// above the largest sample.
+func TestDurHistQuantiles(t *testing.T) {
+	var h durHist
+	for i := 1; i <= 1000; i++ {
+		h.add(time.Duration(i) * time.Millisecond)
+	}
+	for _, c := range []struct {
+		q    float64
+		want time.Duration
+	}{{0.50, 500 * time.Millisecond}, {0.95, 950 * time.Millisecond}, {0.99, 990 * time.Millisecond}} {
+		got := h.quantile(c.q)
+		if got < c.want || got > c.want*110/100 || got > time.Second {
+			t.Errorf("p%.0f = %v, want %v .. +10%% (and at most the max)", c.q*100, got, c.want)
+		}
+	}
+	if h.count() != 1000 || h.quantile(1) != time.Second {
+		t.Errorf("n=%d max=%v", h.count(), h.quantile(1))
+	}
+	var empty durHist
+	if empty.quantile(0.5) != 0 {
+		t.Error("empty histogram")
+	}
+	for d, want := range map[time.Duration]string{400 * time.Microsecond: "0.4ms", 37 * time.Millisecond: "37ms",
+		1200 * time.Millisecond: "1.2s", 125 * time.Second: "2m05s"} {
+		if got := fmtDur(d); got != want {
+			t.Errorf("fmtDur(%v) = %q, want %q", d, got, want)
+		}
+	}
+}
+
+// The -debug summary gave avg/min/max of the whole time of a name
+// ("Timing FREE"), which counted the wait for a -rate start as latency.
+// It shows the network time and the waiting apart now.
+func TestDebugSummaryShowsNetworkAndWaiting(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	if err := os.WriteFile(in, []byte("name0001\nname0002\nname0003\nname0004\nname0005\nname0006\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	defer func(l LogLevel) { logLevel = l }(logLevel)
+	code := Main([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL,
+		"-no-cache", "-workers", "2", "-rate", "5", "-debug"})
+	if code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	out := logs.String()
+	if strings.Contains(out, "Timing FREE") {
+		t.Error("the old avg/min/max line is still printed")
+	}
+	pick := func(label string) time.Duration {
+		t.Helper()
+		m := regexp.MustCompile(regexp.QuoteMeta(label) + `[^\n]*?p50=([0-9.]+)(ms|s)`).FindStringSubmatch(out)
+		if m == nil {
+			t.Fatalf("no %q line in:\n%s", label, out)
+		}
+		v, _ := strconv.ParseFloat(m[1], 64)
+		if m[2] == "s" {
+			v *= 1000
+		}
+		return time.Duration(v * float64(time.Millisecond))
+	}
+	if net := pick("Network per name, redirects"); net > 100*time.Millisecond {
+		t.Errorf("network p50 %v for a local server: the wait for starts is in it", net)
+	}
+	if wait := pick("Waiting per name"); wait < 150*time.Millisecond {
+		t.Errorf("waiting p50 %v; at -rate 5 with 2 workers names wait for their start", wait)
+	}
+	if !strings.Contains(out, "Tries per name: 1: 6 |") {
+		t.Errorf("no tries line for 6 names in:\n%s", out)
 	}
 }

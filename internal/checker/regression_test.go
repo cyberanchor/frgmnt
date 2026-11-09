@@ -550,3 +550,64 @@ func TestGateWakesWaitersWhenItOpens(t *testing.T) {
 		t.Errorf("5 names took %v; after the first answer the waiting requests must go together", took)
 	}
 }
+
+// A result had one figure, Took, the whole time of the name, so the -debug
+// timings mixed the network with the queue: a retry delay, a -rate start,
+// a pause. Net and Wait split it now, and Attempts counts the tries.
+func TestResultSplitsNetworkAndWaiting(t *testing.T) {
+	var n atomic.Int32
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		if name == "splitname" && n.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable) // retried after RetryDelay
+			return
+		}
+		if name == "splitname" {
+			time.Sleep(80 * time.Millisecond)
+		}
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	c := New(Config{Workers: 1, Retries: 1, RetryDelay: 300 * time.Millisecond, Timeout: 2 * time.Second})
+	defer c.Close()
+	res := c.CheckOne(context.Background(), "splitname")
+	if res.Status != StatusFree || res.Attempts != 2 {
+		t.Fatalf("%s after %d tries (%s), want free after 2", res.Status, res.Attempts, res.Error)
+	}
+	if res.Net < 80*time.Millisecond || res.Net > 250*time.Millisecond {
+		t.Errorf("Net = %v, want the ~80 ms of the two requests", res.Net)
+	}
+	if res.Wait < 280*time.Millisecond {
+		t.Errorf("Wait = %v, want the 300 ms retry delay in it", res.Wait)
+	}
+	if res.Took != res.Net+res.Wait {
+		t.Errorf("Took %v != Net %v + Wait %v", res.Took, res.Net, res.Wait)
+	}
+	if inv := c.CheckOne(context.Background(), "1bad"); inv.Net != 0 || inv.Attempts != 0 {
+		t.Errorf("invalid name: Net %v, %d tries; want no request", inv.Net, inv.Attempts)
+	}
+
+	// A -rate start is waiting too: with one worker at 4/s each name after
+	// the first waits ~250 ms for its start.
+	r := New(Config{Workers: 1, RateRPS: 4, Retries: 0, Timeout: 2 * time.Second})
+	defer r.Close()
+	in := make(chan string, 3)
+	in <- "ratename0"
+	in <- "ratename1"
+	in <- "ratename2"
+	close(in)
+	out := make(chan Result, 3)
+	r.Run(context.Background(), in, out)
+	close(out)
+	waited := 0
+	for res := range out {
+		if res.Net > 100*time.Millisecond {
+			t.Errorf("%s: Net %v for an instant answer: the wait for the start leaked into it", res.Username, res.Net)
+		}
+		if res.Wait >= 200*time.Millisecond {
+			waited++
+		}
+	}
+	if waited < 2 {
+		t.Errorf("%d names waited >= 200 ms for a start, want 2", waited)
+	}
+}

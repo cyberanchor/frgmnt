@@ -37,7 +37,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"os/signal"
 	"strconv"
@@ -159,14 +158,15 @@ type Stats struct {
 	listNames int64
 	dropped   int64
 
-	freeCount    int64
-	freeSumUs    int64
-	freeMinUs    int64
-	freeMaxUs    int64
-	nonfreeCount int64
-	nonfreeSumUs int64
-	nonfreeMinUs int64
-	nonfreeMaxUs int64
+	// The -debug summary: the network time of a name (its own requests)
+	// for redirects (free/reserved, no body) and for pages, the time it
+	// waited (starts, pauses, retry delays, probes), and how many tries it
+	// took (1, 2, 3, 4 or more). The summary used to give avg/min/max of the
+	// whole time of a name, which mixed the network with the queue.
+	netRedirect durHist
+	netPage     durHist
+	wait        durHist
+	tries       [4]int64
 
 	startTime time.Time
 }
@@ -175,10 +175,8 @@ type Stats struct {
 // to MaxInt64 so the first observed sample wins the CAS.
 func newStats() *Stats {
 	return &Stats{
-		startTime:    time.Now(),
-		freeMinUs:    math.MaxInt64,
-		nonfreeMinUs: math.MaxInt64,
-		listNames:    -1,
+		startTime: time.Now(),
+		listNames: -1,
 	}
 }
 
@@ -216,19 +214,6 @@ func countListNames(f *os.File) (n int64, ok bool) {
 	return n, true
 }
 
-// atomicMin sets *p = min(*p, v) using a CAS loop.
-func atomicMin(p *int64, v int64) {
-	for {
-		old := atomic.LoadInt64(p)
-		if old <= v {
-			return
-		}
-		if atomic.CompareAndSwapInt64(p, old, v) {
-			return
-		}
-	}
-}
-
 // atomicMax sets *p = max(*p, v) using a CAS loop.
 func atomicMax(p *int64, v int64) {
 	for {
@@ -242,26 +227,22 @@ func atomicMax(p *int64, v int64) {
 	}
 }
 
-// observe feeds the latency figures (free/reserved vs. the rest) and the
-// largest marker offset. Cache answers and errors are left out: they would
-// skew the latency of real requests.
+// observe feeds the timing figures of the -debug summary and the largest
+// marker offset. Cache answers and errors are left out: they would skew
+// the figures of real requests.
 func (s *Stats) observe(r checker.Result) {
 	if r.Cached || r.Status == StatusError {
 		return
 	}
-	us := r.Took.Microseconds()
 	switch r.Status {
 	case StatusFree, StatusReserved:
-		atomic.AddInt64(&s.freeCount, 1)
-		atomic.AddInt64(&s.freeSumUs, us)
-		atomicMin(&s.freeMinUs, us)
-		atomicMax(&s.freeMaxUs, us)
+		s.netRedirect.add(r.Net)
 	default:
-		atomic.AddInt64(&s.nonfreeCount, 1)
-		atomic.AddInt64(&s.nonfreeSumUs, us)
-		atomicMin(&s.nonfreeMinUs, us)
-		atomicMax(&s.nonfreeMaxUs, us)
+		s.netPage.add(r.Net)
 	}
+	s.wait.add(r.Wait)
+	k := min(max(r.Attempts, 1), len(s.tries))
+	atomic.AddInt64(&s.tries[k-1], 1)
 	if r.Offset > 0 {
 		atomicMax(&s.statusOffsetMax, int64(r.Offset))
 	}
@@ -324,17 +305,17 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 		line += fmt.Sprintf("\n  Cloudflare challenges: %d", e.Challenges)
 	}
 	if logLevel >= LevelDebug {
-		if fc := atomic.LoadInt64(&s.freeCount); fc > 0 {
-			avg := float64(atomic.LoadInt64(&s.freeSumUs)) / float64(fc) / 1000
-			mn := float64(atomic.LoadInt64(&s.freeMinUs)) / 1000
-			mx := float64(atomic.LoadInt64(&s.freeMaxUs)) / 1000
-			line += fmt.Sprintf("\n  Timing FREE:     avg=%.0fms min=%.0fms max=%.0fms (n=%d)", avg, mn, mx, fc)
+		if s.netRedirect.count() > 0 {
+			line += "\n  Network per name, redirects (free, reserved): " + s.netRedirect.summary()
 		}
-		if nc := atomic.LoadInt64(&s.nonfreeCount); nc > 0 {
-			avg := float64(atomic.LoadInt64(&s.nonfreeSumUs)) / float64(nc) / 1000
-			mn := float64(atomic.LoadInt64(&s.nonfreeMinUs)) / 1000
-			mx := float64(atomic.LoadInt64(&s.nonfreeMaxUs)) / 1000
-			line += fmt.Sprintf("\n  Timing NON-FREE: avg=%.0fms min=%.0fms max=%.0fms (n=%d)", avg, mn, mx, nc)
+		if s.netPage.count() > 0 {
+			line += "\n  Network per name, pages (the other verdicts): " + s.netPage.summary()
+		}
+		if s.wait.count() > 0 {
+			line += "\n  Waiting per name (-rate starts, pauses, retry delays, probes): " + s.wait.summary()
+			line += fmt.Sprintf("\n  Tries per name: 1: %d | 2: %d | 3: %d | 4+: %d",
+				atomic.LoadInt64(&s.tries[0]), atomic.LoadInt64(&s.tries[1]),
+				atomic.LoadInt64(&s.tries[2]), atomic.LoadInt64(&s.tries[3]))
 		}
 		if maxOff := atomic.LoadInt64(&s.statusOffsetMax); maxOff > 0 {
 			line += fmt.Sprintf("\n  Status offset max: %d bytes (readLimit=%d, you can tighten it to %d via -readlimit)",
