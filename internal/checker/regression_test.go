@@ -451,3 +451,62 @@ func TestRateLimiterSpacesStartsAfterIdle(t *testing.T) {
 		}
 	}
 }
+
+// -rate was taken once per name before the check: the retry of a name went
+// out right after its first try, on top of the limit, and names that need
+// no request (invalid ones, answers from the cache) used up a start each.
+// Every request takes a start now, and only requests do.
+func TestRateCountsRequestsNotNames(t *testing.T) {
+	var mu sync.Mutex
+	var hits []time.Duration
+	tries := map[string]int{}
+	begin := time.Now()
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		mu.Lock()
+		hits = append(hits, time.Since(begin))
+		tries[name]++
+		first := tries[name] == 1
+		mu.Unlock()
+		if first {
+			w.WriteHeader(http.StatusServiceUnavailable) // retried after 1 ms
+			return
+		}
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	c := New(Config{Workers: 4, RateRPS: 20, Retries: 1, RetryDelay: time.Millisecond, Timeout: 2 * time.Second})
+	defer c.Close()
+	in := make(chan string, 64)
+	for i := 0; i < 5; i++ {
+		in <- fmt.Sprintf("valid%d", i) // two requests each
+	}
+	for i := 0; i < 20; i++ {
+		in <- fmt.Sprintf("1bad%d", i) // invalid: no request
+	}
+	close(in)
+	out := make(chan Result, 64)
+	c.Run(context.Background(), in, out)
+	took := time.Since(begin)
+	close(out)
+	free := 0
+	for r := range out {
+		if r.Status == StatusFree {
+			free++
+		}
+	}
+	if free != 5 || len(hits) != 10 {
+		t.Fatalf("%d free and %d requests, want 5 and 10", free, len(hits))
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i] < hits[j] })
+	for k, d := range hits {
+		if due := hits[0] + time.Duration(k)*50*time.Millisecond - 5*time.Millisecond; d < due {
+			t.Errorf("request %d at %v, due no earlier than %v: a retry went past -rate (%v)", k, d, due, hits)
+			break
+		}
+	}
+	// 10 requests at 20/s take ~450 ms; a start for each of the 25 names
+	// took ~1.2 s.
+	if took > 900*time.Millisecond {
+		t.Errorf("run took %v; the 20 invalid names must not wait for starts", took)
+	}
+}

@@ -108,7 +108,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-output` | | Results file (truncated unless `-append` or `-resume`) |
 | `-workers` | `50` | Parallel workers (up to 1000) |
 | `-conns` | `8` | TCP connections to fragment.com (HTTP/2 multiplexing) |
-| `-rate` | `0` | Global limit, requests per second (0 = unlimited) |
+| `-rate` | `0` | Requests per second to Fragment, retries included; names answered from the cache and invalid names do not count (0 = unlimited) |
 | `-retries` / `-retry-delay` | `2` / `500ms` | Extra attempts per name and the pause between them |
 | `-rl-wait-max` | `30s` | Longest `Retry-After` honoured on HTTP 429 |
 | `-timeout` | `15s` | Whole-request timeout |

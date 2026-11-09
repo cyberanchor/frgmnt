@@ -566,7 +566,7 @@ func Main(args []string) int {
 		outputPath = fs.String("output", "", "Path to the results file (required)")
 		workers    = fs.Int("workers", defaultWorkers, "Number of parallel workers")
 		maxConns   = fs.Int("conns", defaultMaxConnsPerHost, "Max TCP connections to fragment.com (HTTP/2 multiplex)")
-		rateRPS    = fs.Int("rate", 0, "Global rate limit, requests per second (0 = unlimited)")
+		rateRPS    = fs.Int("rate", 0, "Requests per second to Fragment, retries included; answers from the cache do not count (0 = unlimited)")
 		retries    = fs.Int("retries", 2, "Max manual retries per request (no exponential backoff)")
 		retryDelay = fs.Duration("retry-delay", 500*time.Millisecond, "Delay between retries")
 		rlWaitMax  = fs.Duration("rl-wait-max", 30*time.Second, "Maximum wait honoured for HTTP 429 Retry-After")

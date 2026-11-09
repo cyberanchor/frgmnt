@@ -100,7 +100,7 @@ type Result struct {
 type Config struct {
 	Workers     int           `json:"workers"`
 	MaxConns    int           `json:"max_conns"`
-	RateRPS     int           `json:"rate_rps"`
+	RateRPS     int           `json:"rate_rps"` // requests per second to Fragment, retries included; 0 = no limit
 	Retries     int           `json:"retries"`
 	RetryDelay  time.Duration `json:"retry_delay_ns"`
 	RLWaitMax   time.Duration `json:"rl_wait_max_ns"`
@@ -327,9 +327,6 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 			if !ok {
 				return
 			}
-			if err := c.limiter.Wait(ctx); err != nil {
-				return
-			}
 			start := time.Now()
 			r := c.CheckOne(ctx, name)
 			r.Took = time.Since(start)
@@ -465,9 +462,6 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 }
 
 func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
-	if err := c.waitBlock(ctx); err != nil {
-		return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
-	}
 	if !c.opened.Load() {
 		select {
 		case c.scout <- struct{}{}:
@@ -478,6 +472,24 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		if c.blocked.Load() {
 			msg := "not sent: Fragment blocks this client (Cloudflare challenge)"
 			return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
+		}
+	}
+	// -rate counts requests: every attempt takes a start, a retry too. It
+	// used to be taken once per name before the check, so retries went out
+	// on top of the limit, and names answered from the cache (or invalid
+	// ones) used up starts without sending anything. The start is taken
+	// after the shared pause; if a pause began while this request waited
+	// for its start, it waits that pause out and takes a new start, so the
+	// requests that waited do not all go out together when it ends.
+	for {
+		if err := c.waitBlock(ctx); err != nil {
+			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
+		}
+		if err := c.limiter.Wait(ctx); err != nil {
+			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
+		}
+		if !c.paused() {
+			break
 		}
 	}
 	// Runs before the scout slot is released: a waiting request sees the
@@ -1100,7 +1112,10 @@ func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
 
 // probeHealthy requests a random username that should resolve to free/taken.
 // It returns false when Fragment redirects even the probe to "/", which is
-// the signature of IP/session throttling rather than a reserved name.
+// the signature of IP/session throttling rather than a reserved name. The
+// probe does not wait for a -rate start: it is one request shared by all
+// workers per check, and behind a queue of starts the decision to pause
+// could come many seconds late.
 func (c *Checker) probeHealthy(ctx context.Context) bool {
 	name := fmt.Sprintf("zzprobe%d", time.Now().UnixNano()%1_000_000_000_000)
 	reqURL := fmt.Sprintf(FragmentURLTemplate, url.PathEscape(name))
@@ -1141,6 +1156,12 @@ func (c *Checker) triggerBlock() {
 			return
 		}
 	}
+}
+
+// paused reports whether the shared cooldown is in force now.
+func (c *Checker) paused() bool {
+	until := c.blockUntil.Load()
+	return until != 0 && time.Now().UnixNano() < until
 }
 
 // waitBlock sleeps until the shared cooldown expires, or ctx is cancelled.
