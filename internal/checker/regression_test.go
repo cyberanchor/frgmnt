@@ -510,3 +510,43 @@ func TestRateCountsRequestsNotNames(t *testing.T) {
 		t.Errorf("run took %v; the 20 invalid names must not wait for starts", took)
 	}
 }
+
+// Until the first answer, requests go out one at a time. A request that had
+// queued for that first slot stayed in the queue after the first answer
+// opened the gate, so the requests of the start still went one by one: on
+// the local stand-in, with the second request slow (2 s), 30 names took
+// 4.0 s instead of 2.2 s. Waiters wake up when the gate opens now.
+func TestGateWakesWaitersWhenItOpens(t *testing.T) {
+	var n atomic.Int32
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if n.Add(1) > 1 {
+			time.Sleep(500 * time.Millisecond) // every request but the first is slow
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	// MaxConns 8: the test server speaks HTTP/1.1, one request per
+	// connection at a time.
+	c := New(Config{Workers: 5, MaxConns: 8, Retries: 0, Timeout: 5 * time.Second})
+	defer c.Close()
+	in := make(chan string, 5)
+	for i := 0; i < 5; i++ {
+		in <- fmt.Sprintf("gatename%d", i)
+	}
+	close(in)
+	out := make(chan Result, 5)
+	start := time.Now()
+	c.Run(context.Background(), in, out)
+	took := time.Since(start)
+	close(out)
+	for r := range out {
+		if r.Status != StatusFree {
+			t.Fatalf("%s: %s %s", r.Username, r.Status, r.Error)
+		}
+	}
+	// One fast request, then four slow ones together: ~0.5 s. In single
+	// file the four took ~2 s.
+	if took > 1200*time.Millisecond {
+		t.Errorf("5 names took %v; after the first answer the waiting requests must go together", took)
+	}
+}

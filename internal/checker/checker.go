@@ -239,11 +239,8 @@ type Checker struct {
 	probeOK      bool
 
 	// Until the first outcome that is not a challenge (an answer or a
-	// network error), requests go out one at a time through scout. A
-	// client that is already blocked then learns it after ChallengeLimit
-	// requests instead of sending one per worker at once.
-	opened atomic.Bool
-	scout  chan struct{}
+	// network error), requests go out one at a time through the gate.
+	gate *gate
 
 	log Logger // optional detail for the console's -debug and -trace
 }
@@ -274,7 +271,7 @@ func New(cfg Config) *Checker {
 		limiter: newRateLimiter(cfg.RateRPS),
 		stats:   newLiveStats(),
 		cache:   newPageCache(cfg.CacheDir, cfg.CacheTTL, cfg.CacheSoldTTL),
-		scout:   make(chan struct{}, 1),
+		gate:    newGate(),
 	}
 	c.pool.New = func() any {
 		b := make([]byte, cfg.ReadLimit)
@@ -462,17 +459,14 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 }
 
 func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
-	if !c.opened.Load() {
-		select {
-		case c.scout <- struct{}{}:
-			defer func() { <-c.scout }()
-		case <-ctx.Done():
-			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
-		}
-		if c.blocked.Load() {
-			msg := "not sent: Fragment blocks this client (Cloudflare challenge)"
-			return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
-		}
+	release, err := c.gate.pass(ctx)
+	if err != nil {
+		return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
+	}
+	defer release()
+	if c.blocked.Load() {
+		msg := "not sent: Fragment blocks this client (Cloudflare challenge)"
+		return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
 	}
 	// -rate counts requests: every attempt takes a start, a retry too. It
 	// used to be taken once per name before the check, so retries went out
@@ -492,12 +486,12 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 			break
 		}
 	}
-	// Runs before the scout slot is released: a waiting request sees the
-	// gate open and goes ahead.
+	// Runs before the gate's slot is released; every waiting request wakes
+	// up and goes ahead.
 	challenged := false
 	defer func() {
 		if !challenged && ctx.Err() == nil {
-			c.opened.Store(true)
+			c.gate.Open()
 		}
 	}()
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
