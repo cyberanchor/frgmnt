@@ -1051,14 +1051,13 @@ func ScanNames(r io.Reader, fn func(name string) error) error {
 // ParseNamesReader reads a list with ScanNames and returns the valid names
 // without duplicates, in order, and the number of invalid ones.
 func ParseNamesReader(r io.Reader) (names []string, rejected int, err error) {
-	seen := make(map[string]struct{}, 256)
+	var seen NameSet
 	err = ScanNames(r, func(name string) error {
 		if ValidateUsername(name) != nil {
 			rejected++
 			return nil
 		}
-		if _, ok := seen[name]; !ok {
-			seen[name] = struct{}{}
+		if seen.Add(name) {
 			names = append(names, name)
 		}
 		return nil

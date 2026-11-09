@@ -292,32 +292,25 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 // after "|" is ignored, so a results file can be read back. When dedup is
 // true, duplicates are skipped. When skip is non-nil, names in it are
 // dropped (used for -resume). Invalid names are passed on: the engine
-// reports them as "invalid" errors without a request. Memory usage is
-// O(unique-names) when dedup is on, O(1) otherwise.
+// reports them as "invalid" errors without a request. Memory grows only
+// with the number of unique names when dedup is on (checker.NameSet, about
+// 8 bytes per name of up to 12 characters), and stays flat otherwise.
 func produceUsernames(
 	ctx context.Context,
 	src io.Reader,
 	tasks chan<- string,
 	dedup bool,
-	skip map[string]struct{},
+	skip *checker.NameSet,
 	stats *Stats,
 ) (rejected int64, err error) {
-	var seen map[string]struct{}
-	if dedup {
-		seen = make(map[string]struct{}, 1024)
-	}
+	var seen checker.NameSet
 	err = checker.ScanNames(src, func(name string) error {
-		if dedup {
-			if _, ok := seen[name]; ok {
-				return nil
-			}
-			seen[name] = struct{}{}
+		if dedup && !seen.Add(name) {
+			return nil
 		}
-		if skip != nil {
-			if _, ok := skip[name]; ok {
-				rejected++
-				return nil
-			}
+		if skip.Has(name) {
+			rejected++
+			return nil
 		}
 		select {
 		case <-ctx.Done():
@@ -338,7 +331,7 @@ func produceUsernames(
 // usernames that already have a verdict there (lines with an error do not
 // count). Returns nil, nil when the file does not exist (first run is
 // allowed).
-func loadResumeSet(path string) (map[string]struct{}, error) {
+func loadResumeSet(path string) (*checker.NameSet, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -349,7 +342,7 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
-	set := make(map[string]struct{})
+	set := new(checker.NameSet)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "@") {
@@ -368,7 +361,7 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 		}
 		name := strings.ToLower(strings.TrimSpace(line[1:pipe]))
 		if name != "" {
-			set[name] = struct{}{}
+			set.Add(name)
 		}
 	}
 	return set, scanner.Err()
@@ -376,7 +369,7 @@ func loadResumeSet(path string) (map[string]struct{}, error) {
 
 // addCheckedList adds the names of a <output>.checked list (one per line)
 // to set. A missing file is not an error.
-func addCheckedList(path string, set map[string]struct{}) error {
+func addCheckedList(path string, set *checker.NameSet) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -389,7 +382,7 @@ func addCheckedList(path string, set map[string]struct{}) error {
 	scanner.Buffer(make([]byte, 64*1024), scannerBufMax)
 	for scanner.Scan() {
 		if name := strings.TrimSpace(scanner.Text()); name != "" {
-			set[name] = struct{}{}
+			set.Add(name)
 		}
 	}
 	return scanner.Err()
@@ -663,20 +656,20 @@ func Main(args []string) int {
 	// With -filter the results file lacks the names the filter left out;
 	// <output>.checked lists every name that got a verdict.
 	checkedPath := *outputPath + ".checked"
-	var skip map[string]struct{}
+	var skip *checker.NameSet
 	if *resume {
 		s, err := loadResumeSet(*outputPath)
 		if err != nil {
 			log.Fatalf("Cannot read resume set from %s: %v", *outputPath, err)
 		}
 		if s == nil {
-			s = make(map[string]struct{})
+			s = new(checker.NameSet)
 		}
 		if err := addCheckedList(checkedPath, s); err != nil {
 			log.Fatalf("Cannot read %s: %v", checkedPath, err)
 		}
 		skip = s
-		log.Printf("[resume] loaded %d already-processed names", len(skip))
+		log.Printf("[resume] loaded %d already-processed names", skip.Len())
 	}
 
 	// --- Open output ---

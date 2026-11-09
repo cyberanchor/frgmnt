@@ -127,7 +127,7 @@ func TestResumeRechecksErrorLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, want := range map[string]bool{"alice": true, "bob": false, "carol": false, "dave": true} {
-		if _, got := set[name]; got != want {
+		if got := set.Has(name); got != want {
 			t.Errorf("%s in the resume set: %v, want %v (set %v)", name, got, want, set)
 		}
 	}
