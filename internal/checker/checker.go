@@ -314,6 +314,24 @@ func (c *Checker) block(kind BlockKind, format string, args ...any) {
 		c.blockKind.Store(int32(kind))
 		close(c.blockedCh)
 		c.warnf(format, args...)
+		block := "challenge"
+		if kind == BlockedByThrottle {
+			block = "throttle"
+		}
+		c.event(TraceEvent{Kind: "blocked", Block: block, Message: fmt.Sprintf(format, args...)})
+	}
+}
+
+// openGate and closeGate change the gate and put the change in the trace.
+func (c *Checker) openGate() {
+	if c.gate.Open() {
+		c.event(TraceEvent{Kind: "gate", Gate: "open"})
+	}
+}
+
+func (c *Checker) closeGate() {
+	if c.gate.Close() {
+		c.event(TraceEvent{Kind: "gate", Gate: "closed"})
 	}
 }
 
@@ -436,6 +454,13 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 		res.Net = net
 		res.Wait = res.Took - net
 		res.Attempts = tries
+		if c.eventsOn() {
+			c.event(TraceEvent{Kind: "result", Name: res.Username, Status: res.Status,
+				Confidence: res.Confidence, Evidence: res.Evidence, Offset: res.Offset, Error: res.Error,
+				Attempts: res.Attempts, TookMs: ms(res.Took), NetMs: ms(res.Net), WaitMs: ms(res.Wait),
+				Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
+				Cancelled: ctx.Err() != nil && res.Status == StatusError})
+		}
 	}()
 	name := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(raw, "@")))
 	if err := ValidateUsername(name); err != nil {
@@ -459,13 +484,16 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 				Evidence:   "cache; " + ev,
 				Cached:     true,
 			}
+			age := time.Since(ent.FetchedAt)
 			if c.cache.fresh(st, ent.FetchedAt) {
 				atomic.AddInt64(&c.stats.cacheHits, 1)
-				c.debugf("cache hit: %s -> %s (confidence=%d; %s)", name, st, conf, ev)
+				c.debugf("cache hit: %s -> %s (confidence=%d; %s; %v old)", name, st, conf, ev, age.Round(time.Second))
+				c.event(TraceEvent{Kind: "cache", Name: name, Cache: "hit", Status: st, AgeMs: ms(age)})
 				return cached
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
-			c.debugf("cache stale: %s -> %s; re-checking", name, st)
+			c.debugf("cache stale: %s -> %s (%v old); re-checking", name, st, age.Round(time.Second))
+			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "stale", Status: st, AgeMs: ms(age)})
 			// Only settled verdicts are served after a network failure: a
 			// sold or taken name rarely changes, while an auction or a sale
 			// seen days ago is likely over.
@@ -475,6 +503,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			}
 		} else {
 			atomic.AddInt64(&c.stats.cacheMisses, 1)
+			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "miss"})
 		}
 	}
 
@@ -507,7 +536,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 				// the gate that the "302 /" left closed. For a reserved name
 				// nobody waits; it is retried in its cookie session (a first
 				// "302 /" can also be a session start).
-				c.gate.Open()
+				c.openGate()
 			}
 			lastErr, lastRes = errStr, r
 			attempts++
@@ -636,7 +665,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 	challenged, hold := false, false
 	defer func() {
 		if !challenged && !hold && ctx.Err() == nil {
-			c.gate.Open()
+			c.openGate()
 		}
 	}()
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
@@ -1307,6 +1336,11 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 		if at.end.IsZero() {
 			at.end = time.Now()
 		}
+		if c.eventsOn() {
+			e := at.event(Result{Error: why}, false)
+			e.Healthy = boolPtr(healthy)
+			c.event(e)
+		}
 		if c.debugOn() {
 			verdict := "THROTTLED (redirected to / as well)"
 			if healthy {
@@ -1417,10 +1451,15 @@ func (c *Checker) throttled(wait time.Duration) bool {
 	if d > maxThrottlePause {
 		d = maxThrottlePause
 	}
-	c.gate.Close()
+	c.closeGate()
 	c.pauseFor(d)
 	c.throttleMu.Unlock()
 	atomic.AddInt64(&c.stats.pauses, 1)
+	reason := "throttle"
+	if wait > 0 {
+		reason = "429"
+	}
+	c.event(TraceEvent{Kind: "pause", PauseMs: ms(d), Round: round, Reason: reason, ThrottledMs: ms(lasted)})
 	c.warnf("Fragment is throttling this client: every request pauses for %v (pause %d, throttled for %v)",
 		d, round, lasted.Round(time.Second))
 	return false
@@ -1440,6 +1479,7 @@ func (c *Checker) noteHealthy() {
 	c.throttleMu.Unlock()
 	if rounds > 0 {
 		c.warnf("Fragment answers normally again after %d pause(s)", rounds)
+		c.event(TraceEvent{Kind: "throttle_over", Round: rounds})
 	}
 }
 

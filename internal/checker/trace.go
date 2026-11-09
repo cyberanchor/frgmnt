@@ -18,6 +18,10 @@ type Logger struct {
 	Warnf  func(format string, args ...any) // notable events: throttle pauses, HTTP 429, the stop
 	Debugf func(format string, args ...any) // one line per HTTP try with its timings, codes, redirects, verdicts, cache use
 	Tracef func(format string, args ...any) // every step: request headers, DNS/TCP/TLS, headers of the answer, body previews
+
+	// Event receives the structured trace: one TraceEvent per HTTP request,
+	// cache lookup and name, and the pauses, the gate and the stop. nil = off.
+	Event func(TraceEvent)
 }
 
 // SetLogger installs l. Call it before the first check.
@@ -289,10 +293,14 @@ func (a *attempt) line(outcome string) string {
 	return strings.Join(parts, " | ")
 }
 
-// finish closes the record of a try of a name: the -debug line.
+// finish closes the record of a try of a name: its event in the
+// structured trace and its -debug line.
 func (a *attempt) finish(res Result, retry bool) {
 	if a.end.IsZero() {
 		a.end = time.Now()
+	}
+	if a.c.eventsOn() {
+		a.c.event(a.event(res, retry))
 	}
 	if !a.c.debugOn() {
 		return

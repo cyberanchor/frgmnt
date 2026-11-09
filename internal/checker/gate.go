@@ -78,25 +78,31 @@ func (g *gate) closedSince(t ticket) bool {
 	return g.epoch != t.epoch
 }
 
-// Open lets every request through and wakes the ones that wait.
-func (g *gate) Open() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if !g.open {
-		g.open = true
-		close(g.opened)
-	}
-}
-
-// Close makes requests go one at a time again until the next Open.
-func (g *gate) Close() {
+// Open lets every request through and wakes the ones that wait. It
+// reports whether the gate was closed.
+func (g *gate) Open() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.open {
-		g.open = false
-		g.epoch++
-		g.opened = make(chan struct{})
+		return false
 	}
+	g.open = true
+	close(g.opened)
+	return true
+}
+
+// Close makes requests go one at a time again until the next Open. It
+// reports whether the gate was open.
+func (g *gate) Close() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.open {
+		return false
+	}
+	g.open = false
+	g.epoch++
+	g.opened = make(chan struct{})
+	return true
 }
 
 // IsOpen reports whether requests go through without waiting.
