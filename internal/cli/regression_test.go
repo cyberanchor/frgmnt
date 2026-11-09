@@ -536,3 +536,54 @@ func TestConsoleReadsListsLikeWeb(t *testing.T) {
 		t.Errorf("%d lines, want 4: %q", len(lines), lines)
 	}
 }
+
+// A run that Fragment kept throttling ("302 /" for every name and for the
+// probe) wrote "persistent 302 /" errors for the names whose attempts ran
+// out within one pause and went on. With -throttle-max it now stops when
+// the throttling lasts that long, exits with 3, writes no lines for the
+// names (no verdict), and -resume later checks all of them.
+func TestThrottledRunExitCodeAndResume(t *testing.T) {
+	var throttled atomic.Bool
+	throttled.Store(true)
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		if throttled.Load() {
+			http.Redirect(w, r, "/", http.StatusFound)
+			return
+		}
+		freeHandler(w, r, name)
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	var b strings.Builder
+	for i := 0; i < 50; i++ {
+		fmt.Fprintf(&b, "name%03d\n", i)
+	}
+	if err := os.WriteFile(in, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "4", "-retries", "2", "-throttle-max", "300ms"}
+	if code := Main(args); code != 3 {
+		t.Errorf("throttled run: exit code %d, want 3", code)
+	}
+	raw, _ := os.ReadFile(out)
+	if s := strings.TrimSpace(string(raw)); s != "" {
+		t.Errorf("throttled run wrote %q; a throttled name has no verdict and no line", s)
+	}
+
+	throttled.Store(false)
+	if code := Main(append(args, "-resume")); code != 0 {
+		t.Errorf("resume: exit code %d, want 0", code)
+	}
+	raw, _ = os.ReadFile(out)
+	free := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if _, status, ok := strings.Cut(line, " | "); ok && status == "free" {
+			free++
+		}
+	}
+	if free != 50 {
+		t.Errorf("%d free lines after -resume, want 50", free)
+	}
+}

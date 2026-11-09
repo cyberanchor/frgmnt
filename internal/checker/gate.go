@@ -9,7 +9,9 @@ import (
 // starts with it closed: until the first outcome that is not a Cloudflare
 // challenge, one request goes out at a time, so a client that is already
 // blocked learns it after ChallengeLimit requests instead of sending one
-// per worker at once.
+// per worker at once. A throttle pause closes it again, so that after the
+// pause one request tests whether Fragment answers normally before the
+// others follow.
 //
 // The gate used to be a flag plus a one-slot channel. A request that saw
 // the flag unset queued for the slot and stayed in that queue after the
@@ -20,6 +22,7 @@ import (
 type gate struct {
 	mu     sync.Mutex
 	open   bool
+	epoch  uint64        // how many times the gate has been closed again
 	opened chan struct{} // closed when the gate opens; a new one when it closes again
 	slot   chan struct{} // capacity 1: the request holding it goes alone
 }
@@ -28,27 +31,51 @@ func newGate() *gate {
 	return &gate{opened: make(chan struct{}), slot: make(chan struct{}, 1)}
 }
 
-func noRelease() {}
+// ticket is a pass through the gate. Release it once, when the request
+// is done.
+type ticket struct {
+	g     *gate
+	epoch uint64
+	scout bool // holds the slot: the request goes alone
+}
+
+func (t ticket) release() {
+	if t.scout {
+		<-t.g.slot
+	}
+}
 
 // pass returns when the caller may send its request: at once when the
 // gate is open, otherwise when the caller gets the slot (it goes alone) or
-// the gate opens. Call release when the request is done.
-func (g *gate) pass(ctx context.Context) (release func(), err error) {
+// the gate opens. It gives up when ctx is done or stop is closed.
+func (g *gate) pass(ctx context.Context, stop <-chan struct{}) (ticket, error) {
 	g.mu.Lock()
+	t := ticket{g: g, epoch: g.epoch}
 	if g.open {
 		g.mu.Unlock()
-		return noRelease, nil
+		return t, nil
 	}
 	opened := g.opened
 	g.mu.Unlock()
 	select {
 	case g.slot <- struct{}{}:
-		return func() { <-g.slot }, nil
+		t.scout = true
+		return t, nil
 	case <-opened:
-		return noRelease, nil
+		return t, nil
+	case <-stop:
+		return t, errBlocked
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return t, ctx.Err()
 	}
+}
+
+// closedSince reports whether the gate was closed again after t was
+// issued: the request that holds t must go through the gate once more.
+func (g *gate) closedSince(t ticket) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.epoch != t.epoch
 }
 
 // Open lets every request through and wakes the ones that wait.
@@ -67,6 +94,7 @@ func (g *gate) Close() {
 	defer g.mu.Unlock()
 	if g.open {
 		g.open = false
+		g.epoch++
 		g.opened = make(chan struct{})
 	}
 }

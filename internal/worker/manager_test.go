@@ -774,3 +774,57 @@ func TestResultEventsOnlyAtDebugLevel(t *testing.T) {
 		t.Errorf("%d result events at debug level, want 5", n)
 	}
 }
+
+// A tile that Fragment keeps throttling stops with the error status and a
+// log line that says so, keeps every name pending, and its warnings (the
+// pauses) reach the log: the panel set no logger for the engine before.
+func TestThrottledRunStopsWithItsOwnMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/", http.StatusFound) // every name and the probe
+	}))
+	old := checker.FragmentURLTemplate
+	checker.FragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() { checker.FragmentURLTemplate = old; srv.Close() })
+
+	h := newHarness(t)
+	var warns atomic.Int64
+	events, cancel := h.bus.Subscribe("", 1024)
+	defer cancel()
+	go func() {
+		for e := range events {
+			if e.Level == "WARN" && strings.Contains(e.Message, "throttling") {
+				warns.Add(1)
+			}
+		}
+	}()
+	ctx := context.Background()
+	cfg := testConfig(4)
+	cfg.BlockCooldown = 20 * time.Millisecond
+	cfg.ThrottleMax = 300 * time.Millisecond
+	w, err := h.m.Create(ctx, "throttled", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(40)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("throttled run did not stop")
+	}
+	if st := w.Status(); st != StatusError {
+		t.Errorf("status: %s, want error", st)
+	}
+	if !strings.Contains(h.lastError(), "kept throttling") {
+		t.Errorf("last error log: %q, want the throttling explained", h.lastError())
+	}
+	if checked, rows := persistedCounts(t, h.st, w.ID()); checked != 0 || rows != 0 {
+		t.Errorf("%d names checked, %d rows; a throttled name must stay pending", checked, rows)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if warns.Load() == 0 {
+		t.Error("no throttle warning reached the log")
+	}
+}

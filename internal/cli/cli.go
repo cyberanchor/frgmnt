@@ -231,10 +231,10 @@ func (s *Stats) snapshot(e checker.Stats) string {
 		rps = float64(e.Checked) / elapsed
 	}
 	return fmt.Sprintf(
-		"%d/%d (%.1f req/s) | free=%d reserved=%d auction=%d available=%d taken=%d sold=%d unknown=%d err=%d | new=%d reuse=%d | 429=%d retry=%d",
+		"%d/%d (%.1f req/s) | free=%d reserved=%d auction=%d available=%d taken=%d sold=%d unknown=%d err=%d | new=%d reuse=%d | 429=%d retry=%d pause=%d",
 		e.Checked, atomic.LoadInt64(&s.total), rps,
 		e.Free, e.Reserved, e.Auction, e.Available, e.Taken, e.Sold, e.Unknown, e.Errors,
-		e.ConnNew, e.ConnReuse, e.RateLimit, e.Retries,
+		e.ConnNew, e.ConnReuse, e.RateLimit, e.Retries, e.Pauses,
 	)
 }
 
@@ -570,6 +570,7 @@ func Main(args []string) int {
 		retries    = fs.Int("retries", 2, "Max manual retries per request (no exponential backoff)")
 		retryDelay = fs.Duration("retry-delay", 500*time.Millisecond, "Delay between retries")
 		rlWaitMax  = fs.Duration("rl-wait-max", 30*time.Second, "Maximum wait honoured for HTTP 429 Retry-After")
+		throttleMx = fs.Duration("throttle-max", 30*time.Minute, "Stop when Fragment keeps throttling this long; names without a verdict stay for -resume")
 		timeout    = fs.Duration("timeout", defaultTimeout, "Total HTTP request timeout")
 		readLimitF = fs.Int("readlimit", checker.DefaultReadLimit, "Body bytes to read for status parsing (the -debug summary suggests an optimal value)")
 
@@ -706,6 +707,7 @@ func Main(args []string) int {
 	cfg.Retries = *retries
 	cfg.RetryDelay = *retryDelay
 	cfg.RLWaitMax = *rlWaitMax
+	cfg.ThrottleMax = *throttleMx
 	cfg.Timeout = *timeout
 	cfg.ReadLimit = *readLimitF
 	cfg.InsecureTLS = *insecure
@@ -841,6 +843,13 @@ func Main(args []string) int {
 	final := chk.Snapshot()
 	log.Println(stats.finalSummary(final, eff.ReadLimit))
 	switch {
+	case blocked && chk.BlockedBy() == checker.BlockedByThrottle:
+		log.Printf("[ERROR] Fragment kept throttling this IP for %v (every request and the probe redirected to \"/\", "+
+			"or HTTP 429), so the run stopped. Names without a verdict are checked again by a later run with -resume; "+
+			"a lower -rate makes throttling less likely.", eff.ThrottleMax)
+		if exitCode == 0 {
+			exitCode = 3
+		}
 	case blocked:
 		log.Printf("[ERROR] Fragment answered %d requests in a row with a Cloudflare challenge "+
 			"(HTTP 403, cf-mitigated: challenge), so it blocks this IP and the run stopped. "+

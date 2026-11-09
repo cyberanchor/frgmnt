@@ -93,6 +93,10 @@ type Result struct {
 	// client was found blocked first. Run drops it: the name stays
 	// unchecked, like one cut short by a cancel.
 	notSent bool
+
+	// throttleWait is set by doRequest for HTTP 429: the Retry-After wait
+	// that the shared pause must at least cover.
+	throttleWait time.Duration
 }
 
 // Config is the per-Checker tunables surface. Zero values get sensible
@@ -121,6 +125,12 @@ type Config struct {
 	// names and for throttling) while a probe name is redirected to "/"
 	// as well. A reserved name alone does not pause anyone.
 	BlockCooldown time.Duration `json:"block_cooldown_ns,omitempty"`
+
+	// ThrottleMax is how long Fragment may keep throttling this client,
+	// counted from the first sign after the last normal answer, before
+	// Run stops and leaves the rest of the names pending. Meanwhile the
+	// shared pause grows from BlockCooldown up to two minutes.
+	ThrottleMax time.Duration `json:"throttle_max_ns,omitempty"`
 }
 
 // Upper bounds for Config values. The web API rejects values above them;
@@ -162,6 +172,7 @@ func (c Config) Validate() error {
 		checkDur("rl_wait_max_ns", c.RLWaitMax, 10*time.Minute),
 		checkDur("timeout_ns", c.Timeout, 10*time.Minute),
 		checkDur("block_cooldown_ns", c.BlockCooldown, 10*time.Minute),
+		checkDur("throttle_max_ns", c.ThrottleMax, 24*time.Hour),
 	} {
 		if err != nil {
 			return err
@@ -183,8 +194,13 @@ func DefaultConfig() Config {
 		ReadLimit:     DefaultReadLimit,
 		UserAgent:     defaultUserAgent,
 		BlockCooldown: 3 * time.Second,
+		ThrottleMax:   defaultThrottleMax,
 	}
 }
+
+// defaultThrottleMax lets a long run sit out a throttled spell: with the
+// pause capped at two minutes that costs about two requests per pause.
+const defaultThrottleMax = 30 * time.Minute
 
 // Stats is a snapshot of per-Checker counters. Returned by Checker.Snapshot.
 type Stats struct {
@@ -210,6 +226,10 @@ type Stats struct {
 	// Challenges counts Cloudflare challenge answers (HTTP 403 with
 	// cf-mitigated: challenge, or a "Just a moment..." page).
 	Challenges int64 `json:"challenges"`
+
+	// Pauses counts the shared pauses taken because Fragment throttled
+	// this client.
+	Pauses int64 `json:"pauses"`
 }
 
 // Checker performs concurrent Fragment lookups against a single Config.
@@ -227,9 +247,21 @@ type Checker struct {
 	blockUntil atomic.Int64
 
 	// challengeRun counts challenge answers since the last other answer;
-	// blocked is set when it reaches ChallengeLimit.
+	// blocked is set when it reaches ChallengeLimit, or when throttling
+	// lasts ThrottleMax (blockKind says which). blockedCh is closed then,
+	// to wake the requests that wait.
 	challengeRun atomic.Int64
 	blocked      atomic.Bool
+	blockKind    atomic.Int32
+	blockedCh    chan struct{}
+
+	// Throttling: rounds of the shared pause since the last normal
+	// answer, and when the first sign of this spell came. throttling is
+	// the lock-free "is there anything to reset" for noteHealthy.
+	throttleMu     sync.Mutex
+	throttleRounds int
+	throttleSince  time.Time
+	throttling     atomic.Bool
 
 	// The last probe (see probe): when it started and finished, and whether
 	// the probe name got a normal answer.
@@ -245,16 +277,44 @@ type Checker struct {
 	log Logger // optional detail for the console's -debug and -trace
 }
 
-// Blocked reports whether Run gave up because Fragment kept answering with
-// a Cloudflare challenge. The names Run did not get to are left unread in
-// its input channel; callers stop their producer and keep them pending.
+// Blocked reports whether Run gave up: Fragment kept answering with a
+// Cloudflare challenge, or kept throttling for ThrottleMax (BlockedBy).
+// The names Run did not get to are left unread in its input channel;
+// callers stop their producer and keep them pending.
 func (c *Checker) Blocked() bool { return c.blocked.Load() }
+
+// BlockKind says why Run gave up.
+type BlockKind int
+
+// Why Run gave up.
+const (
+	NotBlocked         BlockKind = iota
+	BlockedByChallenge           // ChallengeLimit Cloudflare challenges in a row
+	BlockedByThrottle            // Fragment throttled for ThrottleMax
+)
+
+// BlockedBy reports why Run gave up, or NotBlocked.
+func (c *Checker) BlockedBy() BlockKind { return BlockKind(c.blockKind.Load()) }
+
+// block stops the run: Run takes no more names, and the requests that
+// wait (for the gate, the pause or a -rate start) wake up and are not
+// sent. Only the first call counts.
+func (c *Checker) block(kind BlockKind, format string, args ...any) {
+	if c.blocked.CompareAndSwap(false, true) {
+		c.blockKind.Store(int32(kind))
+		close(c.blockedCh)
+		c.warnf(format, args...)
+	}
+}
+
+// errBlocked ends a wait because the run was stopped (see block).
+var errBlocked = errors.New("blocked")
 
 // noteChallenge counts a Cloudflare challenge answer.
 func (c *Checker) noteChallenge() {
 	atomic.AddInt64(&c.stats.challenges, 1)
-	if c.challengeRun.Add(1) >= ChallengeLimit && c.blocked.CompareAndSwap(false, true) {
-		c.warnf("Fragment answered %d requests in a row with a Cloudflare challenge: this client is blocked, stopping", ChallengeLimit)
+	if c.challengeRun.Add(1) >= ChallengeLimit {
+		c.block(BlockedByChallenge, "Fragment answered %d requests in a row with a Cloudflare challenge: this client is blocked, stopping", ChallengeLimit)
 	}
 }
 
@@ -272,6 +332,8 @@ func New(cfg Config) *Checker {
 		stats:   newLiveStats(),
 		cache:   newPageCache(cfg.CacheDir, cfg.CacheTTL, cfg.CacheSoldTTL),
 		gate:    newGate(),
+
+		blockedCh: make(chan struct{}),
 	}
 	c.pool.New = func() any {
 		b := make([]byte, cfg.ReadLimit)
@@ -401,12 +463,37 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 
 	reqURL := fmt.Sprintf(FragmentURLTemplate, url.PathEscape(name))
 
-	var lastErr string
-	var lastRes Result
-	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
-		if attempt > 0 {
-			if c.blocked.Load() {
-				break // no point in retrying: every answer is a challenge
+	// A try counts against Retries only when it says something about the
+	// name; tries while Fragment throttles this client do not (see
+	// throttled), so a name waits out the pause and is tried again.
+	for {
+		var lastErr string
+		var lastRes Result
+		attempts := 0
+		for {
+			res, retry, errStr := c.doRequest(ctx, name, reqURL)
+			if !retry {
+				return res
+			}
+			if res.throttleWait > 0 || (res.Status == StatusReserved && !c.probe(ctx, probeReuse)) {
+				// HTTP 429, or a bare "302 /" while a random free name is
+				// redirected to "/" too: the client is throttled.
+				if c.throttled(res.throttleWait) {
+					return Result{Username: name, Status: StatusError, Error: c.blockedError(), notSent: true}
+				}
+				continue
+			}
+			if res.Status == StatusReserved {
+				// The probe is healthy, so Fragment serves this client: open
+				// the gate that the "302 /" left closed. For a reserved name
+				// nobody waits; it is retried in its cookie session (a first
+				// "302 /" can also be a session start).
+				c.gate.Open()
+			}
+			lastErr, lastRes = errStr, res
+			attempts++
+			if attempts > c.cfg.Retries || c.blocked.Load() {
+				break // no point in retrying when every answer is a challenge
 			}
 			select {
 			case <-ctx.Done():
@@ -418,79 +505,100 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) Result {
 			}
 			atomic.AddInt64(&c.stats.retries, 1)
 		}
-		res, retry, errStr := c.doRequest(ctx, name, reqURL)
-		if !retry {
+		if lastRes.Status == StatusReserved {
+			// Distinguish a genuine reserved name from a throttled client by
+			// probing a random name that should be free, now. If the probe
+			// is also redirected to "/", throttling began during the tries,
+			// so their "302 /" proves nothing: the name is checked again
+			// after the pause (it used to end as an error, "persistent 302
+			// /"), and never reported as a false "reserved".
+			if c.probe(ctx, 0) {
+				c.debugf("@%s: redirect to / persisted after %d attempts; probe healthy -> reserved", name, c.cfg.Retries+1)
+				lastRes.Evidence = fmt.Sprintf("redirect=/ after %d attempts; probe healthy -> reserved", c.cfg.Retries+1)
+				lastRes.Confidence = 60
+				return lastRes
+			}
+			if ctx.Err() != nil {
+				return Result{Username: name, Status: StatusError, Error: "cancelled"}
+			}
+			if c.throttled(0) {
+				return Result{Username: name, Status: StatusError, Error: c.blockedError(), notSent: true}
+			}
+			continue
+		}
+		if stale != nil {
+			c.debugf("network failed (%s); serving stale cache for %s", lastErr, name)
+			res := *stale
+			res.Confidence = 30
+			res.Evidence = "stale-cache; " + res.Evidence
+			res.Error = "network failed (" + lastErr + "); served stale cache"
 			return res
 		}
-		if res.Status == StatusReserved && !c.probe(ctx, probeReuse) {
-			// A bare "302 /", and a random free name is redirected to "/"
-			// too: the client is throttled. Pause every worker, then retry.
-			// For a reserved name nobody waits; the name is retried in its
-			// cookie session (a first "302 /" can also be a session start).
-			c.triggerBlock()
+		return Result{Username: name, Status: StatusError, Error: "retries exhausted: " + lastErr}
+	}
+}
+
+// admit waits until a request may go out: through the gate (one at a time
+// until it is open), after the shared pause, at its -rate start.
+//
+// -rate counts requests: every attempt takes a start, a retry too. It used
+// to be taken once per name before the check, so retries went out on top
+// of the limit, and names answered from the cache (or invalid ones) used
+// up starts without sending anything. If a pause begins, or the gate is
+// closed again, while a request waits, the request starts over: the ones
+// that waited do not all go out together when the pause ends.
+func (c *Checker) admit(ctx context.Context) (release func(), err error) {
+	for {
+		t, err := c.gate.pass(ctx, c.blockedCh)
+		if err != nil {
+			return nil, err
 		}
-		lastErr = errStr
-		lastRes = res
-	}
-	if lastRes.Status == StatusReserved {
-		// Distinguish a genuine reserved name from a throttled client by
-		// probing a random name that should be free, now. If the probe is
-		// also redirected to "/", the whole client is being limited and we
-		// must not report a false "reserved".
-		if c.probe(ctx, 0) {
-			c.debugf("@%s: redirect to / persisted after %d attempts; probe healthy -> reserved", name, c.cfg.Retries+1)
-			lastRes.Evidence = fmt.Sprintf("redirect=/ after %d attempts; probe healthy -> reserved", c.cfg.Retries+1)
-			lastRes.Confidence = 60
-			return lastRes
+		if err := c.waitBlock(ctx); err != nil {
+			t.release()
+			return nil, err
 		}
-		return Result{Username: name, Status: StatusError,
-			Error:    "persistent 302 / (throttled; probe also blocked)",
-			Evidence: "redirect=/; probe blocked"}
+		if err := c.limiter.Wait(ctx, c.blockedCh); err != nil {
+			t.release()
+			return nil, err
+		}
+		if c.blocked.Load() {
+			t.release()
+			return nil, errBlocked
+		}
+		if c.paused() || (!t.scout && c.gate.closedSince(t)) {
+			t.release()
+			continue
+		}
+		return t.release, nil
 	}
-	if stale != nil {
-		c.debugf("network failed (%s); serving stale cache for %s", lastErr, name)
-		res := *stale
-		res.Confidence = 30
-		res.Evidence = "stale-cache; " + res.Evidence
-		res.Error = "network failed (" + lastErr + "); served stale cache"
-		return res
+}
+
+// blockedError is the error of a check that was not sent because the run
+// stopped.
+func (c *Checker) blockedError() string {
+	if c.BlockedBy() == BlockedByThrottle {
+		return "not sent: Fragment kept throttling this client"
 	}
-	return Result{Username: name, Status: StatusError, Error: "retries exhausted: " + lastErr}
+	return "not sent: Fragment blocks this client (Cloudflare challenge)"
 }
 
 func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
-	release, err := c.gate.pass(ctx)
+	release, err := c.admit(ctx)
+	if errors.Is(err, errBlocked) {
+		msg := c.blockedError()
+		return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
+	}
 	if err != nil {
 		return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
 	}
 	defer release()
-	if c.blocked.Load() {
-		msg := "not sent: Fragment blocks this client (Cloudflare challenge)"
-		return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
-	}
-	// -rate counts requests: every attempt takes a start, a retry too. It
-	// used to be taken once per name before the check, so retries went out
-	// on top of the limit, and names answered from the cache (or invalid
-	// ones) used up starts without sending anything. The start is taken
-	// after the shared pause; if a pause began while this request waited
-	// for its start, it waits that pause out and takes a new start, so the
-	// requests that waited do not all go out together when it ends.
-	for {
-		if err := c.waitBlock(ctx); err != nil {
-			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
-		}
-		if err := c.limiter.Wait(ctx); err != nil {
-			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
-		}
-		if !c.paused() {
-			break
-		}
-	}
 	// Runs before the gate's slot is released; every waiting request wakes
-	// up and goes ahead.
-	challenged := false
+	// up and goes ahead. A bare "302 /" and HTTP 429 leave the gate as it
+	// is (hold): they can mean throttling, which CheckOne finds out with
+	// the probe.
+	challenged, hold := false, false
 	defer func() {
-		if !challenged && ctx.Err() == nil {
+		if !challenged && !hold && ctx.Err() == nil {
 			c.gate.Open()
 		}
 	}()
@@ -562,6 +670,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		c.debugf("@%s REDIRECT -> %s", name, loc)
 		switch {
 		case strings.Contains(loc, "?query="):
+			c.noteHealthy()
 			tr.summary(StatusFree, 0)
 			return Result{Username: name, Status: StatusFree, Confidence: 95,
 				Evidence: "redirect=" + loc}, false, ""
@@ -569,30 +678,36 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 			// A bare 302 to "/" is how Fragment answers both rare reserved
 			// names and rate-limited clients. Do not report it as reserved
 			// on the first attempt: CheckOne probes and retries.
+			hold = true
 			return Result{Username: name, Status: StatusReserved, Confidence: 35,
 				Evidence: "redirect=/ (reserved or throttled)"}, true, "redirect to /"
 		default:
+			c.noteHealthy()
 			tr.summary(StatusUnknown, 0)
 			return Result{Username: name, Status: StatusUnknown, Confidence: 20,
 				Evidence: "unexpected redirect=" + loc}, false, ""
 		}
 
 	case 429:
+		// Too many requests from this client: not the worker that got it
+		// but every worker waits (CheckOne starts a shared pause of at
+		// least Retry-After). The worker used to sleep alone, up to
+		// RLWaitMax, while the others kept sending; the try did not count
+		// as throttling and used up an attempt.
 		atomic.AddInt64(&c.stats.rateLimit, 1)
 		ra := resp.Header.Get("Retry-After")
 		wait := parseRetryAfter(ra, c.cfg.RetryDelay)
 		if wait > c.cfg.RLWaitMax {
 			wait = c.cfg.RLWaitMax
 		}
-		c.warnf("@%s 429 Retry-After=%q sleeping=%v", name, ra, wait)
-		drainBody(resp.Body)
-		resp.Body.Close()
-		select {
-		case <-ctx.Done():
-			return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
-		case <-time.After(wait):
+		if wait <= 0 {
+			wait = c.cfg.RetryDelay
 		}
-		return Result{}, true, "rate limited"
+		c.warnf("@%s HTTP 429 (Retry-After %q): every request pauses for at least %v", name, ra, wait)
+		hold = true
+		tr.summary(StatusError, 0)
+		return Result{Username: name, Status: StatusError, Error: "HTTP 429 (rate limited)",
+			throttleWait: wait}, true, "rate limited"
 
 	case 200:
 		bufPtr := c.pool.Get().(*[]byte)
@@ -625,6 +740,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 				Evidence: pi.Evidence}, true, "cloudflare challenge"
 		}
 		c.noteAnswer()
+		c.noteHealthy()
 		if c.cache != nil && pi.Found {
 			// Best-effort: never let a read-only cache directory fail a check.
 			_ = c.cache.put(name, reqURL, pi, body)
@@ -844,10 +960,11 @@ func newRateLimiter(rps int) *rateLimiter {
 	return &rateLimiter{interval: interval}
 }
 
-// Wait blocks until the caller's start time or until ctx is done. A
-// caller that gives up loses its start time; the next one is not moved
-// forward, which matters only when a run is stopped.
-func (rl *rateLimiter) Wait(ctx context.Context) error {
+// Wait blocks until the caller's start time, until ctx is done, or until
+// stop is closed (the run gave up). A caller that gives up loses its start
+// time; the next one is not moved forward, which matters only when a run
+// is stopped.
+func (rl *rateLimiter) Wait(ctx context.Context, stop <-chan struct{}) error {
 	if rl == nil {
 		return nil
 	}
@@ -868,6 +985,8 @@ func (rl *rateLimiter) Wait(ctx context.Context) error {
 	select {
 	case <-t.C:
 		return nil
+	case <-stop:
+		return errBlocked
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -900,6 +1019,7 @@ type liveStats struct {
 	cacheStale  int64
 	cacheMisses int64
 	challenges  int64
+	pauses      int64
 }
 
 func newLiveStats() *liveStats { return &liveStats{} }
@@ -947,6 +1067,7 @@ func (s *liveStats) snapshot() Stats {
 		CacheStale:  atomic.LoadInt64(&s.cacheStale),
 		CacheMisses: atomic.LoadInt64(&s.cacheMisses),
 		Challenges:  atomic.LoadInt64(&s.challenges),
+		Pauses:      atomic.LoadInt64(&s.pauses),
 	}
 }
 
@@ -976,6 +1097,9 @@ func normalizeConfig(c Config) Config {
 	}
 	if c.BlockCooldown <= 0 {
 		c.BlockCooldown = 3 * time.Second
+	}
+	if c.ThrottleMax <= 0 {
+		c.ThrottleMax = defaultThrottleMax
 	}
 	return c
 }
@@ -1101,6 +1225,9 @@ func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
 	c.probeStarted = time.Now()
 	c.probeOK = c.probeHealthy(ctx)
 	c.probeDone = time.Now()
+	if c.probeOK {
+		c.noteHealthy()
+	}
 	return c.probeOK
 }
 
@@ -1135,11 +1262,12 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 	return false
 }
 
-// triggerBlock pauses every worker for cfg.BlockCooldown. It is called when
-// Fragment answers with a bare 302 to "/", which happens both for reserved
-// names and for clients that are being rate-limited.
-func (c *Checker) triggerBlock() {
-	d := c.cfg.BlockCooldown
+// triggerBlock pauses every worker for cfg.BlockCooldown.
+func (c *Checker) triggerBlock() { c.pauseFor(c.cfg.BlockCooldown) }
+
+// pauseFor makes every request wait until d from now, unless a pause
+// already lasts longer.
+func (c *Checker) pauseFor(d time.Duration) {
 	if d <= 0 {
 		return
 	}
@@ -1149,6 +1277,83 @@ func (c *Checker) triggerBlock() {
 		if until <= old || c.blockUntil.CompareAndSwap(old, until) {
 			return
 		}
+	}
+}
+
+// maxThrottlePause caps the pause that grows while Fragment throttles.
+const maxThrottlePause = 2 * time.Minute
+
+// throttled handles a sign that Fragment throttles this client: a bare
+// "302 /" while the probe gets "/" too, or HTTP 429 (wait is its
+// Retry-After). A sign that comes back while a pause is on belongs to
+// that pause. Otherwise a new round starts: every request pauses, for
+// BlockCooldown in the first round and twice as long in each next one up
+// to maxThrottlePause (or for wait, when Fragment said how long), and the
+// gate closes, so after the pause one request goes first and the others
+// follow only if it gets a normal answer.
+//
+// A try during throttling says nothing about the name, so CheckOne does
+// not count it as an attempt. Such tries used to use up the attempts
+// within one 3 s pause and end as "persistent 302 /" errors, 150 of them
+// in one real run. throttled returns true once the throttling has lasted
+// ThrottleMax since the last normal answer: the run stops then, and the
+// names without a verdict stay pending.
+func (c *Checker) throttled(wait time.Duration) bool {
+	if c.blocked.Load() {
+		return true
+	}
+	c.throttleMu.Lock()
+	now := time.Now()
+	if !c.throttling.Load() {
+		c.throttling.Store(true)
+		c.throttleSince = now
+	}
+	lasted := now.Sub(c.throttleSince)
+	if lasted >= c.cfg.ThrottleMax {
+		c.throttleMu.Unlock()
+		c.block(BlockedByThrottle, "Fragment has throttled this client for %v: stopping; the names without a verdict stay pending",
+			lasted.Round(time.Second))
+		return true
+	}
+	if c.paused() {
+		c.throttleMu.Unlock()
+		return false
+	}
+	c.throttleRounds++
+	round := c.throttleRounds
+	d := wait
+	if d <= 0 {
+		d = c.cfg.BlockCooldown
+		for i := 1; i < round && d < maxThrottlePause; i++ {
+			d *= 2
+		}
+	}
+	if d > maxThrottlePause {
+		d = maxThrottlePause
+	}
+	c.gate.Close()
+	c.pauseFor(d)
+	c.throttleMu.Unlock()
+	atomic.AddInt64(&c.stats.pauses, 1)
+	c.warnf("Fragment is throttling this client: every request pauses for %v (pause %d, throttled for %v)",
+		d, round, lasted.Round(time.Second))
+	return false
+}
+
+// noteHealthy records a normal answer: Fragment serves this client, so a
+// throttled spell, if there was one, is over.
+func (c *Checker) noteHealthy() {
+	if !c.throttling.Load() {
+		return
+	}
+	c.throttleMu.Lock()
+	rounds := c.throttleRounds
+	c.throttleRounds = 0
+	c.throttleSince = time.Time{}
+	c.throttling.Store(false)
+	c.throttleMu.Unlock()
+	if rounds > 0 {
+		c.warnf("Fragment answers normally again after %d pause(s)", rounds)
 	}
 }
 
@@ -1163,6 +1368,9 @@ func (c *Checker) paused() bool {
 // "302 /"), so the deadline is read again after every timer.
 func (c *Checker) waitBlock(ctx context.Context) error {
 	for {
+		if c.blocked.Load() {
+			return errBlocked
+		}
 		until := c.blockUntil.Load()
 		if until == 0 {
 			return nil
@@ -1176,6 +1384,9 @@ func (c *Checker) waitBlock(ctx context.Context) error {
 		case <-ctx.Done():
 			t.Stop()
 			return ctx.Err()
+		case <-c.blockedCh:
+			t.Stop()
+			return errBlocked
 		case <-t.C:
 		}
 	}

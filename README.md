@@ -75,10 +75,17 @@ evidence chain such as `text="for sale"; class=avail; timer; buy-now`.
 - **`302 /` is ambiguous**: Fragment uses it for rare reserved names and for
   throttled clients. A random free name is probed at once (one probe shared
   by all workers): if it is redirected to `/` as well, the client is
-  throttled and all workers pause for a shared cooldown. The name is retried
-  with the same cookie session, and the verdict takes a fresh probe: only a
-  healthy probe gives `reserved`; otherwise the result is an error, never a
-  false `reserved`. A reserved name does not slow the other workers down.
+  throttled. A reserved name is retried with the same cookie session, and the
+  verdict takes a fresh probe: only a healthy probe gives `reserved`, never a
+  false one. A reserved name does not slow the other workers down.
+- **Throttling** (`302 /` for the probe too, or HTTP 429): every worker pauses,
+  3 s the first time and twice as long each next time, up to 2 minutes (for
+  429: its `Retry-After`). After the pause one request goes first; the others
+  follow when it gets a normal answer. A try while throttled does not count
+  as an attempt, so the name waits and gets its real verdict afterwards
+  instead of an error. If the throttling lasts `-throttle-max` (30 min), the
+  run stops like on a Cloudflare block: exit code 3, status `error` in the
+  panel, and the names without a verdict stay for `-resume` / Resume.
 - **Cloudflare challenge**: an answer with `cf-mitigated: challenge` (HTTP 403)
   or a "Just a moment..." page says nothing about the name and is an error.
   After 10 of them in a row, with no other answer in between, Fragment is
@@ -111,6 +118,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-rate` | `0` | Requests per second to Fragment, retries included; names answered from the cache and invalid names do not count (0 = unlimited) |
 | `-retries` / `-retry-delay` | `2` / `500ms` | Extra attempts per name and the pause between them |
 | `-rl-wait-max` | `30s` | Longest `Retry-After` honoured on HTTP 429 |
+| `-throttle-max` | `30m` | Stop when Fragment keeps throttling this long (names without a verdict stay for `-resume`) |
 | `-timeout` | `15s` | Whole-request timeout |
 | `-readlimit` | `16384` | Body bytes scanned for the status (1 KiB–1 MiB) |
 | `-cache-dir` / `-no-cache` | `.fragment_cache` | Page cache directory, or no cache |
@@ -237,7 +245,8 @@ also when the proxy sends its own `Host`).
 Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
 `max_conns` up to 1000, `rate_rps` up to 1000, `retries` up to 10,
 `read_limit` up to 1 MiB, `retry_delay_ns` up to 1 minute, `timeout_ns`,
-`rl_wait_max_ns` and `block_cooldown_ns` up to 10 minutes. 0 or a missing
+`rl_wait_max_ns` and `block_cooldown_ns` up to 10 minutes, `throttle_max_ns`
+up to 24 hours. 0 or a missing
 field means the default; a negative or too large value is answered with 400.
 `cache_dir` cannot be set through the API: the page cache directory is set
 for the whole panel with `-cache-dir`.

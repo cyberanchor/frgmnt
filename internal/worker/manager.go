@@ -622,6 +622,11 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 
 	chk := checker.New(cfg)
 	defer chk.Close()
+	// The engine's warnings (throttle pauses, HTTP 429, the stop) go to the
+	// tile's log; the panel used to get none of them.
+	chk.SetLogger(checker.Logger{Warnf: func(format string, args ...any) {
+		m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(format, args...))
+	}})
 	w.mu.Lock()
 	w.chk = chk
 	w.mu.Unlock()
@@ -727,10 +732,15 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	w.mu.Unlock()
 
 	if blocked {
-		m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf(
-			"stopped: Fragment answered %d requests in a row with a Cloudflare challenge "+
-				"(HTTP 403, cf-mitigated: challenge), so it blocks this IP. The names without a verdict "+
-				"stay pending: press Resume later.", checker.ChallengeLimit))
+		msg := fmt.Sprintf("stopped: Fragment answered %d requests in a row with a Cloudflare challenge "+
+			"(HTTP 403, cf-mitigated: challenge), so it blocks this IP. The names without a verdict "+
+			"stay pending: press Resume later.", checker.ChallengeLimit)
+		if chk.BlockedBy() == checker.BlockedByThrottle {
+			msg = fmt.Sprintf("stopped: Fragment kept throttling this IP for %v (every request and the probe "+
+				"redirected to \"/\", or HTTP 429). The names without a verdict stay pending: press Resume "+
+				"later, with a lower rate.", chk.Config().ThrottleMax)
+		}
+		m.bus.Publish(logbus.LevelError, w.id, msg)
 		w.setStatus(StatusError)
 		return
 	}

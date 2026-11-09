@@ -412,7 +412,7 @@ func TestRateLimiterSpacesStartsAfterIdle(t *testing.T) {
 	rl := newRateLimiter(20) // one start per 50 ms
 	defer rl.Close()
 	ctx := context.Background()
-	if err := rl.Wait(ctx); err != nil {
+	if err := rl.Wait(ctx, nil); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(400 * time.Millisecond) // a bucket would hold 8 tokens now
@@ -424,7 +424,7 @@ func TestRateLimiterSpacesStartsAfterIdle(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := rl.Wait(ctx); err != nil {
+			if err := rl.Wait(ctx, nil); err != nil {
 				t.Error(err)
 			}
 			mu.Lock()
@@ -446,7 +446,7 @@ func TestRateLimiterSpacesStartsAfterIdle(t *testing.T) {
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
 	for i := 0; i < 3; i++ {
-		if err := rl.Wait(cctx); err == nil && i > 0 {
+		if err := rl.Wait(cctx, nil); err == nil && i > 0 {
 			t.Errorf("Wait %d with a cancelled context returned nil", i)
 		}
 	}
