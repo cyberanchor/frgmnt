@@ -813,60 +813,62 @@ func newHTTPClient(c Config) *http.Client {
 	}
 }
 
+// rateLimiter spaces requests evenly: every Wait gets the next start
+// time, one interval after the previous one, and sleeps until it. It used
+// to be a bucket of rps tokens filled by a ticker: during a pause (a
+// throttle cool-down) the bucket filled up, and when the pause ended its
+// tokens went out at once on top of the workers that had waited. With
+// -rate 10 that was 21 requests in the first 100 ms after a 3 s pause,
+// the kind of burst that gets a client throttled again. A pause does not
+// bank starts now; the earliest next start is never before "now".
 type rateLimiter struct {
-	tokens chan struct{}
-	stop   chan struct{}
-	once   sync.Once // Close may be called more than once
+	mu       sync.Mutex
+	interval time.Duration
+	next     time.Time // earliest start of the next request
 }
 
 func newRateLimiter(rps int) *rateLimiter {
 	if rps <= 0 {
 		return nil
 	}
-	rl := &rateLimiter{
-		tokens: make(chan struct{}, rps),
-		stop:   make(chan struct{}),
-	}
 	interval := time.Second / time.Duration(rps)
 	if interval <= 0 {
 		interval = 1
 	}
-	go func() {
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-rl.stop:
-				return
-			case <-t.C:
-				select {
-				case rl.tokens <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-	return rl
+	return &rateLimiter{interval: interval}
 }
 
+// Wait blocks until the caller's start time or until ctx is done. A
+// caller that gives up loses its start time; the next one is not moved
+// forward, which matters only when a run is stopped.
 func (rl *rateLimiter) Wait(ctx context.Context) error {
 	if rl == nil {
 		return nil
 	}
+	rl.mu.Lock()
+	now := time.Now()
+	at := rl.next
+	if at.Before(now) {
+		at = now
+	}
+	rl.next = at.Add(rl.interval)
+	rl.mu.Unlock()
+	d := at.Sub(now)
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
 	select {
-	case <-rl.tokens:
+	case <-t.C:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (rl *rateLimiter) Close() {
-	if rl == nil {
-		return
-	}
-	rl.once.Do(func() { close(rl.stop) })
-}
+// Close is kept for Checker.Close; the limiter has no goroutine to stop.
+func (rl *rateLimiter) Close() {}
 
 // -----------------------------------------------------------------------------
 // Live stats

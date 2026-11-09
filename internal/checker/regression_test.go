@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -399,5 +401,53 @@ func TestScanNamesRules(t *testing.T) {
 	_ = ScanNames(strings.NewReader(long+",durov"), func(n string) error { got = append(got, n); return nil })
 	if len(got) != 2 || len(got[0]) != maxNameToken || got[1] != "durov" {
 		t.Errorf("a %d-byte token: got %d tokens, first %d bytes", len(long), len(got), len(got[0]))
+	}
+}
+
+// The limiter was a bucket of rps tokens filled by a ticker. After an idle
+// period (a throttle cool-down) the bucket was full, and the requests that
+// had waited went out at once: 21 in the first 100 ms after a 3 s pause
+// at -rate 10. Starts keep the 1/rate spacing after an idle period now.
+func TestRateLimiterSpacesStartsAfterIdle(t *testing.T) {
+	rl := newRateLimiter(20) // one start per 50 ms
+	defer rl.Close()
+	ctx := context.Background()
+	if err := rl.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond) // a bucket would hold 8 tokens now
+	begin := time.Now()
+	var mu sync.Mutex
+	var starts []time.Duration
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := rl.Wait(ctx); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			starts = append(starts, time.Since(begin))
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+	// A start can be late (a busy machine) but never early: the k-th one
+	// is due k*50 ms after begin.
+	for k, d := range starts {
+		if due := time.Duration(k)*50*time.Millisecond - 5*time.Millisecond; d < due {
+			t.Errorf("start %d after %v, due no earlier than %v (starts %v)", k, d, due, starts)
+			break
+		}
+	}
+	// Stop gives up the wait at once.
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	for i := 0; i < 3; i++ {
+		if err := rl.Wait(cctx); err == nil && i > 0 {
+			t.Errorf("Wait %d with a cancelled context returned nil", i)
+		}
 	}
 }
