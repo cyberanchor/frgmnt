@@ -5,7 +5,7 @@
 package checker
 
 import (
-	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -1133,14 +1133,37 @@ const maxNameToken = 4096
 // to stop. The console used to read one name per line, so "alice, bob"
 // was a single invalid name there while the web panel read two.
 func ScanNames(r io.Reader, fn func(name string) error) error {
-	br := bufio.NewReaderSize(r, 64*1024)
+	// The list is read in 64 KB chunks and each chunk is split with a
+	// lookup table, so the inner loop is a table lookup per byte; it used
+	// to call bufio.Reader.ReadByte for every byte (about 120 MB/s here).
+	buf := make([]byte, 64*1024)
 	tok := make([]byte, 0, 64)
 	skipLine := false
 	emit := func() error {
 		if len(tok) == 0 {
 			return nil
 		}
-		name := strings.ToLower(strings.TrimPrefix(string(tok), "@"))
+		// One leading "@" is dropped and the name lower-cased: ASCII in
+		// place (one allocation per name), anything else by
+		// strings.ToLower, which gives the same result for ASCII.
+		t := tok
+		if t[0] == '@' {
+			t = t[1:]
+		}
+		ascii := true
+		for i, c := range t {
+			if c >= 0x80 {
+				ascii = false
+				break
+			}
+			if 'A' <= c && c <= 'Z' {
+				t[i] = c + ('a' - 'A')
+			}
+		}
+		name := string(t)
+		if !ascii {
+			name = strings.ToLower(name)
+		}
 		tok = tok[:0]
 		if name == "" {
 			return nil
@@ -1148,37 +1171,50 @@ func ScanNames(r io.Reader, fn func(name string) error) error {
 		return fn(name)
 	}
 	for {
-		b, err := br.ReadByte()
-		if err != nil {
-			if eerr := emit(); eerr != nil {
-				return eerr
+		n, rerr := r.Read(buf)
+		chunk := buf[:n]
+		for len(chunk) > 0 {
+			if skipLine {
+				nl := bytes.IndexByte(chunk, '\n')
+				if nl < 0 {
+					chunk = nil
+					break
+				}
+				chunk = chunk[nl+1:]
+				skipLine = false
+				continue
 			}
-			if err == io.EOF {
+			k := 0
+			for k < len(chunk) && !nameSep[chunk[k]] {
+				k++
+			}
+			if room := maxNameToken - len(tok); room > 0 {
+				tok = append(tok, chunk[:min(k, room)]...)
+			}
+			if k == len(chunk) {
+				break // the token goes on in the next chunk
+			}
+			if err := emit(); err != nil {
+				return err
+			}
+			skipLine = chunk[k] == '|'
+			chunk = chunk[k+1:]
+		}
+		if rerr != nil {
+			if err := emit(); err != nil {
+				return err
+			}
+			if rerr == io.EOF {
 				return nil
 			}
-			return err
-		}
-		if skipLine {
-			skipLine = b != '\n'
-			continue
-		}
-		switch b {
-		case '\n', '\r', ' ', '\t', ',', ';':
-			if err := emit(); err != nil {
-				return err
-			}
-		case '|':
-			if err := emit(); err != nil {
-				return err
-			}
-			skipLine = true
-		default:
-			if len(tok) < maxNameToken {
-				tok = append(tok, b)
-			}
+			return rerr
 		}
 	}
 }
+
+// nameSep marks the bytes that end a name in ScanNames. "|" also ends the
+// names of its line.
+var nameSep = [256]bool{'\n': true, '\r': true, ' ': true, '\t': true, ',': true, ';': true, '|': true}
 
 // ParseNamesReader reads a list with ScanNames and returns the valid names
 // without duplicates, in order, and the number of invalid ones.
