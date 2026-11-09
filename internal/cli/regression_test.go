@@ -5,6 +5,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -762,5 +763,88 @@ func TestDebugSummaryShowsNetworkAndWaiting(t *testing.T) {
 	}
 	if !strings.Contains(out, "Tries per name: 1: 6 |") {
 		t.Errorf("no tries line for 6 names in:\n%s", out)
+	}
+}
+
+// -trace-file writes the structured trace as JSON Lines: run_start with
+// the settings, an event for every try (a retried name has two) and for
+// every name, run_end with the counters; the file is private (0600) and
+// -resume appends a second run to it.
+func TestTraceFileJSONLines(t *testing.T) {
+	var mu sync.Mutex
+	tries := map[string]int{}
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		mu.Lock()
+		tries[name]++
+		n := tries[name]
+		mu.Unlock()
+		if name == "retryme" && n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		freeHandler(w, r, name)
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "results.txt")
+	tracePath := filepath.Join(dir, "trace.jsonl")
+	if err := os.WriteFile(in, []byte("alice\nretryme\ncarol\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "2", "-retry-delay", "10ms", "-trace-file", tracePath}
+	if code := Main(args); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	if fi, err := os.Stat(tracePath); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("trace file: %v, mode %v; want 0600", err, fi.Mode().Perm())
+	}
+	read := func() []checker.TraceEvent {
+		t.Helper()
+		raw, err := os.ReadFile(tracePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var events []checker.TraceEvent
+		for i, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+			var e checker.TraceEvent
+			if err := json.Unmarshal([]byte(line), &e); err != nil {
+				t.Fatalf("line %d is not JSON: %v: %s", i+1, err, line)
+			}
+			events = append(events, e)
+		}
+		return events
+	}
+	events := read()
+	if events[0].Kind != "run_start" || events[0].Info["version"] != Version || events[0].Info["workers"] != float64(2) {
+		t.Errorf("first event: %+v", events[0])
+	}
+	if last := events[len(events)-1]; last.Kind != "run_end" || last.Info["checked"] != float64(3) || last.Info["exit_code"] != float64(0) {
+		t.Errorf("last event: %+v", last)
+	}
+	count := map[string]int{}
+	for _, e := range events {
+		count[e.Kind+":"+e.Name]++
+	}
+	for _, want := range []string{"attempt:alice", "result:alice", "result:retryme", "attempt:carol", "result:carol"} {
+		if count[want] != 1 {
+			t.Errorf("%s: %d events, want 1 (%v)", want, count[want], count)
+		}
+	}
+	if count["attempt:retryme"] != 2 {
+		t.Errorf("retryme: %d attempt events, want 2", count["attempt:retryme"])
+	}
+
+	if code := Main(append(args, "-resume")); code != 0 {
+		t.Fatalf("resume: exit code %d", code)
+	}
+	starts := 0
+	for _, e := range read() {
+		if e.Kind == "run_start" {
+			starts++
+		}
+	}
+	if starts != 2 {
+		t.Errorf("%d run_start events after -resume, want 2 (appended)", starts)
 	}
 }

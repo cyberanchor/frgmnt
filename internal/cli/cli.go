@@ -90,11 +90,23 @@ type LogLevel int
 const (
 	// LevelNormal prints results and a periodic progress line only.
 	LevelNormal LogLevel = iota
-	// LevelDebug adds HTTP codes, body sizes, verdicts and cache use.
+	// LevelDebug adds one line per HTTP try with its timings, the HTTP
+	// codes, redirects, verdicts and cache use.
 	LevelDebug
-	// LevelTrace adds DNS / TCP / TLS / header / body-preview events.
+	// LevelTrace adds every step: the request, DNS / TCP / TLS, the headers
+	// of the answer, body previews.
 	LevelTrace
 )
+
+func (l LogLevel) String() string {
+	switch l {
+	case LevelDebug:
+		return "debug"
+	case LevelTrace:
+		return "trace"
+	}
+	return "normal"
+}
 
 // logLevel is the active verbosity, set by Main from -debug/-trace.
 var logLevel LogLevel
@@ -645,8 +657,9 @@ func Main(args []string) int {
 		quiet      = fs.Bool("quiet", false, "Stdout: print only free results and errors")
 		insecure   = fs.Bool("insecure", false, "Skip TLS certificate verification (debug only)")
 
-		debugFlag = fs.Bool("debug", false, "Enable debug-level logging")
-		traceFlag = fs.Bool("trace", false, "Enable trace-level logging (implies -debug)")
+		debugFlag = fs.Bool("debug", false, "Enable debug-level logging: one line per HTTP try with its timings")
+		traceFlag = fs.Bool("trace", false, "Enable trace-level logging: every step of every request (implies -debug)")
+		traceOut  = fs.String("trace-file", "", "Write the structured trace to this file as JSON Lines: every request, cache lookup, name and engine event (appended with -resume/-append)")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
 	fs.Usage = func() { printUsage(fs) }
@@ -790,17 +803,31 @@ func Main(args []string) int {
 	if logLevel >= LevelTrace {
 		logger.Tracef = tracef
 	}
+	var trace *traceFile
+	if *traceOut != "" {
+		trace, err = openTraceFile(*traceOut, *appendFlag || *resume)
+		if err != nil {
+			log.Printf("[ERROR] -trace-file: %v", err)
+			return 2
+		}
+		logger.Event = trace.write
+	}
 	chk.SetLogger(logger)
 	eff := chk.Config()
+	if trace != nil {
+		trace.write(checker.TraceEvent{Time: time.Now(), Kind: "run_start", Info: map[string]any{
+			"program": ProgName, "version": Version, "input": *inputPath, "output": *outputPath,
+			"list_names": listNames, "resume": *resume, "dedup": !*noDedup, "filter": *filterRaw,
+			"workers": eff.Workers, "max_conns": eff.MaxConns, "rate_rps": eff.RateRPS, "retries": eff.Retries,
+			"retry_delay_ms": eff.RetryDelay.Milliseconds(), "timeout_ms": eff.Timeout.Milliseconds(),
+			"read_limit": eff.ReadLimit, "rl_wait_max_ms": eff.RLWaitMax.Milliseconds(),
+			"block_cooldown_ms": eff.BlockCooldown.Milliseconds(), "throttle_max_ms": eff.ThrottleMax.Milliseconds(),
+			"cache_dir": eff.CacheDir, "log": logLevel.String(),
+		}})
+	}
 
 	// --- Log level banner ---
-	levelName := "normal"
-	switch logLevel {
-	case LevelDebug:
-		levelName = "debug"
-	case LevelTrace:
-		levelName = "trace"
-	}
+	levelName := logLevel.String()
 	filterStr := *filterRaw
 	if filterStr == "" {
 		filterStr = "all"
@@ -928,6 +955,24 @@ func Main(args []string) int {
 		log.Printf("[ERROR] every checked name ended with an error")
 		if exitCode == 0 {
 			exitCode = 1
+		}
+	}
+	if trace != nil {
+		info := statsInfo(final)
+		info["elapsed_ms"] = time.Since(stats.startTime).Milliseconds()
+		info["exit_code"] = exitCode
+		switch chk.BlockedBy() {
+		case checker.BlockedByChallenge:
+			info["blocked"] = "challenge"
+		case checker.BlockedByThrottle:
+			info["blocked"] = "throttle"
+		}
+		trace.write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
+		n, err := trace.Close()
+		if err != nil {
+			log.Printf("[ERROR] -trace-file %s: %v (the trace is incomplete)", *traceOut, err)
+		} else {
+			log.Printf("[INFO] trace: %d events in %s", n, *traceOut)
 		}
 	}
 	return exitCode
