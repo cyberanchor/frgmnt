@@ -4,4 +4,4 @@
 package version
 
 // Version is the release of every mode and of the panel.
-const Version = "2.0.0"
+const Version = "2.1.0"

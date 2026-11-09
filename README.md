@@ -40,7 +40,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
 ```
 
 Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
-`frgmnt 2.0.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
+`frgmnt 2.1.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
 `./frgmnt web -h` and `./frgmnt token -h` list every flag. The old shorthands still work:
 `./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
 

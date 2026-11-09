@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.1.0 (2026-11-09)
+
+Debug and trace cover every request and every step of the engine.
+
+- Every result splits its time into network and waiting (a -rate start,
+  the gate, a pause, a retry delay, the probe) and counts its tries; the
+  -debug summary shows p50/p95/p99/max of both instead of avg/min/max of
+  the whole time (which counted the wait for a -rate start as latency).
+- At -debug every HTTP try ends with one line: its number (#1, #2), the
+  outcome, the waits before it, DNS/TCP/TLS/first byte/body and the
+  connection; the throttle probe gets the same line. At -trace the request
+  is printed too; cookie values are hidden everywhere.
+- Structured trace (JSON Lines): `-trace-file PATH` in the console, and a
+  "Write a trace" switch per worker in the panel (<data>/traces/<id>.jsonl,
+  100 MB cap, Download trace in the details, GET/DELETE
+  /api/workers/{id}/trace). One event per request, cache lookup, name,
+  pause, gate change and stop, plus run_start, run_end and a pipeline event
+  every second.
+- The panel's Logs tab gets the engine's debug and trace lines, following
+  the log level while a run goes on.
+- Stats and the -debug progress line show the queues and what the workers
+  do (on the network, at the gate, in a pause, waiting for a start, a
+  retry, the probe).
+- Results in the panel keep network time, waiting time and tries (three
+  new columns, added on start); the details tooltip shows them.
+
 ## 2.0.0 (2026-11-09)
 
 One version for the whole program: `frgmnt version`, `frgmnt check
