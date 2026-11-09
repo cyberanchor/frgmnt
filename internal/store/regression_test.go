@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func pendingNames(t *testing.T, s *Store, workerID string) []string {
@@ -286,3 +287,31 @@ func TestBatchedWritesKeepEveryRowInOrder(t *testing.T) {
 }
 
 func itoa(i int) string { return strconv.Itoa(i) }
+
+// The result writer retries a failed write only when it can pass: waiting
+// for the busy connection past the deadline is transient, a closed
+// database is not (retrying it stalled a shutdown for 30 s).
+func TestIsTransient(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateWorker(ctx, Worker{ID: "w", Name: "w", ConfigJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the only connection in a transaction; a second write times out.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	err = s.RecordResults(short, []Result{{WorkerID: "w", Username: "alice", Status: "free"}})
+	_ = tx.Rollback()
+	if err == nil || !IsTransient(err) {
+		t.Errorf("write while the database is busy: %v, transient=%v; want a transient error", err, IsTransient(err))
+	}
+	_ = s.Close()
+	err = s.RecordResults(ctx, []Result{{WorkerID: "w", Username: "alice", Status: "free"}})
+	if err == nil || IsTransient(err) {
+		t.Errorf("write to a closed database: %v, transient=%v; want a permanent error", err, IsTransient(err))
+	}
+}

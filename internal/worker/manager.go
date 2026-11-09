@@ -765,33 +765,71 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 	//   - Using the in-flight ctx here meant that when the user pressed
 	//     Stop, the trailing flush failed with "sql: context canceled" and
 	//     lost up to batchSize rows.
-	dbCtx := func() (context.Context, context.CancelFunc) {
-		return context.WithTimeout(context.Background(), 5*time.Second)
-	}
-	flush := func() {
+	//
+	// A write that fails keeps its rows. The database is busy for seconds
+	// while another tile stores a big list (one connection, one writer),
+	// and the batch used to be dropped after 5 s: the results were lost
+	// and the names checked again on the next Resume. Now the batch is
+	// written again after a pause that doubles up to maxRetryPause, and
+	// once it holds maxPending rows the writer stops taking results, so
+	// the checks wait (the results channel fills) instead. Only errors that
+	// can pass are retried (store.IsTransient): busy, locked, disk full.
+	var (
+		failing bool // the last write failed
+		pause   time.Duration
+		retryAt time.Time // no new attempt before this
+	)
+	flush := func() bool {
 		if len(batch) == 0 {
-			return
+			return true
 		}
-		c, cancel := dbCtx()
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		// The rows and the per-name "done" flags used by resume mode are
 		// written in one transaction (one commit per batch, not one per
-		// name). If the write fails, the names stay pending and a resume
-		// checks them again.
+		// name).
 		if err := m.store.RecordResults(c, batch); err != nil {
-			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("persist: %v", err))
-		} else {
-			w.addSaved(batch)
+			if !store.IsTransient(err) {
+				// A closed database or a broken file does not get better:
+				// report it and go on; the names stay pending for Resume.
+				m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("persist: %v", err))
+				batch = batch[:0]
+				return true
+			}
+			if !failing {
+				m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(
+					"results not saved yet (%v); keeping them and trying again", err))
+			}
+			failing = true
+			pause = min(max(2*pause, flushEvery), maxRetryPause)
+			retryAt = time.Now().Add(pause)
+			return false
 		}
+		if failing {
+			m.bus.Publish(logbus.LevelInfo, w.id, fmt.Sprintf("results saved again (%d rows waited)", len(batch)))
+		}
+		failing, pause = false, 0
+		w.addSaved(batch)
 		batch = batch[:0]
+		return true
 	}
 
 	for {
+		take := in
+		if len(batch) >= maxPending {
+			take = nil // the database refuses writes: let the checks wait
+		}
 		select {
-		case r, ok := <-in:
+		case r, ok := <-take:
 			if !ok {
-				// Drain done. Persist the tail.
-				flush()
+				// Drain done. Persist the tail, retrying for a while.
+				for deadline := time.Now().Add(finalSaveBudget); !flush() && time.Now().Before(deadline); {
+					time.Sleep(time.Until(retryAt))
+				}
+				if len(batch) > 0 {
+					m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf(
+						"%d results could not be saved; their names stay pending and Resume checks them again", len(batch)))
+				}
 				return
 			}
 			payload, _ := json.Marshal(map[string]any{
@@ -816,14 +854,23 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 				Evidence:   r.Evidence,
 				Cached:     r.Cached,
 			})
-			if len(batch) >= batchSize {
+			if len(batch) >= batchSize && !time.Now().Before(retryAt) {
 				flush()
 			}
 		case <-ticker.C:
-			flush()
+			if !time.Now().Before(retryAt) {
+				flush()
+			}
 		}
 	}
 }
+
+// Limits of the result writer while the database refuses writes.
+const (
+	maxPending      = 4096             // rows held before the checks are made to wait
+	maxRetryPause   = 5 * time.Second  // longest pause between two attempts
+	finalSaveBudget = 30 * time.Second // how long the last rows are retried at the end of a run
+)
 
 // -----------------------------------------------------------------------------
 // Helpers

@@ -680,3 +680,52 @@ func TestStartRefusedWhileListIsStored(t *testing.T) {
 		t.Fatal("run did not finish")
 	}
 }
+
+// While one tile stores a big list, the database is busy for seconds (a
+// shuffled list of 500,000 names takes ~12 s). The result writer of a
+// running tile gave up after 5 s and dropped its batch: the results were
+// lost and the names were checked again on the next Resume. Now it keeps
+// the batch and writes it once the database is free.
+func TestResultsSurviveABusyDatabase(t *testing.T) {
+	fake := newFakeFragment(t, 20*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	run, err := h.m.Create(ctx, "running", testConfig(4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := testNames(300)
+	if _, err := h.m.SetInput(ctx, run.ID(), names); err != nil {
+		t.Fatal(err)
+	}
+	loader, err := h.m.Create(ctx, "loader", testConfig(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, run.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	// Hold the database inside the upload transaction for 6 s once the
+	// run is under way.
+	for deadline := time.Now().Add(5 * time.Second); fake.hitsFor(names[20]) == 0 && time.Now().Before(deadline); {
+		time.Sleep(5 * time.Millisecond)
+	}
+	held := make(chan error, 1)
+	go func() {
+		_, err := h.m.SetInputFrom(ctx, loader.ID(), func(add func(string) error) error {
+			time.Sleep(6 * time.Second)
+			return add("loadedname")
+		})
+		held <- err
+	}()
+	if !waitNotRunning(run, 30*time.Second) {
+		t.Fatal("run did not finish")
+	}
+	if err := <-held; err != nil {
+		t.Fatal(err)
+	}
+	checked, rows := persistedCounts(t, h.st, run.ID())
+	if rows != 300 || checked != 300 {
+		t.Errorf("%d result rows and %d names flagged checked, want 300 and 300 (last error: %q)", rows, checked, h.lastError())
+	}
+}

@@ -16,7 +16,8 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Store owns the *sql.DB and JSON-settings file.
@@ -81,6 +82,24 @@ func Open(dataDir string) (*Store, error) {
 
 // Close releases the underlying DB connection.
 func (s *Store) Close() error { return s.db.Close() }
+
+// IsTransient reports whether a failed write may succeed if it is tried
+// again: the database was busy (the only connection stayed taken past the
+// deadline, or SQLite reported it busy or locked) or the disk was full.
+// A closed database and other errors are permanent.
+func IsTransient(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var se *sqlite.Error
+	if errors.As(err, &se) {
+		switch se.Code() & 0xff { // the primary code of an extended one
+		case sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED, sqlite3.SQLITE_FULL:
+			return true
+		}
+	}
+	return false
+}
 
 // DataDir returns the directory holding data.db and settings.json.
 func (s *Store) DataDir() string { return s.dataDir }
