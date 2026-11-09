@@ -489,7 +489,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 		attempts := 0
 		for {
 			tries++
-			r, retry, errStr := c.doRequest(ctx, name, reqURL)
+			r, retry, errStr := c.doRequest(ctx, name, reqURL, tries)
 			net += r.Net
 			if !retry {
 				return r
@@ -566,29 +566,38 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 // up starts without sending anything. If a pause begins, or the gate is
 // closed again, while a request waits, the request starts over: the ones
 // that waited do not all go out together when the pause ends.
-func (c *Checker) admit(ctx context.Context) (release func(), err error) {
+func (c *Checker) admit(ctx context.Context) (release func(), w waits, err error) {
 	for {
+		t0 := time.Now()
 		t, err := c.gate.pass(ctx, c.blockedCh)
+		w.gate += time.Since(t0)
 		if err != nil {
-			return nil, err
+			return nil, w, err
 		}
-		if err := c.waitBlock(ctx); err != nil {
+		t1 := time.Now()
+		err = c.waitBlock(ctx)
+		w.pause += time.Since(t1)
+		if err != nil {
 			t.release()
-			return nil, err
+			return nil, w, err
 		}
-		if err := c.limiter.Wait(ctx, c.blockedCh); err != nil {
+		t2 := time.Now()
+		err = c.limiter.Wait(ctx, c.blockedCh)
+		w.rate += time.Since(t2)
+		if err != nil {
 			t.release()
-			return nil, err
+			return nil, w, err
 		}
 		if c.blocked.Load() {
 			t.release()
-			return nil, errBlocked
+			return nil, w, errBlocked
 		}
 		if c.paused() || (!t.scout && c.gate.closedSince(t)) {
 			t.release()
 			continue
 		}
-		return t.release, nil
+		w.scout = t.scout
+		return t.release, w, nil
 	}
 }
 
@@ -601,16 +610,17 @@ func (c *Checker) blockedError() string {
 	return "not sent: Fragment blocks this client (Cloudflare challenge)"
 }
 
-func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Result, retry bool, errStr string) {
+func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (res Result, retry bool, errStr string) {
+	at := c.newAttempt(kindAttempt, name, try, reqURL)
 	// Registered first, so it runs last: the network time of this try
-	// includes draining and closing the body.
-	var start time.Time
+	// includes draining and closing the body; then the try reports itself.
 	defer func() {
-		if !start.IsZero() {
-			res.Net = time.Since(start)
-		}
+		at.end = time.Now()
+		res.Net = at.netTime()
+		at.finish(res, retry)
 	}()
-	release, err := c.admit(ctx)
+	release, w, err := c.admit(ctx)
+	at.waits = w
 	if errors.Is(err, errBlocked) {
 		msg := c.blockedError()
 		return Result{Username: name, Status: StatusError, Error: msg, notSent: true}, false, msg
@@ -638,13 +648,12 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Accept-Encoding", "gzip")
 
-	start = time.Now()
-	ct, tr := c.clientTrace(name, start)
-	req = req.WithContext(httptrace.WithClientTrace(req.Context(), ct))
+	at.begin(req)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), at.clientTrace()))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		c.debugf("@%s REQUEST FAILED: %v (%.0fms)", name, err, ms(time.Since(start)))
+		c.debugf("%s REQUEST FAILED: %v (%.0fms)", at.who(), err, ms(time.Since(at.start)))
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			if ctx.Err() != nil {
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}, false, "cancelled"
@@ -655,13 +664,14 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 	}
 	defer resp.Body.Close()
 	defer drainBody(resp.Body)
+	at.response(resp)
 
 	var bodyReader io.Reader = resp.Body
 	switch ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); ce {
 	case "gzip":
 		gz, gzErr := gzip.NewReader(resp.Body)
 		if gzErr != nil {
-			c.debugf("@%s gzip error: %v", name, gzErr)
+			c.debugf("%s gzip error: %v", at.who(), gzErr)
 			return Result{Username: name, Status: StatusError, Error: "gzip: " + gzErr.Error()}, false, gzErr.Error()
 		}
 		defer gz.Close()
@@ -671,34 +681,28 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 	default:
 		// Accept-Encoding asks for gzip only. Read the raw bytes; the parser
 		// will most likely find no marker and report unknown.
-		c.debugf("@%s unexpected Content-Encoding: %q — reading raw", name, ce)
+		c.debugf("%s unexpected Content-Encoding: %q — reading raw", at.who(), ce)
 	}
 
-	c.debugf("@%s HTTP %d | CE: %s | CT: %s | Server: %s | CF-Ray: %s", name, resp.StatusCode,
+	c.debugf("%s HTTP %d %s | CE: %s | CT: %s | Server: %s | CF-Ray: %s", at.who(), resp.StatusCode, resp.Proto,
 		resp.Header.Get("Content-Encoding"), resp.Header.Get("Content-Type"),
 		resp.Header.Get("Server"), resp.Header.Get("Cf-Ray"))
-	if c.log.Tracef != nil {
-		for k, vals := range resp.Header {
-			c.tracef("@%s  header  %s: %s", name, k, strings.Join(vals, "; "))
-		}
-	}
 
 	// Cloudflare marks the answers it replaces with a challenge (HTTP 403
 	// today) with this header. They say nothing about the name.
 	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Cf-Mitigated")), "challenge") {
 		challenged = true
-		return c.challengeResult(name, resp.StatusCode, tr)
+		return c.challengeResult(at, resp.StatusCode)
 	}
 
 	switch resp.StatusCode {
 	case 301, 302, 303, 307, 308:
 		c.noteAnswer()
 		loc := resp.Header.Get("Location")
-		c.debugf("@%s REDIRECT -> %s", name, loc)
+		c.debugf("%s REDIRECT -> %s", at.who(), loc)
 		switch {
 		case strings.Contains(loc, "?query="):
 			c.noteHealthy()
-			tr.summary(StatusFree, 0)
 			return Result{Username: name, Status: StatusFree, Confidence: 95,
 				Evidence: "redirect=" + loc}, false, ""
 		case isReservedRedirect(loc):
@@ -710,7 +714,6 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 				Evidence: "redirect=/ (reserved or throttled)"}, true, "redirect to /"
 		default:
 			c.noteHealthy()
-			tr.summary(StatusUnknown, 0)
 			return Result{Username: name, Status: StatusUnknown, Confidence: 20,
 				Evidence: "unexpected redirect=" + loc}, false, ""
 		}
@@ -730,9 +733,8 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		if wait <= 0 {
 			wait = c.cfg.RetryDelay
 		}
-		c.warnf("@%s HTTP 429 (Retry-After %q): every request pauses for at least %v", name, ra, wait)
+		c.warnf("%s HTTP 429 (Retry-After %q): every request pauses for at least %v", at.who(), ra, wait)
 		hold = true
-		tr.summary(StatusError, 0)
 		return Result{Username: name, Status: StatusError, Error: "HTTP 429 (rate limited)",
 			throttleWait: wait}, true, "rate limited"
 
@@ -745,6 +747,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 			buf = buf[:c.cfg.ReadLimit]
 		}
 		n, readErr := io.ReadFull(io.LimitReader(bodyReader, int64(c.cfg.ReadLimit)), buf)
+		at.bodyDone, at.bytes = time.Now(), n
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			readErr = nil
 		}
@@ -752,17 +755,15 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		if readErr != nil {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
-			tr.summary(StatusError, n)
 			return Result{Username: name, Status: StatusError, Error: readErr.Error()}, isRetriableNet(readErr), readErr.Error()
 		}
-		c.debugf("@%s body: %d bytes read (limit %d)", name, n, c.cfg.ReadLimit)
+		c.debugf("%s body: %d bytes read (limit %d)", at.who(), n, c.cfg.ReadLimit)
 		pi := ParseStatusDetailed(body)
 		if pi.Challenge {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
 			challenged = true
 			c.noteChallenge()
-			tr.summary(StatusError, n)
 			return Result{Username: name, Status: StatusError, Error: "cloudflare challenge",
 				Evidence: pi.Evidence}, true, "cloudflare challenge"
 		}
@@ -773,26 +774,24 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 			_ = c.cache.put(name, reqURL, pi, body)
 		}
 		if !pi.Found {
-			c.debugf("@%s STATUS NOT FOUND in %d bytes (increase -readlimit)", name, n)
-			if c.log.Tracef != nil && n > 0 {
+			c.debugf("%s STATUS NOT FOUND in %d bytes (increase -readlimit)", at.who(), n)
+			if c.traceOn() && n > 0 {
 				preview := string(body)
 				if len(preview) > 300 {
 					preview = preview[:300] + "…"
 				}
-				c.tracef("@%s body preview:\n%s", name, preview)
+				c.tracef("%s body preview:\n%s", at.who(), preview)
 			}
 		} else {
-			c.debugf("@%s parsed -> %s (confidence=%d; %s; offset: %d bytes, %.1f%% of readLimit)",
-				name, pi.Status, pi.Confidence, pi.Evidence, pi.Offset, float64(pi.Offset)/float64(c.cfg.ReadLimit)*100)
+			c.debugf("%s parsed -> %s (confidence=%d; %s; offset: %d bytes, %.1f%% of readLimit)",
+				at.who(), pi.Status, pi.Confidence, pi.Evidence, pi.Offset, float64(pi.Offset)/float64(c.cfg.ReadLimit)*100)
 		}
 		*bufPtr = buf
 		c.pool.Put(bufPtr)
 		if !pi.Found {
-			tr.summary(StatusUnknown, n)
 			return Result{Username: name, Status: StatusUnknown,
 				Confidence: pi.Confidence, Evidence: pi.Evidence}, false, ""
 		}
-		tr.summary(pi.Status, n)
 		return Result{Username: name, Status: pi.Status, Offset: pi.Offset,
 			Confidence: pi.Confidence, Evidence: pi.Evidence}, false, ""
 
@@ -800,14 +799,14 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusServiceUnavailable {
 			// A proxy may drop cf-mitigated; the page itself still shows.
 			head, _ := io.ReadAll(io.LimitReader(bodyReader, 8<<10))
+			at.bodyDone, at.bytes = time.Now(), len(head)
 			if looksLikeChallenge(head) {
 				challenged = true
-				return c.challengeResult(name, resp.StatusCode, tr)
+				return c.challengeResult(at, resp.StatusCode)
 			}
 		}
 		c.noteAnswer()
-		c.debugf("@%s unexpected HTTP %d", name, resp.StatusCode)
-		tr.summary(StatusError, 0)
+		c.debugf("%s unexpected HTTP %d", at.who(), resp.StatusCode)
 		s := fmt.Sprintf("HTTP %d", resp.StatusCode)
 		retryable := resp.StatusCode >= 500 && resp.StatusCode <= 599
 		return Result{Username: name, Status: StatusError, Error: s}, retryable, s
@@ -816,12 +815,11 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string) (res Resul
 
 // challengeResult is the answer to a Cloudflare challenge: an error that is
 // retried like the 200 interstitial, and counted toward ChallengeLimit.
-func (c *Checker) challengeResult(name string, code int, tr *requestTrace) (Result, bool, string) {
+func (c *Checker) challengeResult(at *attempt, code int) (Result, bool, string) {
 	c.noteChallenge()
-	c.debugf("@%s Cloudflare challenge (HTTP %d)", name, code)
-	tr.summary(StatusError, 0)
+	c.debugf("%s Cloudflare challenge (HTTP %d)", at.who(), code)
 	msg := fmt.Sprintf("cloudflare challenge (HTTP %d)", code)
-	return Result{Username: name, Status: StatusError, Error: msg,
+	return Result{Username: at.name, Status: StatusError, Error: msg,
 		Evidence: "cf-mitigated: challenge"}, true, msg
 }
 
@@ -1303,26 +1301,51 @@ func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
 func (c *Checker) probeHealthy(ctx context.Context) bool {
 	name := fmt.Sprintf("zzprobe%d", time.Now().UnixNano()%1_000_000_000_000)
 	reqURL := fmt.Sprintf(FragmentURLTemplate, url.PathEscape(name))
+	at := c.newAttempt(kindProbe, name, 0, reqURL)
+	healthy, why := false, ""
+	defer func() {
+		if at.end.IsZero() {
+			at.end = time.Now()
+		}
+		if c.debugOn() {
+			verdict := "THROTTLED (redirected to / as well)"
+			if healthy {
+				verdict = "healthy"
+			}
+			if why != "" {
+				verdict = why
+			}
+			c.debugf("%s", at.line(verdict))
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
+		why = "failed: " + err.Error()
 		return false
 	}
 	req.Header.Set("User-Agent", c.cfg.UserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	at.begin(req)
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), at.clientTrace()))
 	resp, err := c.client.Do(req)
 	if err != nil {
+		why = "failed: " + err.Error()
 		return false
 	}
-	defer resp.Body.Close()
-	defer drainBody(resp.Body)
-	if resp.StatusCode == http.StatusOK {
-		return true
+	at.response(resp)
+	drainBody(resp.Body)
+	resp.Body.Close()
+	at.end = time.Now()
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		healthy = true
+	case resp.StatusCode >= 300 && resp.StatusCode <= 399:
+		healthy = strings.Contains(resp.Header.Get("Location"), "?query=")
+	default:
+		why = fmt.Sprintf("not healthy: HTTP %d", resp.StatusCode)
 	}
-	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
-		return strings.Contains(resp.Header.Get("Location"), "?query=")
-	}
-	return false
+	return healthy
 }
 
 // triggerBlock pauses every worker for cfg.BlockCooldown.

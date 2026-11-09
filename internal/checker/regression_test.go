@@ -611,3 +611,103 @@ func TestResultSplitsNetworkAndWaiting(t *testing.T) {
 		t.Errorf("%d names waited >= 200 ms for a start, want 2", waited)
 	}
 }
+
+// logCapture collects Debugf and Tracef lines.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *logCapture) add(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *logCapture) text() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+// -debug printed the HTTP code and the verdict of a try but no timings (the
+// timing line existed only at -trace), tries of one name were not told
+// apart, and the shared throttle probe printed nothing at any level. Now
+// every try ends with one line: its number, the outcome, the waits before
+// it and the phases of the request; the probe gets the same line.
+func TestDebugLinePerTryAndProbe(t *testing.T) {
+	var n atomic.Int32
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		switch {
+		case strings.HasPrefix(name, "zzprobe"):
+			http.Redirect(w, r, "/?query="+name, http.StatusFound)
+		case name == "rsvname":
+			http.Redirect(w, r, "/", http.StatusFound)
+		case n.Add(1) == 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			http.Redirect(w, r, "/?query="+name, http.StatusFound)
+		}
+	})
+	var debug logCapture
+	c := New(Config{Workers: 1, Retries: 1, RetryDelay: time.Millisecond, Timeout: 2 * time.Second})
+	defer c.Close()
+	c.SetLogger(Logger{Debugf: debug.add}) // -debug only, no -trace
+	if res := c.CheckOne(context.Background(), "retryname"); res.Status != StatusFree {
+		t.Fatalf("retryname: %s %s", res.Status, res.Error)
+	}
+	if res := c.CheckOne(context.Background(), "rsvname"); res.Status != StatusReserved {
+		t.Fatalf("rsvname: %s %s", res.Status, res.Error)
+	}
+	out := debug.text()
+	for _, want := range []string{
+		"@retryname #1 | -> error (will retry): HTTP 503 | 503 HTTP/1.1 |",
+		"@retryname #2 | -> free | 302 HTTP/1.1 |",
+		"@rsvname #1 | -> redirect to / (reserved or throttled) |",
+		"| -> healthy | 302 HTTP/1.1 |",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in the -debug output:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "probe zzprobe") || !strings.Contains(out, "net=") || !strings.Contains(out, "ttfb=") {
+		t.Errorf("the -debug lines lack the probe or the timings:\n%s", out)
+	}
+}
+
+// -trace printed every header of an answer as it was, so the session
+// cookie (Set-Cookie: stel_ssid=...) landed in the log. Values are hidden
+// now, in the answer and in the request (only the names of the cookies
+// sent are shown), and the request itself is printed.
+func TestTraceHidesCookieValues(t *testing.T) {
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		http.SetCookie(w, &http.Cookie{Name: "stel_ssid", Value: "SECRET123", Path: "/", HttpOnly: true})
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	var lines logCapture
+	c := New(Config{Workers: 1, Timeout: 2 * time.Second})
+	defer c.Close()
+	c.SetLogger(Logger{Debugf: lines.add, Tracef: lines.add})
+	_ = c.CheckOne(context.Background(), "cookiename")
+	_ = c.CheckOne(context.Background(), "cookiename2") // sends the cookie back
+	out := lines.text()
+	if strings.Contains(out, "SECRET123") {
+		t.Fatalf("a cookie value reached the trace:\n%s", out)
+	}
+	for _, want := range []string{"Set-Cookie: stel_ssid=…; Path=/; HttpOnly", "-> GET http", "User-Agent: ",
+		"cookies: none", "cookies: stel_ssid (values hidden)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in the trace:\n%s", want, out)
+		}
+	}
+}
+
+func TestMaskSetCookies(t *testing.T) {
+	got := maskSetCookies([]string{"a=1; Path=/", "b=two", "noequals; Secure", ""})
+	want := []string{"a=…; Path=/", "b=…", "noequals; Secure", ""}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("maskSetCookies = %q, want %q", got, want)
+	}
+}
