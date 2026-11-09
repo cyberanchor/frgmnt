@@ -848,3 +848,54 @@ func TestTraceFileJSONLines(t *testing.T) {
 		t.Errorf("%d run_start events after -resume, want 2 (appended)", starts)
 	}
 }
+
+// At -debug the progress line shows the queues and what the workers do;
+// at the normal level it stays as it was.
+func TestProgressShowsThePipelineAtDebug(t *testing.T) {
+	e := checker.Stats{Checked: 10, Busy: 5, InFlight: 2, WaitRate: 3}
+	q := queues{in: func() int { return 4096 }, out: func() int { return 1 }}
+	got := pipelineLine(e, q, 8)
+	want := "queue in=4096 out=1 | workers net=2 gate=0 pause=0 rate=3 retry=0 probe=0 idle=3"
+	if got != want {
+		t.Errorf("pipelineLine = %q, want %q", got, want)
+	}
+	info := pipelineInfo(e, q, 8, 2.5)
+	if info["queue_in"] != 4096 || info["wait_rate"] != int64(3) || info["inst_rps"] != 2.5 {
+		t.Errorf("pipelineInfo = %v", info)
+	}
+}
+
+// A run with -trace-file that lasts over a second has "pipeline" events.
+func TestTraceFileHasPipelineEvents(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	tracePath := filepath.Join(dir, "trace.jsonl")
+	if err := os.WriteFile(in, []byte("name0001\nname0002\nname0003\nname0004\nname0005\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := Main([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL,
+		"-no-cache", "-quiet", "-workers", "2", "-rate", "3", "-trace-file", tracePath}); code != 0 {
+		t.Fatalf("exit code %d", code)
+	}
+	raw, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var e checker.TraceEvent
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("not JSON: %q", line)
+		}
+		if e.Kind == "pipeline" {
+			n++
+			if _, ok := e.Info["wait_rate"]; !ok || e.Info["workers"] != float64(2) {
+				t.Errorf("pipeline info %v", e.Info)
+			}
+		}
+	}
+	if n == 0 {
+		t.Error("no pipeline event in a run of about 1.5 s")
+	}
+}

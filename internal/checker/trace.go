@@ -94,6 +94,7 @@ type attempt struct {
 	tlsStart, tlsDone         time.Time
 	wrote, firstByte          time.Time
 	bodyDone                  time.Time
+	inFlight                  bool // counted in Stats.InFlight until done
 
 	connReused bool
 	connIdle   time.Duration
@@ -137,6 +138,8 @@ func (a *attempt) begin(req *http.Request) {
 		}
 	}
 	a.start = time.Now()
+	atomic.AddInt64(&a.c.stats.inFlight, 1)
+	a.inFlight = true
 	if a.c.traceOn() {
 		var hdr []string
 		for _, k := range sortedKeys(req.Header) {
@@ -247,6 +250,18 @@ func (a *attempt) clientTrace() *httptrace.ClientTrace {
 	}
 }
 
+// done takes the request off Stats.InFlight; it is called once the body
+// is drained.
+func (a *attempt) done() {
+	if a.end.IsZero() {
+		a.end = time.Now()
+	}
+	if a.inFlight {
+		a.inFlight = false
+		atomic.AddInt64(&a.c.stats.inFlight, -1)
+	}
+}
+
 // netTime is the time from sending the request to draining the body.
 func (a *attempt) netTime() time.Duration {
 	if a.start.IsZero() || a.end.IsZero() {
@@ -316,9 +331,7 @@ func (a *attempt) line(outcome string) string {
 // finish closes the record of a try of a name: its event in the
 // structured trace and its -debug line.
 func (a *attempt) finish(res Result, retry bool) {
-	if a.end.IsZero() {
-		a.end = time.Now()
-	}
+	a.done()
 	if a.c.eventsOn() {
 		a.c.event(a.event(res, retry))
 	}

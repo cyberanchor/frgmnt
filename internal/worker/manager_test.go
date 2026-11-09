@@ -1019,3 +1019,46 @@ func TestSavedResultsCarryTheTimeSplit(t *testing.T) {
 		t.Errorf("%d rows, %d waited for a -rate start; want 3 and 2", len(rs), waited)
 	}
 }
+
+// A traced run gets a "pipeline" event every second: the queues and what
+// the workers do.
+func TestTileTraceHasPipelineEvents(t *testing.T) {
+	newFakeFragment(t, 500*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg := testConfig(1)
+	cfg.Trace = true
+	w, err := h.m.Create(ctx, "pipeline", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(3)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+	raw, err := os.ReadFile(h.m.TracePath(w.ID()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var e checker.TraceEvent
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("not JSON: %q", line)
+		}
+		if e.Kind == "pipeline" {
+			n++
+			if e.Info["workers"] != float64(1) || e.Info["busy"] == nil {
+				t.Errorf("pipeline info %v", e.Info)
+			}
+		}
+	}
+	if n == 0 {
+		t.Error("no pipeline event in a run of about 1.5 s")
+	}
+}

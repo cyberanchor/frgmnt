@@ -596,7 +596,7 @@ func formatResult(r checker.Result, filter map[Status]bool, quiet bool) (fileLin
 
 // runProgress prints a one-line snapshot every progressInterval, with an
 // "instant" requests-per-second value to help spot throughput stalls.
-func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker) {
+func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queues, trace *tracelog.Writer) {
 	ticker := time.NewTicker(progressInterval)
 	defer ticker.Stop()
 	var lastChecked int64
@@ -614,8 +614,39 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker) {
 			}
 			lastChecked = e.Checked
 			lastTime = now
-			log.Printf("[progress] %s | inst=%.0f r/s", stats.snapshot(e), instRPS)
+			line := fmt.Sprintf("[progress] %s | inst=%.0f r/s", stats.snapshot(e), instRPS)
+			if logLevel >= LevelDebug {
+				line += " | " + pipelineLine(e, q, chk.Config().Workers)
+			}
+			log.Print(line)
+			if trace != nil {
+				trace.Write(checker.TraceEvent{Time: now, Kind: "pipeline", Info: pipelineInfo(e, q, chk.Config().Workers, instRPS)})
+			}
 		}
+	}
+}
+
+// queues are the two queues of a run: names waiting for a worker, results
+// waiting for the writer.
+type queues struct {
+	in  func() int
+	out func() int
+}
+
+// pipelineLine is the state of the run in the -debug progress line: the
+// queues, then the workers by what they do.
+func pipelineLine(e checker.Stats, q queues, workers int) string {
+	idle := int64(workers) - e.Busy
+	return fmt.Sprintf("queue in=%d out=%d | workers net=%d gate=%d pause=%d rate=%d retry=%d probe=%d idle=%d",
+		q.in(), q.out(), e.InFlight, e.WaitGate, e.WaitPause, e.WaitRate, e.WaitRetry, e.WaitProbe, max(idle, 0))
+}
+
+// pipelineInfo is the same for the "pipeline" event of the trace.
+func pipelineInfo(e checker.Stats, q queues, workers int, instRPS float64) map[string]any {
+	return map[string]any{
+		"queue_in": q.in(), "queue_out": q.out(), "checked": e.Checked, "inst_rps": instRPS,
+		"workers": workers, "busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate,
+		"wait_pause": e.WaitPause, "wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
 	}
 }
 
@@ -865,7 +896,7 @@ func Main(args []string) int {
 
 	// --- Progress reporter ---
 	progCtx, progCancel := context.WithCancel(ctx)
-	go runProgress(progCtx, stats, chk)
+	go runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace)
 
 	// --- Checks: eff.Workers goroutines inside the engine ---
 	runDone := make(chan struct{})

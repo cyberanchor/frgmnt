@@ -738,3 +738,86 @@ func TestLoggerLevelGatesDebugAndTrace(t *testing.T) {
 		t.Fatalf("no request line at LogTrace: %q", trace.text())
 	}
 }
+
+// Stats tells what the workers do right now: on the network, waiting for
+// the gate or for a -rate start (or a pause, a retry, the probe), so a
+// progress line can show where a slow run spends its time.
+func TestStatsShowWhatTheWorkersDo(t *testing.T) {
+	// Two held groups; the test server waits for held requests when it
+	// closes, so both are released whatever happens.
+	gateHeld, nameHeld := make(chan struct{}), make(chan struct{})
+	var gateOnce, nameOnce sync.Once
+	freeGate := func() { gateOnce.Do(func() { close(gateHeld) }) }
+	freeNames := func() { nameOnce.Do(func() { close(nameHeld) }) }
+	t.Cleanup(freeGate)
+	t.Cleanup(freeNames)
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/username/")
+		switch {
+		case strings.HasPrefix(name, "stuckgate"):
+			<-gateHeld
+		case strings.HasPrefix(name, "stuckname"):
+			<-nameHeld
+		}
+		http.Redirect(w, r, "/?query="+name, http.StatusFound)
+	})
+	wait := func(what string, ok func(Stats) bool, c *Checker) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for s := c.Snapshot(); !ok(s); s = c.Snapshot() {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: busy=%d in_flight=%d wait_gate=%d wait_rate=%d", what, s.Busy, s.InFlight, s.WaitGate, s.WaitRate)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// Until the first answer one request goes at a time: with the first
+	// one held, the other workers wait at the gate.
+	g := New(Config{Workers: 4, MaxConns: 8, Retries: 0, Timeout: 5 * time.Second})
+	defer g.Close()
+	gin := make(chan string, 4)
+	for i := 0; i < 4; i++ {
+		gin <- fmt.Sprintf("stuckgate%d", i)
+	}
+	close(gin)
+	gdone := make(chan struct{})
+	go func() { g.Run(context.Background(), gin, make(chan Result, 4)); close(gdone) }()
+	wait("scouting", func(s Stats) bool { return s.Busy == 4 && s.InFlight == 1 && s.WaitGate == 3 }, g)
+	freeGate()
+	<-gdone
+
+	// After an answer opened the gate, all four go out together.
+	c := New(Config{Workers: 4, MaxConns: 8, Retries: 0, Timeout: 5 * time.Second})
+	defer c.Close()
+	if res := c.CheckOne(context.Background(), "openname"); res.Status != StatusFree {
+		t.Fatalf("openname: %s", res.Status)
+	}
+	in := make(chan string, 4)
+	for i := 0; i < 4; i++ {
+		in <- fmt.Sprintf("stuckname%d", i)
+	}
+	close(in)
+	done := make(chan struct{})
+	go func() { c.Run(context.Background(), in, make(chan Result, 4)); close(done) }()
+	wait("open gate", func(s Stats) bool { return s.Busy == 4 && s.InFlight == 4 && s.WaitGate == 0 }, c)
+	freeNames()
+	<-done
+	if s := c.Snapshot(); s.Busy != 0 || s.InFlight != 0 || s.WaitGate != 0 {
+		t.Errorf("after the run: busy=%d in_flight=%d wait_gate=%d, want 0", s.Busy, s.InFlight, s.WaitGate)
+	}
+
+	// With -rate 2 and 3 workers, two of them wait for a start.
+	r := New(Config{Workers: 3, RateRPS: 2, Retries: 0, Timeout: 5 * time.Second})
+	defer r.Close()
+	_ = r.CheckOne(context.Background(), "openname") // open the gate
+	rin := make(chan string, 3)
+	for i := 0; i < 3; i++ {
+		rin <- fmt.Sprintf("ratewait%d", i)
+	}
+	close(rin)
+	rdone := make(chan struct{})
+	go func() { r.Run(context.Background(), rin, make(chan Result, 3)); close(rdone) }()
+	wait("rate", func(s Stats) bool { return s.WaitRate >= 2 }, r)
+	<-rdone
+}

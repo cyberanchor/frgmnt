@@ -245,6 +245,19 @@ type Stats struct {
 	// Pauses counts the shared pauses taken because Fragment throttled
 	// this client.
 	Pauses int64 `json:"pauses"`
+
+	// What the workers do right now: inside a check (Busy), with a request
+	// on the network (InFlight, probes included), or waiting for the gate,
+	// a shared pause, a -rate start, the delay before a retry, or the
+	// throttle probe. Busy minus the others is time spent on the CPU
+	// (parsing, the cache).
+	Busy      int64 `json:"busy"`
+	InFlight  int64 `json:"in_flight"`
+	WaitGate  int64 `json:"wait_gate"`
+	WaitPause int64 `json:"wait_pause"`
+	WaitRate  int64 `json:"wait_rate"`
+	WaitRetry int64 `json:"wait_retry"`
+	WaitProbe int64 `json:"wait_probe"`
 }
 
 // Checker performs concurrent Fragment lookups against a single Config.
@@ -419,7 +432,9 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 			if !ok {
 				return
 			}
+			atomic.AddInt64(&c.stats.busy, 1)
 			r := c.CheckOne(ctx, name)
+			atomic.AddInt64(&c.stats.busy, -1)
 			if ctx.Err() != nil && r.Status == StatusError {
 				// Stop or shutdown cut this check short, so there is no
 				// verdict. Reporting it as an error used to store the name
@@ -548,11 +563,14 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			if attempts > c.cfg.Retries || c.blocked.Load() {
 				break // no point in retrying when every answer is a challenge
 			}
+			atomic.AddInt64(&c.stats.waitRetry, 1)
 			select {
 			case <-ctx.Done():
+				atomic.AddInt64(&c.stats.waitRetry, -1)
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}
 			case <-time.After(c.cfg.RetryDelay):
 			}
+			atomic.AddInt64(&c.stats.waitRetry, -1)
 			if c.blocked.Load() {
 				break // found blocked during the pause
 			}
@@ -603,20 +621,30 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 func (c *Checker) admit(ctx context.Context) (release func(), w waits, err error) {
 	for {
 		t0 := time.Now()
+		atomic.AddInt64(&c.stats.waitGate, 1)
 		t, err := c.gate.pass(ctx, c.blockedCh)
+		atomic.AddInt64(&c.stats.waitGate, -1)
 		w.gate += time.Since(t0)
 		if err != nil {
 			return nil, w, err
 		}
 		t1 := time.Now()
-		err = c.waitBlock(ctx)
+		if c.paused() {
+			atomic.AddInt64(&c.stats.waitPause, 1)
+			err = c.waitBlock(ctx)
+			atomic.AddInt64(&c.stats.waitPause, -1)
+		} else {
+			err = c.waitBlock(ctx)
+		}
 		w.pause += time.Since(t1)
 		if err != nil {
 			t.release()
 			return nil, w, err
 		}
 		t2 := time.Now()
+		atomic.AddInt64(&c.stats.waitRate, 1)
 		err = c.limiter.Wait(ctx, c.blockedCh)
+		atomic.AddInt64(&c.stats.waitRate, -1)
 		w.rate += time.Since(t2)
 		if err != nil {
 			t.release()
@@ -649,7 +677,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 	// Registered first, so it runs last: the network time of this try
 	// includes draining and closing the body; then the try reports itself.
 	defer func() {
-		at.end = time.Now()
+		at.done()
 		res.Net = at.netTime()
 		at.finish(res, retry)
 	}()
@@ -1079,6 +1107,8 @@ type liveStats struct {
 	cacheMisses int64
 	challenges  int64
 	pauses      int64
+
+	busy, inFlight, waitGate, waitPause, waitRate, waitRetry, waitProbe int64
 }
 
 func newLiveStats() *liveStats { return &liveStats{} }
@@ -1127,6 +1157,14 @@ func (s *liveStats) snapshot() Stats {
 		CacheMisses: atomic.LoadInt64(&s.cacheMisses),
 		Challenges:  atomic.LoadInt64(&s.challenges),
 		Pauses:      atomic.LoadInt64(&s.pauses),
+
+		Busy:      atomic.LoadInt64(&s.busy),
+		InFlight:  atomic.LoadInt64(&s.inFlight),
+		WaitGate:  atomic.LoadInt64(&s.waitGate),
+		WaitPause: atomic.LoadInt64(&s.waitPause),
+		WaitRate:  atomic.LoadInt64(&s.waitRate),
+		WaitRetry: atomic.LoadInt64(&s.waitRetry),
+		WaitProbe: atomic.LoadInt64(&s.waitProbe),
 	}
 }
 
@@ -1311,6 +1349,8 @@ const probeReuse = time.Second
 // It used to be one request per caller, and every "302 /" also paused all
 // workers for BlockCooldown, about 3 s per attempt of a reserved name.
 func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
+	atomic.AddInt64(&c.stats.waitProbe, 1)
+	defer atomic.AddInt64(&c.stats.waitProbe, -1)
 	asked := time.Now()
 	c.probeMu.Lock()
 	defer c.probeMu.Unlock()
@@ -1338,9 +1378,7 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 	at := c.newAttempt(kindProbe, name, 0, reqURL)
 	healthy, why := false, ""
 	defer func() {
-		if at.end.IsZero() {
-			at.end = time.Now()
-		}
+		at.done()
 		if c.eventsOn() {
 			e := at.event(Result{Error: why}, false)
 			e.Healthy = boolPtr(healthy)
@@ -1375,7 +1413,7 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 	at.response(resp)
 	drainBody(resp.Body)
 	resp.Body.Close()
-	at.end = time.Now()
+	at.done()
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		healthy = true

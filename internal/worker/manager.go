@@ -773,7 +773,36 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	batchDone := make(chan struct{})
 	go m.persister(ctx, w, out, batchDone)
 
+	// With a trace, the state of the run once a second: the queues and
+	// what the workers do.
+	pipeDone := make(chan struct{})
+	pipeStopped := make(chan struct{})
+	if trace == nil {
+		close(pipeStopped)
+	} else {
+		go func() {
+			defer close(pipeStopped)
+			tick := time.NewTicker(time.Second)
+			defer tick.Stop()
+			for {
+				select {
+				case <-pipeDone:
+					return
+				case now := <-tick.C:
+					e := chk.Snapshot()
+					trace.Write(checker.TraceEvent{Time: now, Kind: "pipeline", Info: map[string]any{
+						"queue_in": len(in), "queue_out": len(out), "checked": e.Checked, "workers": cfg.Workers,
+						"busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate, "wait_pause": e.WaitPause,
+						"wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
+					}})
+				}
+			}
+		}()
+	}
+
 	chk.Run(ctx, in, out)
+	close(pipeDone)
+	<-pipeStopped // no pipeline event after the trace is closed
 	blocked := chk.Blocked()
 	if blocked {
 		// Run gave up early; the producer still waits to hand over a name.
