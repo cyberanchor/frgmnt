@@ -622,11 +622,31 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 
 	chk := checker.New(cfg)
 	defer chk.Close()
-	// The engine's warnings (throttle pauses, HTTP 429, the stop) go to the
-	// tile's log; the panel used to get none of them.
-	chk.SetLogger(checker.Logger{Warnf: func(format string, args ...any) {
-		m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(format, args...))
-	}})
+	// The engine's output goes to the tile's log, at the level of the bus:
+	// the warnings (throttle pauses, HTTP 429, the stop), at debug a line
+	// per HTTP try with its timings, at trace every step of every request.
+	// The panel got only the warnings, and before 2.0.0 nothing at all, so
+	// its debug and trace levels showed no HTTP detail.
+	chk.SetLogger(checker.Logger{
+		Warnf: func(format string, args ...any) {
+			m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(format, args...))
+		},
+		Debugf: func(format string, args ...any) {
+			m.bus.Publish(logbus.LevelDebug, w.id, fmt.Sprintf(format, args...))
+		},
+		Tracef: func(format string, args ...any) {
+			m.bus.Publish(logbus.LevelTrace, w.id, fmt.Sprintf(format, args...))
+		},
+		Level: func() checker.LogLevel {
+			switch m.bus.Level() {
+			case logbus.LevelTrace:
+				return checker.LogTrace
+			case logbus.LevelDebug:
+				return checker.LogDebug
+			}
+			return checker.LogInfo
+		},
+	})
 	w.mu.Lock()
 	w.chk = chk
 	w.mu.Unlock()

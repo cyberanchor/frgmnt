@@ -828,3 +828,69 @@ func TestThrottledRunStopsWithItsOwnMessage(t *testing.T) {
 		t.Error("no throttle warning reached the log")
 	}
 }
+
+// The panel gave the engine a logger with warnings only, so the debug and
+// trace levels of the Logs tab showed no HTTP detail. The engine's debug
+// and trace lines reach the tile's log now, and follow the level of the
+// bus when it changes: nothing at info, a line per try at debug, every
+// step at trace.
+func TestEngineDetailFollowsTheLogLevel(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	var mu sync.Mutex
+	lines := map[string][]string{} // level -> engine lines
+	events, cancel := h.bus.Subscribe("", 4096)
+	defer cancel()
+	go func() {
+		for e := range events {
+			if strings.Contains(e.Message, " #1") || strings.Contains(e.Message, "probe ") {
+				mu.Lock()
+				lines[e.Level] = append(lines[e.Level], e.Message)
+				mu.Unlock()
+			}
+		}
+	}()
+	w, err := h.m.Create(ctx, "levels", testConfig(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(2)); err != nil {
+		t.Fatal(err)
+	}
+	run := func() {
+		t.Helper()
+		if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if !waitNotRunning(w, 10*time.Second) {
+			t.Fatal("run did not finish")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	count := func(level string) int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(lines[level])
+	}
+	run()
+	if n := count("DEBUG") + count("TRACE"); n != 0 {
+		t.Errorf("%d engine lines at info, want none", n)
+	}
+	h.bus.SetLevel(logbus.LevelDebug)
+	run()
+	if count("DEBUG") == 0 || count("TRACE") != 0 {
+		t.Errorf("at debug: %d debug and %d trace lines, want debug only", count("DEBUG"), count("TRACE"))
+	}
+	mu.Lock()
+	joined := strings.Join(lines["DEBUG"], "\n")
+	mu.Unlock()
+	if !strings.Contains(joined, "#1 | -> free | 302 HTTP/1.1 |") || !strings.Contains(joined, "net=") {
+		t.Errorf("debug lines lack the per-try timing line:\n%s", joined)
+	}
+	h.bus.SetLevel(logbus.LevelTrace)
+	run()
+	if count("TRACE") == 0 {
+		t.Error("no trace lines at the trace level")
+	}
+}

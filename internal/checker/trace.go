@@ -22,15 +22,35 @@ type Logger struct {
 	// Event receives the structured trace: one TraceEvent per HTTP request,
 	// cache lookup and name, and the pauses, the gate and the stop. nil = off.
 	Event func(TraceEvent)
+
+	// Level, when set, is asked before every Debugf and Tracef line: the
+	// panel's log level can change during a run, and a line nobody will
+	// see is then not even formatted. nil: Debugf and Tracef always run.
+	Level func() LogLevel
 }
+
+// LogLevel is what Logger.Level answers.
+type LogLevel int
+
+// Levels for Logger.Level.
+const (
+	LogInfo  LogLevel = iota // neither Debugf nor Tracef
+	LogDebug                 // Debugf
+	LogTrace                 // Debugf and Tracef
+)
 
 // SetLogger installs l. Call it before the first check.
 func (c *Checker) SetLogger(l Logger) { c.log = l }
 
 // debugOn and traceOn tell whether the detail of that level is wanted, so
 // callers can skip work that only feeds it.
-func (c *Checker) debugOn() bool { return c.log.Debugf != nil }
-func (c *Checker) traceOn() bool { return c.log.Tracef != nil }
+func (c *Checker) debugOn() bool {
+	return c.log.Debugf != nil && (c.log.Level == nil || c.log.Level() >= LogDebug)
+}
+
+func (c *Checker) traceOn() bool {
+	return c.log.Tracef != nil && (c.log.Level == nil || c.log.Level() >= LogTrace)
+}
 
 func (c *Checker) warnf(format string, args ...any) {
 	if c.log.Warnf != nil {

@@ -711,3 +711,30 @@ func TestMaskSetCookies(t *testing.T) {
 		t.Errorf("maskSetCookies = %q, want %q", got, want)
 	}
 }
+
+// Logger.Level is asked before every debug and trace line, so a host whose
+// level changes during a run (the panel) gets only what it wants.
+func TestLoggerLevelGatesDebugAndTrace(t *testing.T) {
+	withServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/?query="+strings.TrimPrefix(r.URL.Path, "/username/"), http.StatusFound)
+	})
+	var debug, trace logCapture
+	var level atomic.Int32
+	c := New(Config{Workers: 1, Timeout: 2 * time.Second})
+	defer c.Close()
+	c.SetLogger(Logger{Debugf: debug.add, Tracef: trace.add, Level: func() LogLevel { return LogLevel(level.Load()) }})
+	_ = c.CheckOne(context.Background(), "levelname")
+	if debug.text() != "" || trace.text() != "" {
+		t.Fatalf("lines at LogInfo:\n%s\n%s", debug.text(), trace.text())
+	}
+	level.Store(int32(LogDebug))
+	_ = c.CheckOne(context.Background(), "levelname")
+	if debug.text() == "" || trace.text() != "" {
+		t.Fatalf("at LogDebug: debug %q, trace %q", debug.text(), trace.text())
+	}
+	level.Store(int32(LogTrace))
+	_ = c.CheckOne(context.Background(), "levelname")
+	if !strings.Contains(trace.text(), "-> GET http") {
+		t.Fatalf("no request line at LogTrace: %q", trace.text())
+	}
+}
