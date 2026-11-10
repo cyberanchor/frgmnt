@@ -21,20 +21,31 @@ type TraceEvent struct {
 	// (set by the writer): a gap means lines were lost.
 	Seq  int64     `json:"seq,omitempty"`
 	Time time.Time `json:"ts"`
-	Kind string    `json:"kind"` // attempt, probe, cache, result, pause, gate, throttle_over, blocked; run_start, run_end, pipeline, segment, trace_stopped from the hosts and the writer
-	Name string    `json:"name,omitempty"`
-	Try  int       `json:"try,omitempty"` // HTTP try of the name, from 1; throttled tries count
+
+	// Ids that tie events together: nid is one check of a name (its cache
+	// lookup, tries, probes and result), aid one HTTP request, w the
+	// worker (from 1; 0 outside a run). Connections have cid.
+	NID    int64 `json:"nid,omitempty"`
+	AID    int64 `json:"aid,omitempty"`
+	Worker int   `json:"w,omitempty"`
+
+	Kind string `json:"kind"` // attempt, probe, cache, result, pause, gate, throttle_over, blocked; run_start, run_end, pipeline, segment, trace_stopped from the hosts and the writer
+	Name string `json:"name,omitempty"`
+	Try  int    `json:"try,omitempty"` // HTTP try of the name, from 1; throttled tries count
 
 	// The request (attempt, probe).
 	URL            string      `json:"url,omitempty"`
 	Method         string      `json:"method,omitempty"`
 	ReqHeaders     http.Header `json:"req_headers,omitempty"` // as sent; Cookie by name only ("stel_ssid=…")
 	CookiesSent    []string    `json:"cookies_sent,omitempty"`
-	WaitGateMs     float64     `json:"wait_gate_ms,omitempty"`  // waiting for the gate (one request at a time)
-	WaitPauseMs    float64     `json:"wait_pause_ms,omitempty"` // waiting out a shared pause
-	WaitRateMs     float64     `json:"wait_rate_ms,omitempty"`  // waiting for the -rate start
-	Alone          bool        `json:"alone,omitempty"`         // went alone through the closed gate
-	ConnWaitMs     float64     `json:"conn_wait_ms,omitempty"`  // waiting for a free connection (-conns); not network time
+	WaitGateMs     float64     `json:"wait_gate_ms,omitempty"`   // waiting for the gate (one request at a time)
+	WaitPauseMs    float64     `json:"wait_pause_ms,omitempty"`  // waiting out a shared pause
+	WaitRateMs     float64     `json:"wait_rate_ms,omitempty"`   // waiting for the -rate start
+	Alone          bool        `json:"alone,omitempty"`          // went alone through the closed gate
+	RetryDelayMs   float64     `json:"retry_delay_ms,omitempty"` // the delay before this retry
+	ProbeWaitMs    float64     `json:"probe_wait_ms,omitempty"`  // the throttle probe after the previous try
+	RetryReason    string      `json:"retry_reason,omitempty"`   // why the previous try was not the last
+	ConnWaitMs     float64     `json:"conn_wait_ms,omitempty"`   // waiting for a free connection (-conns); not network time
 	DNSMs          float64     `json:"dns_ms,omitempty"`
 	DNSAddrs       []string    `json:"dns_addrs,omitempty"`
 	DNSCoalesced   bool        `json:"dns_coalesced,omitempty"` // shared the lookup of another request
@@ -106,15 +117,21 @@ type TraceEvent struct {
 	CacheError      string  `json:"cache_error,omitempty"`
 
 	// The outcome of a request or of a name.
-	Status     Status `json:"status,omitempty"`
-	Retry      bool   `json:"retry,omitempty"`   // the try will be repeated (or decided by the probe)
-	Healthy    *bool  `json:"healthy,omitempty"` // probe: Fragment answers this client normally
-	Confidence int    `json:"confidence,omitempty"`
-	Evidence   string `json:"evidence,omitempty"`
-	Offset     int    `json:"offset,omitempty"`
-	Error      string `json:"error,omitempty"`
-	NotSent    bool   `json:"not_sent,omitempty"`  // the run stopped before the request went out
-	Cancelled  bool   `json:"cancelled,omitempty"` // Stop or Ctrl+C cut it short
+	Status  Status `json:"status,omitempty"`
+	Retry   bool   `json:"retry,omitempty"`   // the try will be repeated (or decided by the probe)
+	Healthy *bool  `json:"healthy,omitempty"` // probe: Fragment answers this client normally
+	Reused  bool   `json:"reused,omitempty"`  // probe: the verdict of another worker's probe, age_ms old
+
+	// A Cloudflare challenge: how many came in a row, and how many stop
+	// the run.
+	ChallengeRun   int64  `json:"challenge_run,omitempty"`
+	ChallengeLimit int    `json:"challenge_limit,omitempty"`
+	Confidence     int    `json:"confidence,omitempty"`
+	Evidence       string `json:"evidence,omitempty"`
+	Offset         int    `json:"offset,omitempty"`
+	Error          string `json:"error,omitempty"`
+	NotSent        bool   `json:"not_sent,omitempty"`  // the run stopped before the request went out
+	Cancelled      bool   `json:"cancelled,omitempty"` // Stop or Ctrl+C cut it short
 
 	// The end of a name (result).
 	Attempts int     `json:"attempts,omitempty"`
@@ -174,6 +191,12 @@ func (a *attempt) event(res Result, retry bool) TraceEvent {
 	e := TraceEvent{
 		Time:            a.start,
 		Kind:            a.kind,
+		NID:             a.ids.nid,
+		AID:             a.aid,
+		Worker:          a.ids.w,
+		RetryDelayMs:    ms(a.before.retryDelay),
+		ProbeWaitMs:     ms(a.before.probeWait),
+		RetryReason:     a.before.reason,
 		Name:            a.name,
 		Try:             a.try,
 		URL:             a.url,
@@ -224,6 +247,9 @@ func (a *attempt) event(res Result, retry bool) TraceEvent {
 	}
 	if e.Time.IsZero() {
 		e.Time = time.Now() // not sent: no request start
+	}
+	if a.challengeRun > 0 {
+		e.ChallengeRun, e.ChallengeLimit = a.challengeRun, ChallengeLimit
 	}
 	if a.code != 0 && a.contentLength >= 0 {
 		n := a.contentLength

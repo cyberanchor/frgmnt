@@ -212,7 +212,7 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 		return ErrNotFound
 	}
 	// Let the run save its last batch before the rows go away.
-	w.stop()
+	w.stop("the worker was deleted")
 	w.wait(stopTimeout)
 	if err := m.store.DeleteWorker(ctx, id); err != nil {
 		return err
@@ -344,6 +344,7 @@ func (m *Manager) Start(ctx context.Context, id string, opt StartOptions) error 
 	now := time.Now()
 	w.mu.Lock()
 	w.cancel = cancel
+	w.stopWhy = ""
 	w.done = done
 	w.startedAt = now
 	w.resume = opt.Resume
@@ -380,7 +381,7 @@ func (m *Manager) Stop(id string) error {
 	if err != nil {
 		return err
 	}
-	w.stop()
+	w.stop("Stop in the panel or the API")
 	return nil
 }
 
@@ -420,7 +421,7 @@ func (m *Manager) CloseAll() {
 	}
 	m.mu.RUnlock()
 	for _, w := range ws {
-		w.stop()
+		w.stop("the server is shutting down")
 	}
 	deadline := time.Now().Add(stopTimeout)
 	for _, w := range ws {
@@ -450,6 +451,7 @@ type Worker struct {
 	resume    bool // set by Start; consumed by run
 	loading   bool // SetInputFrom is storing a new list; Start waits for it
 	cancel    context.CancelFunc
+	stopWhy   string           // why the current run was cancelled (the first reason), for its trace
 	done      chan struct{}    // closed when the current run returns; nil before the first Start
 	chk       *checker.Checker // non-nil while running
 	lastStats checker.Stats    // cached snapshot from the most recent run
@@ -580,11 +582,21 @@ func (w *Worker) StartedAt() time.Time {
 
 // stop cancels the current run, if any. Start replaces w.cancel under w.mu,
 // so it is read under the same lock.
-func (w *Worker) stop() {
-	w.mu.RLock()
+// stop cancels the current run; why goes to its trace ("stop" event).
+func (w *Worker) stop(why string) {
+	w.mu.Lock()
 	cancel := w.cancel
-	w.mu.RUnlock()
+	if w.stopWhy == "" {
+		w.stopWhy = why
+	}
+	w.mu.Unlock()
 	cancel()
+}
+
+func (w *Worker) stopReason() string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.stopWhy
 }
 
 // wait blocks until the current run (if any) has returned, at most d.
@@ -780,7 +792,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 				"read_limit": cfg.ReadLimit, "rl_wait_max_ms": cfg.RLWaitMax.Milliseconds(),
 				"block_cooldown_ms": cfg.BlockCooldown.Milliseconds(), "throttle_max_ms": cfg.ThrottleMax.Milliseconds(),
 				"cache_dir": cfg.CacheDir, "log": m.bus.Level().String(), "trace_bodies": cfg.TraceBodies,
-				"trace_max": maxTraceBytes,
+				"trace_max": maxTraceBytes, "env": tracelog.Environment(), "config": cfg,
 			}})
 		}
 	}
@@ -846,9 +858,12 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	close(pipeDone)
 	<-pipeStopped // no pipeline event after the trace is closed
 	blocked := chk.Blocked()
+	if trace != nil && ctx.Err() != nil && !blocked {
+		trace.Write(checker.TraceEvent{Kind: "stop", Reason: w.stopReason()})
+	}
 	if blocked {
 		// Run gave up early; the producer still waits to hand over a name.
-		w.stop()
+		w.stop("blocked")
 	}
 	close(out)
 	<-batchDone

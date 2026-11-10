@@ -820,6 +820,12 @@ func TestTraceFileJSONLines(t *testing.T) {
 	if events[0].Kind != "run_start" || events[0].Info["version"] != Version || events[0].Info["workers"] != float64(2) {
 		t.Errorf("first event: %+v", events[0])
 	}
+	env, _ := events[0].Info["env"].(map[string]any)
+	cfg, _ := events[0].Info["config"].(map[string]any)
+	if env["go"] == nil || env["pid"] == nil || cfg["workers"] != float64(2) || events[0].Info["args"] == nil ||
+		events[0].Info["schema"] != float64(tracelog.Schema) {
+		t.Errorf("run_start lacks the environment, the config or the arguments: %v", events[0].Info)
+	}
 	if last := events[len(events)-1]; last.Kind != "run_end" || last.Info["checked"] != float64(3) || last.Info["exit_code"] != float64(0) {
 		t.Errorf("last event: %+v", last)
 	}

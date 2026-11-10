@@ -341,6 +341,8 @@ type Checker struct {
 	gate *gate
 
 	connSeq atomic.Int64 // ids of the connections (cid in the trace)
+	nameSeq atomic.Int64 // ids of the checks of names (nid)
+	trySeq  atomic.Int64 // ids of the HTTP requests, tries and probes (aid)
 
 	log Logger // optional detail: the debug lines and the structured trace
 }
@@ -452,12 +454,31 @@ func (c *Checker) Run(ctx context.Context, in <-chan string, out chan<- Result) 
 	var wg sync.WaitGroup
 	for i := 0; i < c.cfg.Workers; i++ {
 		wg.Add(1)
+		wctx := context.WithValue(ctx, workerKey{}, i+1)
 		go func() {
 			defer wg.Done()
-			c.worker(ctx, in, out)
+			c.worker(wctx, in, out)
 		}()
 	}
 	wg.Wait()
+}
+
+// workerKey carries the number of the worker (from 1) to CheckOne, for the
+// trace ("w"); a CheckOne outside Run has none.
+type workerKey struct{}
+
+// nameIDs tie the events of one check of a name together: nid numbers the
+// check, w the worker that runs it (0 outside Run).
+type nameIDs struct {
+	nid int64
+	w   int
+}
+
+// before is what a try of a name waited for after the previous try.
+type before struct {
+	retryDelay time.Duration // the delay before a retry
+	probeWait  time.Duration // the throttle probe (made or waited for)
+	reason     string        // why the previous try was not the last
 }
 
 func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Result) {
@@ -507,6 +528,8 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 // entries are used as a fallback if the network ultimately fails.
 func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	start := time.Now()
+	ids := nameIDs{nid: c.nameSeq.Add(1)}
+	ids.w, _ = ctx.Value(workerKey{}).(int)
 	// This name's own requests on the network, the wait for a connection
 	// (part of Wait), and the work on this machine (parsing, page cache).
 	var net, connWait, work time.Duration
@@ -519,7 +542,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 		res.ConnWait = connWait
 		res.Attempts = tries
 		if c.eventsOn() {
-			c.event(TraceEvent{Kind: "result", Name: res.Username, Status: res.Status,
+			c.event(TraceEvent{Kind: "result", NID: ids.nid, Worker: ids.w, Name: res.Username, Status: res.Status,
 				Confidence: res.Confidence, Evidence: res.Evidence, Offset: res.Offset, Error: res.Error,
 				Attempts: res.Attempts, TookMs: ms(res.Took), NetMs: ms(res.Net), WaitMs: ms(res.Wait),
 				ConnWaitMs: ms(res.ConnWait), WorkMs: ms(res.Work), Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
@@ -558,12 +581,14 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			if c.cache.fresh(st, ent.FetchedAt) {
 				atomic.AddInt64(&c.stats.cacheHits, 1)
 				c.debugf("cache hit: %s -> %s (confidence=%d; %s; %v old)", name, st, conf, ev, age.Round(time.Second))
-				c.event(TraceEvent{Kind: "cache", Name: name, Cache: "hit", Status: st, AgeMs: ms(age), ReadMs: ms(read)})
+				c.event(TraceEvent{Kind: "cache", NID: ids.nid, Worker: ids.w, Name: name, Cache: "hit", Status: st,
+					AgeMs: ms(age), ReadMs: ms(read)})
 				return cached
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
 			c.debugf("cache stale: %s -> %s (%v old); re-checking", name, st, age.Round(time.Second))
-			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "stale", Status: st, AgeMs: ms(age), ReadMs: ms(read)})
+			c.event(TraceEvent{Kind: "cache", NID: ids.nid, Worker: ids.w, Name: name, Cache: "stale", Status: st,
+				AgeMs: ms(age), ReadMs: ms(read)})
 			// Only settled verdicts are served after a network failure: a
 			// sold or taken name rarely changes, while an auction or a sale
 			// seen days ago is likely over.
@@ -573,7 +598,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			}
 		} else {
 			atomic.AddInt64(&c.stats.cacheMisses, 1)
-			e := TraceEvent{Kind: "cache", Name: name, Cache: "miss", ReadMs: ms(read)}
+			e := TraceEvent{Kind: "cache", NID: ids.nid, Worker: ids.w, Name: name, Cache: "miss", ReadMs: ms(read)}
 			if cerr != nil {
 				// An entry that is there but broken used to be a silent
 				// miss: it is checked over the network, and now it shows.
@@ -590,20 +615,35 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	// A try counts against Retries only when it says something about the
 	// name; tries while Fragment throttles this client do not (see
 	// throttled), so a name waits out the pause and is tried again.
+	var next before // what the next try waits for, for its trace event
+	probe := func(maxAge time.Duration) bool {
+		t := time.Now()
+		ok := c.probe(ctx, maxAge, ids)
+		next.probeWait += time.Since(t)
+		return ok
+	}
 	for {
 		var lastErr string
 		var lastRes Result
 		attempts := 0
 		for {
 			tries++
-			r, retry, errStr := c.doRequest(ctx, name, reqURL, tries)
+			r, retry, errStr := c.doRequest(ctx, name, reqURL, tries, ids, next)
+			next = before{}
 			net += r.Net
 			connWait += r.ConnWait
 			work += r.Work
 			if !retry {
 				return r
 			}
-			if r.throttleWait > 0 || (r.Status == StatusReserved && !c.probe(ctx, probeReuse)) {
+			throttledNow := r.throttleWait > 0
+			if throttledNow {
+				next.reason = "throttled: HTTP 429"
+			} else if r.Status == StatusReserved && !probe(probeReuse) {
+				throttledNow = true
+				next.reason = `throttled: "302 /" for the probe too`
+			}
+			if throttledNow {
 				// HTTP 429, or a bare "302 /" while a random free name is
 				// redirected to "/" too: the client is throttled.
 				if c.throttled(r.throttleWait) {
@@ -623,13 +663,16 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			if attempts > c.cfg.Retries || c.blocked.Load() {
 				break // no point in retrying when every answer is a challenge
 			}
+			next.reason = errStr
 			atomic.AddInt64(&c.stats.waitRetry, 1)
+			delayStart := time.Now()
 			select {
 			case <-ctx.Done():
 				atomic.AddInt64(&c.stats.waitRetry, -1)
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}
 			case <-time.After(c.cfg.RetryDelay):
 			}
+			next.retryDelay = time.Since(delayStart)
 			atomic.AddInt64(&c.stats.waitRetry, -1)
 			if c.blocked.Load() {
 				break // found blocked during the pause
@@ -643,7 +686,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			// so their "302 /" proves nothing: the name is checked again
 			// after the pause (it used to end as an error, "persistent 302
 			// /"), and never reported as a false "reserved".
-			if c.probe(ctx, 0) {
+			if probe(0) {
 				c.debugf("@%s: redirect to / persisted after %d attempts; probe healthy -> reserved", name, c.cfg.Retries+1)
 				lastRes.Evidence = fmt.Sprintf("redirect=/ after %d attempts; probe healthy -> reserved", c.cfg.Retries+1)
 				lastRes.Confidence = 60
@@ -652,6 +695,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			if ctx.Err() != nil {
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}
 			}
+			next.reason = `throttled: "302 /" persisted and the probe got it too`
 			if c.throttled(0) {
 				return Result{Username: name, Status: StatusError, Error: c.blockedError(), notSent: true}
 			}
@@ -732,8 +776,9 @@ func (c *Checker) blockedError() string {
 	return "not sent: Fragment blocks this client (Cloudflare challenge)"
 }
 
-func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (res Result, retry bool, errStr string) {
+func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, ids nameIDs, b before) (res Result, retry bool, errStr string) {
 	at := c.newAttempt(kindAttempt, name, try, reqURL)
+	at.ids, at.before = ids, b
 	// Registered first, so it runs last: the network time of this try
 	// includes draining and closing the body; then the try reports itself.
 	defer func() {
@@ -907,6 +952,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 			c.pool.Put(bufPtr)
 			challenged = true
 			c.noteChallenge()
+			at.challengeRun = c.challengeRun.Load()
 			return Result{Username: name, Status: StatusError, Error: "cloudflare challenge",
 				Evidence: pi.Evidence}, true, "cloudflare challenge"
 		}
@@ -965,6 +1011,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 // retried like the 200 interstitial, and counted toward ChallengeLimit.
 func (c *Checker) challengeResult(at *attempt, code int) (Result, bool, string) {
 	c.noteChallenge()
+	at.challengeRun = c.challengeRun.Load()
 	c.debugf("%s Cloudflare challenge (HTTP %d)", at.who(), code)
 	msg := fmt.Sprintf("cloudflare challenge (HTTP %d)", code)
 	return Result{Username: at.name, Status: StatusError, Error: msg,
@@ -1446,17 +1493,27 @@ const probeReuse = time.Second
 // result is reused when it is younger than maxAge (0 = always a new probe).
 // It used to be one request per caller, and every "302 /" also paused all
 // workers for BlockCooldown, about 3 s per attempt of a reserved name.
-func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
-	atomic.AddInt64(&c.stats.waitProbe, 1)
-	defer atomic.AddInt64(&c.stats.waitProbe, -1)
+//
+// Stats.WaitProbe counts the workers waiting for another worker's probe;
+// the one that makes it is on the network (InFlight). It used to count
+// in both.
+func (c *Checker) probe(ctx context.Context, maxAge time.Duration, ids nameIDs) bool {
 	asked := time.Now()
+	atomic.AddInt64(&c.stats.waitProbe, 1)
 	c.probeMu.Lock()
+	atomic.AddInt64(&c.stats.waitProbe, -1)
 	defer c.probeMu.Unlock()
 	if c.probeStarted.After(asked) || (maxAge > 0 && !c.probeDone.IsZero() && time.Since(c.probeDone) < maxAge) {
+		// Another worker's probe answers this one too: say so in the
+		// trace, which otherwise showed a verdict with no probe behind it.
+		if c.eventsOn() {
+			c.event(TraceEvent{Kind: "probe", NID: ids.nid, Worker: ids.w, Reused: true,
+				AgeMs: ms(time.Since(c.probeDone)), WaitMs: ms(time.Since(asked)), Healthy: boolPtr(c.probeOK)})
+		}
 		return c.probeOK
 	}
 	c.probeStarted = time.Now()
-	c.probeOK = c.probeHealthy(ctx)
+	c.probeOK = c.probeHealthy(ctx, ids)
 	c.probeDone = time.Now()
 	if c.probeOK {
 		c.noteHealthy()
@@ -1470,10 +1527,11 @@ func (c *Checker) probe(ctx context.Context, maxAge time.Duration) bool {
 // probe does not wait for a -rate start: it is one request shared by all
 // workers per check, and behind a queue of starts the decision to pause
 // could come many seconds late.
-func (c *Checker) probeHealthy(ctx context.Context) bool {
+func (c *Checker) probeHealthy(ctx context.Context, ids nameIDs) bool {
 	name := fmt.Sprintf("zzprobe%d", time.Now().UnixNano()%1_000_000_000_000)
 	reqURL := fmt.Sprintf(FragmentURLTemplate, url.PathEscape(name))
 	at := c.newAttempt(kindProbe, name, 0, reqURL)
+	at.ids = ids // the name whose answer asked for the probe
 	healthy, why := false, ""
 	defer func() {
 		at.done()

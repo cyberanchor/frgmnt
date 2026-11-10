@@ -22,6 +22,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -477,6 +479,32 @@ func Decode(r io.Reader) ([]checker.TraceEvent, error) {
 		return out, err
 	}
 	return out, nil
+}
+
+// Environment describes the process for run_start: the build (Go
+// version, module, VCS revision), the machine (OS, CPUs) and the runtime
+// settings, so a trace says what produced it.
+func Environment() map[string]any {
+	env := map[string]any{
+		"go": runtime.Version(), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
+		"num_cpu": runtime.NumCPU(), "gomaxprocs": runtime.GOMAXPROCS(0), "pid": os.Getpid(),
+	}
+	if v := os.Getenv("GODEBUG"); v != "" {
+		env["godebug"] = v
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		env["module"] = bi.Main.Path
+		if bi.Main.Version != "" {
+			env["module_version"] = bi.Main.Version
+		}
+		for _, st := range bi.Settings {
+			switch st.Key {
+			case "vcs.revision", "vcs.time", "vcs.modified", "-trimpath", "CGO_ENABLED", "-race":
+				env[st.Key] = st.Value
+			}
+		}
+	}
+	return env
 }
 
 // StatsInfo turns the engine's counters into the info of a run_end event.

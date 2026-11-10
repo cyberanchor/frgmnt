@@ -889,7 +889,7 @@ func Main(args []string) int {
 			"read_limit": eff.ReadLimit, "rl_wait_max_ms": eff.RLWaitMax.Milliseconds(),
 			"block_cooldown_ms": eff.BlockCooldown.Milliseconds(), "throttle_max_ms": eff.ThrottleMax.Milliseconds(),
 			"cache_dir": eff.CacheDir, "log": logLevel.String(), "trace_bodies": eff.TraceBodies,
-			"trace_max": int64(traceMax),
+			"trace_max": int64(traceMax), "env": tracelog.Environment(), "config": eff, "args": args,
 		}})
 	}
 
@@ -915,6 +915,9 @@ func Main(args []string) int {
 			// used to be swallowed, so a stuck shutdown could not be ended.
 			signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 			log.Printf("[INFO] received signal %s, shutting down gracefully… (press Ctrl+C again to quit at once)", sig)
+			if trace != nil {
+				trace.Write(checker.TraceEvent{Kind: "stop", Reason: "signal " + sig.String()})
+			}
 			cancel()
 		case <-ctx.Done():
 		}

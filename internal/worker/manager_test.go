@@ -60,6 +60,17 @@ func (f *fakeFragment) hitsFor(name string) int {
 	return f.hits[name]
 }
 
+// total is the number of requests so far.
+func (f *fakeFragment) total() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, h := range f.hits {
+		n += h
+	}
+	return n
+}
+
 // harness is a Manager on a fresh store with the page cache off, plus a
 // counter of ERROR events published on the bus.
 type harness struct {
@@ -991,6 +1002,54 @@ func TestTileTraceFile(t *testing.T) {
 	}
 	if files := tracelog.Files(h.m.TracePath(w.ID())); len(files) != 0 {
 		t.Errorf("trace files after Delete: %v, want none", files)
+	}
+}
+
+// A run stopped from the panel ended its trace with run_end and nothing
+// said why it ended early. A "stop" event names the reason.
+func TestTileTraceSaysWhyItStopped(t *testing.T) {
+	fake := newFakeFragment(t, 200*time.Millisecond)
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg := testConfig(1)
+	cfg.Trace = true
+	w, err := h.m.Create(ctx, "stopped", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); fake.total() == 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := h.m.Stop(w.ID()); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not stop")
+	}
+	events, err := tracelog.ReadAll(h.m.TraceFiles(w.ID())...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stop *checker.TraceEvent
+	for i := range events {
+		if events[i].Kind == "stop" {
+			stop = &events[i]
+		}
+	}
+	if stop == nil || stop.Reason != "Stop in the panel or the API" {
+		t.Fatalf("stop event %+v", stop)
+	}
+	if last := events[len(events)-1]; last.Kind != "run_end" || last.Info["stopped"] != true {
+		t.Errorf("last event %+v", last)
+	}
+	if env, _ := events[0].Info["env"].(map[string]any); env["go"] == nil || events[0].Info["config"] == nil {
+		t.Errorf("run_start lacks env or config: %v", events[0].Info)
 	}
 }
 

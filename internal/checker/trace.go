@@ -75,12 +75,17 @@ const (
 // reads), and the request reports itself once at the end: a -debug line,
 // and the structured trace.
 type attempt struct {
-	c     *Checker
-	kind  string
-	name  string
-	try   int // HTTP try of the name, from 1; 0 for a probe
-	url   string
-	waits waits // before the request: the gate, a shared pause, a -rate start
+	c      *Checker
+	kind   string
+	name   string
+	try    int // HTTP try of the name, from 1; 0 for a probe
+	url    string
+	aid    int64   // numbers every request of the checker
+	ids    nameIDs // the check of a name it belongs to
+	before before  // what it waited for after the previous try
+	waits  waits   // before the request: the gate, a shared pause, a -rate start
+
+	challengeRun int64 // challenges in a row, this one included (see ChallengeLimit)
 
 	// Set on the goroutine of the request.
 	start, end    time.Time // request sent .. body drained
@@ -154,7 +159,7 @@ type waits struct {
 func (w waits) total() time.Duration { return w.gate + w.pause + w.rate }
 
 func (c *Checker) newAttempt(kind, name string, try int, url string) *attempt {
-	return &attempt{c: c, kind: kind, name: name, try: try, url: url}
+	return &attempt{c: c, kind: kind, name: name, try: try, url: url, aid: c.trySeq.Add(1)}
 }
 
 // who names the request in log lines: "@name #2", or "probe zzprobe…".
