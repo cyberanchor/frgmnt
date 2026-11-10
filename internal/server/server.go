@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/auth"
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/profiling"
 	"github.com/cyberanchor/frgmnt/internal/store"
 	"github.com/cyberanchor/frgmnt/internal/version"
 	"github.com/cyberanchor/frgmnt/internal/worker"
@@ -39,6 +41,7 @@ type Server struct {
 	keeper     *auth.Keeper // nil: no access tokens (tests)
 	tlsCert    string       // PEM files for HTTPS; "" = plain HTTP
 	tlsKey     string
+	pprof      bool // /debug/pprof/ is served (behind the login)
 	mux        *http.ServeMux
 	handler    http.Handler // mux behind guard() and requireToken()
 }
@@ -60,6 +63,10 @@ type Options struct {
 	// TLSCert and TLSKey are PEM files; when set, Run serves HTTPS and
 	// reads the files again when they change (certificate renewals).
 	TLSCert, TLSKey string
+
+	// Pprof serves the pprof endpoints under /debug/pprof/, behind the
+	// login like everything else (frgmnt web -pprof).
+	Pprof bool
 }
 
 // New assembles a Server but does NOT start listening.
@@ -74,10 +81,15 @@ func New(opt Options) *Server {
 		keeper:     opt.Auth,
 		tlsCert:    opt.TLSCert,
 		tlsKey:     opt.TLSKey,
+		pprof:      opt.Pprof,
 		mux:        http.NewServeMux(),
 	}
 	s.routes()
-	s.handler = s.accessLog(s.guard(s.requireToken(s.mux)))
+	var h http.Handler = s.mux
+	if s.pprof {
+		h = labelHTTP(h)
+	}
+	s.handler = s.accessLog(s.guard(s.requireToken(h)))
 	return s
 }
 
@@ -307,6 +319,16 @@ func (s *Server) accessLog(next http.Handler) http.Handler {
 	})
 }
 
+// labelHTTP puts the requests to the panel under the pprof label
+// component=http-api, apart from the checks in a profile.
+func labelHTTP(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rpprof.Do(r.Context(), rpprof.Labels("component", "http-api"), func(ctx context.Context) {
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	})
+}
+
 // Handler returns the underlying http.Handler (useful for tests).
 func (s *Server) Handler() http.Handler { return s.handler }
 
@@ -477,6 +499,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/workers-bulk/stop", s.handleBulkStop)
 	s.mux.HandleFunc("/api/logs", s.handleLogs)
 	s.mux.HandleFunc("/api/logs/stream", s.handleLogStream)
+	if s.pprof {
+		// CPU, heap, goroutines, block and mutex contention, the execution
+		// trace; behind requireToken like every other path.
+		s.mux.Handle("/debug/pprof/", profiling.Handler())
+	}
+
 	// Unknown API paths get a JSON error like the rest of the API (they
 	// fell through to the UI handler's plain-text 404).
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

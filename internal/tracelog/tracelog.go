@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	rpprof "runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -52,6 +54,10 @@ var flushEvery = time.Second
 // freeSpace reports the free space of the file system holding dir; ok is
 // false where it cannot be read. A variable so tests can fake a full disk.
 var freeSpace = diskFree
+
+// FreeSpace reports the space left on the file system holding dir (Linux;
+// ok is false elsewhere). The execution trace uses it too.
+func FreeSpace(dir string) (int64, bool) { return freeSpace(dir) }
 
 // Options configure Open.
 type Options struct {
@@ -190,7 +196,7 @@ func Open(path string, opt Options) (*Writer, error) {
 		return nil, err
 	}
 	t.seg = seg
-	go t.run()
+	go rpprof.Do(context.Background(), rpprof.Labels("component", "trace-writer"), func(context.Context) { t.run() })
 	return t, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	rpprof "runtime/pprof"
 	"sync"
 	"time"
 
@@ -695,6 +696,10 @@ func (w *Worker) endLoad() {
 // -----------------------------------------------------------------------------
 
 func (m *Manager) run(ctx context.Context, w *Worker) {
+	// pprof shows this run's goroutines (the checks, the producer, the
+	// persister) under the tile's id.
+	ctx = rpprof.WithLabels(ctx, rpprof.Labels("tile", w.id))
+	rpprof.SetGoroutineLabels(ctx)
 	cfg := m.applyCache(w.Config())
 	w.mu.RLock()
 	resume := w.resume
@@ -837,7 +842,9 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 
 	// Persister goroutine: batch writes to SQLite.
 	batchDone := make(chan struct{})
-	go m.persister(ctx, w, out, batchDone, trace)
+	go rpprof.Do(ctx, rpprof.Labels("component", "persister"), func(context.Context) {
+		m.persister(ctx, w, out, batchDone, trace)
+	})
 
 	// With a trace, the state of the run once a second: the queues and
 	// what the workers do.

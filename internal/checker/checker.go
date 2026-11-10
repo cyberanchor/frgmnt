@@ -17,6 +17,8 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptrace"
 	"net/url"
+	rpprof "runtime/pprof"
+	rtrace "runtime/trace"
 	"strconv"
 	"strings"
 	"sync"
@@ -457,7 +459,11 @@ func (c *Checker) Run(ctx context.Context, in <-chan string, out chan<- Result) 
 		wctx := context.WithValue(ctx, workerKey{}, i+1)
 		go func() {
 			defer wg.Done()
-			c.worker(wctx, in, out)
+			// pprof shows the CPU, blocking and goroutines of the checks
+			// under this label (plus the host's, e.g. the panel's tile).
+			rpprof.Do(wctx, rpprof.Labels("component", "check-worker"), func(ctx context.Context) {
+				c.worker(ctx, in, out)
+			})
 		}()
 	}
 	wg.Wait()
@@ -528,6 +534,14 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 // entries are used as a fallback if the network ultimately fails.
 func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	start := time.Now()
+	if rtrace.IsEnabled() {
+		// In an execution trace (-exectrace, /debug/pprof/trace) every
+		// check is a task with the regions of its steps.
+		var task *rtrace.Task
+		ctx, task = rtrace.NewTask(ctx, "check")
+		defer task.End()
+		rtrace.Log(ctx, "name", raw)
+	}
 	ids := nameIDs{nid: c.nameSeq.Add(1)}
 	ids.w, _ = ctx.Value(workerKey{}).(int)
 	// This name's own requests on the network, the wait for a connection
@@ -557,7 +571,9 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	var stale *Result
 	if c.cache != nil {
 		readStart := time.Now()
+		reg := rtrace.StartRegion(ctx, "cache")
 		ent, body, ok, cerr := c.cache.get(name)
+		reg.End()
 		read := time.Since(readStart)
 		work += read
 		if ok {
@@ -618,7 +634,9 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	var next before // what the next try waits for, for its trace event
 	probe := func(maxAge time.Duration) bool {
 		t := time.Now()
+		reg := rtrace.StartRegion(ctx, "probe")
 		ok := c.probe(ctx, maxAge, ids)
+		reg.End()
 		next.probeWait += time.Since(t)
 		return ok
 	}
@@ -666,12 +684,15 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			next.reason = errStr
 			atomic.AddInt64(&c.stats.waitRetry, 1)
 			delayStart := time.Now()
+			reg := rtrace.StartRegion(ctx, "retry-delay")
 			select {
 			case <-ctx.Done():
+				reg.End()
 				atomic.AddInt64(&c.stats.waitRetry, -1)
 				return Result{Username: name, Status: StatusError, Error: "cancelled"}
 			case <-time.After(c.cfg.RetryDelay):
 			}
+			reg.End()
 			next.retryDelay = time.Since(delayStart)
 			atomic.AddInt64(&c.stats.waitRetry, -1)
 			if c.blocked.Load() {
@@ -726,13 +747,16 @@ func (c *Checker) admit(ctx context.Context) (release func(), w waits, err error
 	for {
 		t0 := time.Now()
 		atomic.AddInt64(&c.stats.waitGate, 1)
+		reg := rtrace.StartRegion(ctx, "gate")
 		t, err := c.gate.pass(ctx, c.blockedCh)
+		reg.End()
 		atomic.AddInt64(&c.stats.waitGate, -1)
 		w.gate += time.Since(t0)
 		if err != nil {
 			return nil, w, err
 		}
 		t1 := time.Now()
+		reg = rtrace.StartRegion(ctx, "pause")
 		if c.paused() {
 			atomic.AddInt64(&c.stats.waitPause, 1)
 			err = c.waitBlock(ctx)
@@ -740,6 +764,7 @@ func (c *Checker) admit(ctx context.Context) (release func(), w waits, err error
 		} else {
 			err = c.waitBlock(ctx)
 		}
+		reg.End()
 		w.pause += time.Since(t1)
 		if err != nil {
 			t.release()
@@ -747,7 +772,9 @@ func (c *Checker) admit(ctx context.Context) (release func(), w waits, err error
 		}
 		t2 := time.Now()
 		atomic.AddInt64(&c.stats.waitRate, 1)
+		reg = rtrace.StartRegion(ctx, "rate")
 		err = c.limiter.Wait(ctx, c.blockedCh)
+		reg.End()
 		atomic.AddInt64(&c.stats.waitRate, -1)
 		w.rate += time.Since(t2)
 		if err != nil {
@@ -819,7 +846,9 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, i
 	at.begin(req)
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), at.clientTrace()))
 
+	reg := rtrace.StartRegion(ctx, "http")
 	resp, err := c.client.Do(req)
+	reg.End()
 	if err != nil {
 		c.debugf("%s REQUEST FAILED: %v (%.0fms)", at.who(), err, ms(time.Since(at.start)))
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -839,6 +868,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, i
 	var bodyReader io.Reader = raw
 	var gz *gzip.Reader
 	defer func() {
+		defer rtrace.StartRegion(ctx, "drain").End()
 		if at.wantBody(res) {
 			at.keepBody(bodyReader)
 		}
@@ -929,7 +959,9 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, i
 		} else {
 			buf = buf[:c.cfg.ReadLimit]
 		}
+		reg := rtrace.StartRegion(ctx, "body")
 		n, readErr := io.ReadFull(io.LimitReader(bodyReader, int64(c.cfg.ReadLimit)), buf)
+		reg.End()
 		at.bodyDone, at.bytes = time.Now(), n
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			readErr = nil
@@ -943,7 +975,9 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, i
 		}
 		c.debugf("%s body: %d bytes read (limit %d)", at.who(), n, c.cfg.ReadLimit)
 		parseStart := time.Now()
+		reg = rtrace.StartRegion(ctx, "parse")
 		pi := ParseStatusDetailed(body)
+		reg.End()
 		at.parse = time.Since(parseStart)
 		at.work += at.parse
 		at.keepHead(body, !pi.Found || pi.Challenge)
@@ -962,7 +996,9 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int, i
 			// Best-effort: never let a read-only cache directory fail a
 			// check. The error is in the trace and the debug line.
 			t := time.Now()
+			reg := rtrace.StartRegion(ctx, "cache-write")
 			err := c.cache.put(name, reqURL, pi, body)
+			reg.End()
 			at.cacheWrite = time.Since(t)
 			at.work += at.cacheWrite
 			switch {

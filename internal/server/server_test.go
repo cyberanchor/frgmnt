@@ -622,6 +622,31 @@ func TestAccessLogAtDebug(t *testing.T) {
 	}
 }
 
+// frgmnt web -pprof serves pprof under /debug/pprof/ behind the login;
+// without the flag there is nothing there.
+func TestPprofBehindTheLogin(t *testing.T) {
+	keeper, _, err := auth.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, _, _ := keeper.Issue("laptop", time.Hour)
+	hdr := map[string]string{"Authorization": "Bearer " + good}
+	s, _ := newTestServerWith(t, func(o *Options) { o.Auth = keeper; o.Pprof = true })
+	if rec := do(t, s, "GET", "/debug/pprof/", "", "", nil); rec.Code != http.StatusSeeOther {
+		t.Errorf("without a token: %d, want a redirect to the login", rec.Code)
+	}
+	if rec := do(t, s, "GET", "/debug/pprof/", "", "", hdr); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "goroutine") {
+		t.Errorf("with a token: %d %.100s", rec.Code, rec.Body.String())
+	}
+	if rec := do(t, s, "GET", "/debug/pprof/heap?debug=1", "", "", hdr); rec.Code != http.StatusOK {
+		t.Errorf("heap profile: %d", rec.Code)
+	}
+	off, _ := newTestServerWith(t, func(o *Options) { o.Auth = keeper })
+	if rec := do(t, off, "GET", "/debug/pprof/", "", "", hdr); rec.Code != http.StatusNotFound {
+		t.Errorf("without -pprof: %d, want 404", rec.Code)
+	}
+}
+
 // The panel had no login: anyone who could reach it (through ssh -L or a
 // domain) could create, start and delete workers and read every result.
 // Now every request needs an access token, except the login page.

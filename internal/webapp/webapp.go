@@ -29,6 +29,7 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/auth"
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/profiling"
 	"github.com/cyberanchor/frgmnt/internal/server"
 	"github.com/cyberanchor/frgmnt/internal/staticfs"
 	"github.com/cyberanchor/frgmnt/internal/store"
@@ -58,6 +59,7 @@ func Main(args []string) int {
 		allowHosts   = fs.String("allow-host", "", "comma-separated host names the panel answers to besides localhost, e.g. the domain of a reverse proxy")
 		tlsCert      = fs.String("tls-cert", "", "PEM certificate (full chain) to serve HTTPS; reloaded when the file changes")
 		tlsKey       = fs.String("tls-key", "", "PEM private key for -tls-cert")
+		pprofOn      = fs.Bool("pprof", false, "serve pprof under /debug/pprof/ behind the login (CPU, heap, goroutines, block and mutex contention, execution trace)")
 		showVer      = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -135,7 +137,12 @@ func Main(args []string) int {
 		Auth:       keeper,
 		TLSCert:    *tlsCert,
 		TLSKey:     *tlsKey,
+		Pprof:      *pprofOn,
 	})
+	if *pprofOn {
+		profiling.EnableContention()
+		bus.Publish(logbus.LevelInfo, "", "pprof at /debug/pprof/ (behind the login; block and mutex profiles on)")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -1220,3 +1220,41 @@ func TestTraceCoversInputAndOutput(t *testing.T) {
 		t.Errorf("run_end shutdown %v", end.Info["shutdown"])
 	}
 }
+
+// -cpuprofile, -memprofile and -exectrace write their files (pprof files
+// are gzip, an execution trace starts with "go 1."); -pprof serves the
+// endpoints during the run; a profile on a file of the run is refused.
+func TestProfilingFlags(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, []byte("alice\ncarol\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	cpu, mem, exec := filepath.Join(dir, "cpu.pprof"), filepath.Join(dir, "mem.pprof"), filepath.Join(dir, "exec.trace")
+	if code := Main([]string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-workers", "1",
+		"-cpuprofile", cpu, "-memprofile", mem, "-exectrace", exec, "-pprof", "127.0.0.1:0"}); code != 0 {
+		t.Fatalf("exit %d\n%s", code, logs.String())
+	}
+	for _, f := range []string{cpu, mem} {
+		raw, err := os.ReadFile(f)
+		if err != nil || len(raw) < 2 || raw[0] != 0x1f || raw[1] != 0x8b {
+			t.Errorf("%s is not a pprof file (%v)", f, err)
+		}
+	}
+	if raw, err := os.ReadFile(exec); err != nil || !strings.HasPrefix(string(raw), "go 1.") {
+		t.Errorf("%s is not an execution trace (%v)", exec, err)
+	}
+	for _, want := range []string{"pprof on http://127.0.0.1:", "CPU profile in " + cpu, "heap profile in " + mem, "execution trace: "} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("no %q in the log:\n%s", want, logs.String())
+		}
+	}
+	if code := Main([]string{"-input", in, "-output", out, "-cpuprofile", out}); code != 2 {
+		t.Errorf("-cpuprofile on the output: exit %d, want 2", code)
+	}
+}

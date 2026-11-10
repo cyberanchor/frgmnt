@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -51,6 +52,7 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/profiling"
 	"github.com/cyberanchor/frgmnt/internal/rtstats"
 	"github.com/cyberanchor/frgmnt/internal/tracelog"
 	"github.com/cyberanchor/frgmnt/internal/version"
@@ -794,6 +796,10 @@ func Main(args []string) int {
 		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines (gzip when it ends in .gz): every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
 		traceOld  = fs.String("trace-file", "", "Deprecated spelling of -trace FILE")
 		traceBody = fs.String("trace-bodies", checker.BodiesAnomalies, "Pages the -trace keeps, whole and decoded (up to 1 MB each): anomalies (unknown answers, challenges, unexpected codes, errors), all, or none")
+		pprofAddr = fs.String("pprof", "", "Serve pprof on `ADDR` while the run goes on, e.g. 127.0.0.1:6060 (/debug/pprof/: CPU, heap, goroutines, block and mutex contention, execution trace)")
+		cpuProf   = fs.String("cpuprofile", "", "Write a CPU profile of the run to `FILE` (go tool pprof FILE)")
+		memProf   = fs.String("memprofile", "", "Write the heap profile at the end of the run to `FILE` (live and allocated memory: go tool pprof [-sample_index=alloc_space] FILE)")
+		execTrace = fs.String("exectrace", "", "Write the execution trace of the run to `FILE` (go tool trace FILE): every goroutine switch, network wait, syscall and GC, with a task per name; it stops at -trace-max or when the disk runs low")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
 	traceMax := byteSize(1 << 30)
@@ -836,6 +842,17 @@ func Main(args []string) int {
 	if *inputPath == "" || *outputPath == "" {
 		printUsage(fs)
 		return 2
+	}
+	for _, f := range []struct{ flag, path string }{{"-cpuprofile", *cpuProf}, {"-memprofile", *memProf}, {"-exectrace", *execTrace}} {
+		if f.path == "" {
+			continue
+		}
+		for _, other := range []string{*inputPath, *outputPath, tracePath} {
+			if other != "" && other != "-" && sameFile(f.path, other) {
+				log.Printf("[ERROR] %s %s is a file of the run; write it to another file", f.flag, f.path)
+				return 2
+			}
+		}
 	}
 	if *baseURL != "" {
 		checker.FragmentURLTemplate = strings.TrimRight(*baseURL, "/") + "/username/%s"
@@ -991,6 +1008,14 @@ func Main(args []string) int {
 	log.Printf("%s v%s | workers=%d conns=%d retries=%d retry-delay=%v rate=%d timeout=%v filter=%s log=%s",
 		ProgName, Version, eff.Workers, eff.MaxConns, eff.Retries, eff.RetryDelay, eff.RateRPS, eff.Timeout, filterStr, levelName)
 
+	// --- Profiling: pprof, the CPU profile, the execution trace ---
+	// Started before the run so they cover all of it.
+	stopProfiling, err := startProfiling(*pprofAddr, *cpuProf, *execTrace, int64(traceMax))
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		return 2
+	}
+
 	// --- Context and signals ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1021,13 +1046,16 @@ func Main(args []string) int {
 
 	// --- Output writer (lives until close(results), independent of ctx) ---
 	writeDone := make(chan error, 1)
-	go func() { writeDone <- writeResults(results, out, filter, *quiet, stats) }()
+	go rpprof.Do(ctx, rpprof.Labels("component", "writer"), func(context.Context) {
+		writeDone <- writeResults(results, out, filter, *quiet, stats)
+	})
 
 	// --- Progress reporter ---
 	progCtx, progCancel := context.WithCancel(ctx)
 	progDone := make(chan struct{})
 	go func() {
 		defer close(progDone)
+		rpprof.SetGoroutineLabels(rpprof.WithLabels(progCtx, rpprof.Labels("component", "progress")))
 		runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace, out.st)
 	}()
 
@@ -1051,6 +1079,7 @@ func Main(args []string) int {
 		}
 	}
 	go func() {
+		rpprof.SetGoroutineLabels(rpprof.WithLabels(ctx, rpprof.Labels("component", "producer")))
 		readStart := time.Now()
 		rejected, err := produceUsernames(ctx, inCount, tasks, !*noDedup, skip, stats, onSkip)
 		if rejected > 0 {
@@ -1118,6 +1147,16 @@ func Main(args []string) int {
 		if err := checkedFile.Close(); err != nil {
 			log.Printf("[ERROR] closing %s: %v", checkedPath, err)
 			exitCode = 1
+		}
+	}
+
+	// --- Profiles ---
+	stopProfiling()
+	if *memProf != "" {
+		if err := profiling.WriteHeap(*memProf); err != nil {
+			log.Printf("[ERROR] -memprofile: %v", err)
+		} else {
+			log.Printf("[INFO] heap profile in %s (go tool pprof %s; -sample_index=alloc_space for all allocations)", *memProf, *memProf)
 		}
 	}
 
@@ -1233,6 +1272,65 @@ func fmtBytes(n int64) string {
 		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
 	}
 	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+}
+
+// startProfiling starts what the profiling flags ask for and returns the
+// function that ends it and reports the files. pprof turns on the block
+// and mutex profiles too.
+func startProfiling(pprofAddr, cpuPath, execPath string, execMax int64) (stop func(), err error) {
+	var stops []func()
+	stop = func() {
+		for i := len(stops) - 1; i >= 0; i-- {
+			stops[i]()
+		}
+	}
+	if pprofAddr != "" {
+		if !profiling.IsLoopback(pprofAddr) {
+			log.Printf("[WARN] -pprof %s can be reached from other machines: pprof shows the command line, "+
+				"the stack of every goroutine and the memory profile", pprofAddr)
+		}
+		profiling.EnableContention()
+		addr, stopServer, err := profiling.Serve(pprofAddr)
+		if err != nil {
+			stop()
+			return nil, fmt.Errorf("-pprof: %w", err)
+		}
+		log.Printf("[INFO] pprof on http://%s/debug/pprof/ (block and mutex profiles on)", addr)
+		stops = append(stops, stopServer)
+	}
+	if cpuPath != "" {
+		stopCPU, err := profiling.StartCPU(cpuPath)
+		if err != nil {
+			stop()
+			return nil, fmt.Errorf("-cpuprofile: %w", err)
+		}
+		stops = append(stops, func() {
+			if err := stopCPU(); err != nil {
+				log.Printf("[ERROR] -cpuprofile: %v", err)
+				return
+			}
+			log.Printf("[INFO] CPU profile in %s (go tool pprof %s)", cpuPath, cpuPath)
+		})
+	}
+	if execPath != "" {
+		et, err := profiling.StartExecTrace(execPath, execMax, traceMinFree)
+		if err != nil {
+			stop()
+			return nil, fmt.Errorf("-exectrace: %w", err)
+		}
+		stops = append(stops, func() {
+			n, early, err := et.Stop()
+			switch {
+			case err != nil:
+				log.Printf("[ERROR] -exectrace: %v", err)
+			case early != "":
+				log.Printf("[WARN] the execution trace %s stopped before the end of the run: it %s (%s)", execPath, early, fmtBytes(n))
+			default:
+				log.Printf("[INFO] execution trace: %s in %s (go tool trace %s)", fmtBytes(n), execPath, execPath)
+			}
+		})
+	}
+	return stop, nil
 }
 
 // maxSkipEvents caps the input_skip events of a run (a list can hold
