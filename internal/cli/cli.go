@@ -924,6 +924,41 @@ func Main(args []string) int {
 		log.Printf("[resume] loaded %d already-processed names", skip.Len())
 	}
 
+	// --- Diagnostic files: the TLS key log, the trace, the profiles ---
+	// Opened before the output, which is truncated when it opens: a typo
+	// in one of these paths used to wipe the results of the previous run
+	// before the error was reported.
+	var keyLogFile *os.File
+	if *keyLog != "" {
+		f, err := os.OpenFile(*keyLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Printf("[ERROR] -tls-keylog: %v", err)
+			return 2
+		}
+		defer f.Close()
+		keyLogFile = f
+		log.Printf("[WARN] -tls-keylog: the TLS keys of every connection go to %s; with a capture of the traffic "+
+			"they decrypt all of it. Keep the file private and delete it after use", *keyLog)
+	}
+	var trace *tracelog.Writer
+	if tracePath != "" {
+		trace, err = tracelog.Open(tracePath, tracelog.Options{
+			Append: *appendFlag || *resume, MaxBytes: int64(traceMax), MinFree: traceMinFree,
+		})
+		if err != nil {
+			log.Printf("[ERROR] -trace: %v", err)
+			return 2
+		}
+	}
+	stopProfiling, err := startProfiling(*pprofAddr, *cpuProf, *execTrace, *memProf, int64(traceMax))
+	if err != nil {
+		log.Printf("[ERROR] %v", err)
+		if trace != nil {
+			_, _ = trace.Close()
+		}
+		return 2
+	}
+
 	// --- Open output ---
 	flags := os.O_CREATE | os.O_WRONLY
 	if *appendFlag || *resume {
@@ -938,6 +973,9 @@ func Main(args []string) int {
 	out := outputs{
 		file:   bufio.NewWriterSize(outFile, 64*1024),
 		stdout: bufio.NewWriterSize(os.Stdout, 64*1024),
+	}
+	if trace != nil {
+		out.st = new(outStats)
 	}
 	var checkedFile *os.File
 	if filter != nil {
@@ -963,16 +1001,8 @@ func Main(args []string) int {
 	cfg.ReadLimit = *readLimitF
 	cfg.InsecureTLS = *insecure
 	cfg.TraceBodies = *traceBody
-	if *keyLog != "" {
-		f, err := os.OpenFile(*keyLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			log.Printf("[ERROR] -tls-keylog: %v", err)
-			return 2
-		}
-		defer f.Close()
-		cfg.KeyLog = f
-		log.Printf("[WARN] -tls-keylog: the TLS keys of every connection go to %s; with a capture of the traffic "+
-			"they decrypt all of it. Keep the file private and delete it after use", *keyLog)
+	if keyLogFile != nil {
+		cfg.KeyLog = keyLogFile
 	}
 	if !*noCache {
 		cfg.CacheDir = *cacheDir
@@ -985,17 +1015,8 @@ func Main(args []string) int {
 	if logLevel >= LevelDebug {
 		logger.Debugf = debugf
 	}
-	var trace *tracelog.Writer
-	if tracePath != "" {
-		trace, err = tracelog.Open(tracePath, tracelog.Options{
-			Append: *appendFlag || *resume, MaxBytes: int64(traceMax), MinFree: traceMinFree,
-		})
-		if err != nil {
-			log.Printf("[ERROR] -trace: %v", err)
-			return 2
-		}
+	if trace != nil {
 		logger.Event = trace.Write
-		out.st = new(outStats)
 	}
 	chk.SetLogger(logger)
 	eff := chk.Config()
@@ -1020,14 +1041,6 @@ func Main(args []string) int {
 	}
 	log.Printf("%s v%s | workers=%d conns=%d retries=%d retry-delay=%v rate=%d timeout=%v filter=%s log=%s",
 		ProgName, Version, eff.Workers, eff.MaxConns, eff.Retries, eff.RetryDelay, eff.RateRPS, eff.Timeout, filterStr, levelName)
-
-	// --- Profiling: pprof, the CPU profile, the execution trace ---
-	// Started before the run so they cover all of it.
-	stopProfiling, err := startProfiling(*pprofAddr, *cpuProf, *execTrace, int64(traceMax))
-	if err != nil {
-		log.Printf("[ERROR] %v", err)
-		return 2
-	}
 
 	// --- Context and signals ---
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1292,13 +1305,21 @@ func fmtBytes(n int64) string {
 
 // startProfiling starts what the profiling flags ask for and returns the
 // function that ends it and reports the files. pprof turns on the block
-// and mutex profiles too.
-func startProfiling(pprofAddr, cpuPath, execPath string, execMax int64) (stop func(), err error) {
+// and mutex profiles too. The heap profile is written at the end of the
+// run; its file is created here, so a bad path fails before the run.
+func startProfiling(pprofAddr, cpuPath, execPath, memPath string, execMax int64) (stop func(), err error) {
 	var stops []func()
 	stop = func() {
 		for i := len(stops) - 1; i >= 0; i-- {
 			stops[i]()
 		}
+	}
+	if memPath != "" {
+		f, err := os.OpenFile(memPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("-memprofile: %w", err)
+		}
+		f.Close()
 	}
 	if pprofAddr != "" {
 		if !profiling.IsLoopback(pprofAddr) {

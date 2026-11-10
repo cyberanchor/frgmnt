@@ -1294,3 +1294,44 @@ func TestTLSKeyLogFlag(t *testing.T) {
 		t.Errorf("no warning:\n%s", logs.String())
 	}
 }
+
+// A bad path in -trace, -tls-keylog, -cpuprofile, -memprofile or
+// -exectrace, or a -pprof address that cannot be listened on, stopped the
+// run with exit 2 after the output file had been opened with O_TRUNC: the
+// results of the previous run were gone. Those files are opened before
+// the output now.
+func TestBadDiagnosticFlagsKeepTheOutput(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, []byte("alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const kept = "@previous | taken\n"
+	nowhere := filepath.Join(dir, "no-such-dir")
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	for _, flags := range [][]string{
+		{"-trace", filepath.Join(nowhere, "t.jsonl")},
+		{"-tls-keylog", filepath.Join(nowhere, "k.log")},
+		{"-cpuprofile", filepath.Join(nowhere, "c.pprof")},
+		{"-memprofile", filepath.Join(nowhere, "m.pprof")},
+		{"-exectrace", filepath.Join(nowhere, "e.trace")},
+		{"-pprof", "127.0.0.1:99999"},
+	} {
+		if err := os.WriteFile(out, []byte(kept), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		args := append([]string{"-input", in, "-output", out, "-base-url", "http://127.0.0.1:9", "-no-cache"}, flags...)
+		if code := Main(args); code != 2 {
+			t.Errorf("%v: exit %d, want 2", flags, code)
+		}
+		if got, _ := os.ReadFile(out); string(got) != kept {
+			t.Errorf("%v: the output file holds %q, want the previous results kept", flags, got)
+		}
+		if !strings.Contains(logs.String(), "[ERROR] "+flags[0]) {
+			t.Errorf("%v: no error naming the flag:\n%s", flags, logs.String())
+		}
+	}
+}
