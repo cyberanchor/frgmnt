@@ -831,11 +831,12 @@ func TestThrottledRunStopsWithItsOwnMessage(t *testing.T) {
 	}
 }
 
-// The panel gave the engine a logger with warnings only, so the debug and
-// trace levels of the Logs tab showed no HTTP detail. The engine's debug
-// and trace lines reach the tile's log now, and follow the level of the
-// bus when it changes: nothing at info, a line per try at debug, every
-// step at trace.
+// The panel gave the engine a logger with warnings only, so the debug
+// level of the Logs tab showed no HTTP detail. The engine's debug lines
+// reach the tile's log now and follow the level of the bus when it
+// changes: nothing at info, a line per try at debug. The old trace level
+// is the same as debug (every step of every request is in the worker's
+// trace file instead).
 func TestEngineDetailFollowsTheLogLevel(t *testing.T) {
 	newFakeFragment(t, 0)
 	h := newHarness(t)
@@ -890,10 +891,12 @@ func TestEngineDetailFollowsTheLogLevel(t *testing.T) {
 	if !strings.Contains(joined, "#1 | -> free | 302 HTTP/1.1 |") || !strings.Contains(joined, "net=") {
 		t.Errorf("debug lines lack the per-try timing line:\n%s", joined)
 	}
+	before := count("DEBUG")
 	h.bus.SetLevel(logbus.LevelTrace)
 	run()
-	if count("TRACE") == 0 {
-		t.Error("no trace lines at the trace level")
+	if count("DEBUG") == before || count("TRACE") != 0 {
+		t.Errorf("at the old trace level: %d new debug and %d trace lines, want debug lines only",
+			count("DEBUG")-before, count("TRACE"))
 	}
 }
 

@@ -142,6 +142,26 @@ func TestSettingsMissingKeysGetDefaults(t *testing.T) {
 	}
 }
 
+// A settings file saved with the old "trace" log level loads as debug: the
+// panel no longer offers trace (its detail is in a worker's trace file).
+func TestSettingsOldTraceLevelLoadsAsDebug(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"log_level":"trace"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got := s.GetSettings().LogLevel; got != "debug" {
+		t.Errorf("log level %q, want debug", got)
+	}
+}
+
 // migrate() created idx_inputs_pending(worker_id, checked, seq) in the
 // schema, before the ALTER TABLE that adds "checked" to older databases, so
 // a database from before that column could not be opened at all ("no such

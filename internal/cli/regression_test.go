@@ -766,10 +766,10 @@ func TestDebugSummaryShowsNetworkAndWaiting(t *testing.T) {
 	}
 }
 
-// -trace-file writes the structured trace as JSON Lines: run_start with
-// the settings, an event for every try (a retried name has two) and for
-// every name, run_end with the counters; the file is private (0600) and
-// -resume appends a second run to it.
+// -trace writes the structured trace as JSON Lines: run_start with the
+// settings, an event for every try (a retried name has two) and for every
+// name, run_end with the counters; the file is private (0600) and -resume
+// appends a second run to it.
 func TestTraceFileJSONLines(t *testing.T) {
 	var mu sync.Mutex
 	tries := map[string]int{}
@@ -792,7 +792,7 @@ func TestTraceFileJSONLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
-		"-workers", "2", "-retry-delay", "10ms", "-trace-file", tracePath}
+		"-workers", "2", "-retry-delay", "10ms", "-trace", tracePath}
 	if code := Main(args); code != 0 {
 		t.Fatalf("exit code %d", code)
 	}
@@ -865,7 +865,7 @@ func TestProgressShowsThePipelineAtDebug(t *testing.T) {
 	}
 }
 
-// A run with -trace-file that lasts over a second has "pipeline" events.
+// A run with -trace that lasts over a second has "pipeline" events.
 func TestTraceFileHasPipelineEvents(t *testing.T) {
 	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
 	dir := t.TempDir()
@@ -875,7 +875,7 @@ func TestTraceFileHasPipelineEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	if code := Main([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL,
-		"-no-cache", "-quiet", "-workers", "2", "-rate", "3", "-trace-file", tracePath}); code != 0 {
+		"-no-cache", "-quiet", "-workers", "2", "-rate", "3", "-trace", tracePath}); code != 0 {
 		t.Fatalf("exit code %d", code)
 	}
 	raw, err := os.ReadFile(tracePath)
@@ -897,5 +897,137 @@ func TestTraceFileHasPipelineEvents(t *testing.T) {
 	}
 	if n == 0 {
 		t.Error("no pipeline event in a run of about 1.5 s")
+	}
+}
+
+// -trace turned -debug on (and printed every step of every request as
+// text). The two are independent now: -trace FILE writes the structured
+// trace and prints no debug lines, -debug prints the lines and writes no
+// file. The old spelling -trace-file still works.
+func TestTraceAndDebugAreIndependent(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	if err := os.WriteFile(in, []byte("alice\nbob\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer func(l LogLevel) { logLevel = l }(logLevel)
+	run := func(extra ...string) string {
+		t.Helper()
+		var logs lockedBuffer
+		log.SetOutput(&logs)
+		defer log.SetOutput(os.Stderr)
+		args := append([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL,
+			"-no-cache", "-quiet", "-workers", "1"}, extra...)
+		if code := Main(args); code != 0 {
+			t.Fatalf("%v: exit code %d\n%s", extra, code, logs.String())
+		}
+		return logs.String()
+	}
+	traceOnly := filepath.Join(dir, "only.jsonl")
+	if out := run("-trace", traceOnly); strings.Contains(out, "[DEBUG]") || strings.Contains(out, "[TRACE]") {
+		t.Errorf("-trace alone printed debug lines:\n%s", out)
+	}
+	if fi, err := os.Stat(traceOnly); err != nil || fi.Size() == 0 {
+		t.Fatalf("-trace wrote no file: %v", err)
+	}
+	if out := run("-debug"); !strings.Contains(out, "[DEBUG] @alice #1 | -> free") || strings.Contains(out, "[TRACE]") {
+		t.Errorf("-debug lines missing or trace lines printed:\n%s", out)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(dir, "*.jsonl")); len(matches) != 1 {
+		t.Errorf("trace files after the -debug run: %v, want only %s", matches, traceOnly)
+	}
+	oldSpelling := filepath.Join(dir, "old.jsonl")
+	if out := run("-trace-file", oldSpelling); !strings.Contains(out, "use -trace "+oldSpelling) {
+		t.Errorf("no hint for the old spelling:\n%s", out)
+	}
+	if _, err := os.Stat(oldSpelling); err != nil {
+		t.Errorf("-trace-file wrote no trace: %v", err)
+	}
+}
+
+// -trace was a boolean, so scripts say "-trace -workers 200" or
+// "-trace=true". Taking "-workers" or "true" as the file name would write a
+// trace nobody asked for and lose the rest of the command line; the run is
+// refused before any file is touched.
+func TestOldBooleanTraceIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, []byte("alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, []byte("@old | free\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	for _, args := range [][]string{
+		{"-input", in, "-output", out, "-trace", "-workers", "2"},
+		{"-input", in, "-output", out, "-trace=true"},
+	} {
+		if code := Main(args); code != 2 {
+			t.Errorf("%v: exit code %d, want 2", args, code)
+		}
+	}
+	if !strings.Contains(logs.String(), "-trace takes the path of the trace file") {
+		t.Errorf("no explanation in the log:\n%s", logs.String())
+	}
+	if got, _ := os.ReadFile(out); string(got) != "@old | free\n" {
+		t.Errorf("the results file changed: %q", got)
+	}
+	for _, name := range []string{"-workers", "true"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Errorf("a trace file %q was created", name)
+		}
+	}
+}
+
+// The trace is opened with O_TRUNC, so "-trace results.txt" (or the input,
+// or the checked list) would wipe that file. Such a run is refused.
+func TestTraceCannotBeAnotherFileOfTheRun(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	for path, body := range map[string]string{in: "alice\n", out: "@old | free\n", out + ".checked": "old\n"} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	sep := string(os.PathSeparator)
+	for _, trace := range []string{out, in, out + ".checked", dir + sep + "." + sep + "out.txt"} {
+		if code := Main([]string{"-input", in, "-output", out, "-filter", "free", "-trace", trace}); code != 2 {
+			t.Errorf("-trace %s: exit code %d, want 2", trace, code)
+		}
+	}
+	for path, body := range map[string]string{in: "alice\n", out: "@old | free\n", out + ".checked": "old\n"} {
+		if got, _ := os.ReadFile(path); string(got) != body {
+			t.Errorf("%s changed: %q", path, got)
+		}
+	}
+	if !strings.Contains(logs.String(), "is the same file as -output") {
+		t.Errorf("no explanation in the log:\n%s", logs.String())
+	}
+}
+
+// -h shows -trace FILE and leaves the old spelling -trace-file out.
+func TestUsageShowsTraceFile(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	code := Main([]string{"-h"})
+	os.Stderr = stderr
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	if code != 0 || !strings.Contains(string(out), "-trace FILE") || strings.Contains(string(out), "-trace-file") ||
+		strings.Contains(string(out), "implies -debug") {
+		t.Errorf("-h (exit %d):\n%s", code, out)
 	}
 }

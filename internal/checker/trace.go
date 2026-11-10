@@ -5,27 +5,29 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptrace"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
 // Logger receives optional detail about the checks. Any field may be nil.
-// The console sets them from -debug and -trace; the web panel sends them
-// to the tile's log.
+// The console sets Debugf from -debug and Event from -trace, independently
+// of each other; the web panel sends the lines to the tile's log and the
+// events to the worker's trace file.
 type Logger struct {
 	Warnf  func(format string, args ...any) // notable events: throttle pauses, HTTP 429, the stop
 	Debugf func(format string, args ...any) // one line per HTTP try with its timings, codes, redirects, verdicts, cache use
-	Tracef func(format string, args ...any) // every step: request headers, DNS/TCP/TLS, headers of the answer, body previews
 
-	// Event receives the structured trace: one TraceEvent per HTTP request,
-	// cache lookup and name, and the pauses, the gate and the stop. nil = off.
+	// Event receives the structured trace: every HTTP request with all it
+	// sent and got, every cache lookup and name, and the pauses, the gate
+	// and the stop. nil = off. There used to be a Tracef level of text
+	// lines (DNS, TCP, TLS, headers) that also turned the debug lines on;
+	// at 200 workers it was unreadable, and its detail is in the events.
 	Event func(TraceEvent)
 
-	// Level, when set, is asked before every Debugf and Tracef line: the
-	// panel's log level can change during a run, and a line nobody will
-	// see is then not even formatted. nil: Debugf and Tracef always run.
+	// Level, when set, is asked before every Debugf line: the panel's log
+	// level can change during a run, and a line nobody will see is then
+	// not even formatted. nil: Debugf always runs.
 	Level func() LogLevel
 }
 
@@ -34,22 +36,17 @@ type LogLevel int
 
 // Levels for Logger.Level.
 const (
-	LogInfo  LogLevel = iota // neither Debugf nor Tracef
-	LogDebug                 // Debugf
-	LogTrace                 // Debugf and Tracef
+	LogInfo  LogLevel = iota // no Debugf lines
+	LogDebug                 // Debugf lines
 )
 
 // SetLogger installs l. Call it before the first check.
 func (c *Checker) SetLogger(l Logger) { c.log = l }
 
-// debugOn and traceOn tell whether the detail of that level is wanted, so
-// callers can skip work that only feeds it.
+// debugOn tells whether debug lines are wanted, so callers can skip work
+// that only feeds them.
 func (c *Checker) debugOn() bool {
 	return c.log.Debugf != nil && (c.log.Level == nil || c.log.Level() >= LogDebug)
-}
-
-func (c *Checker) traceOn() bool {
-	return c.log.Tracef != nil && (c.log.Level == nil || c.log.Level() >= LogTrace)
 }
 
 func (c *Checker) warnf(format string, args ...any) {
@@ -61,12 +58,6 @@ func (c *Checker) warnf(format string, args ...any) {
 func (c *Checker) debugf(format string, args ...any) {
 	if c.debugOn() {
 		c.log.Debugf(format, args...)
-	}
-}
-
-func (c *Checker) tracef(format string, args ...any) {
-	if c.traceOn() {
-		c.log.Tracef(format, args...)
 	}
 }
 
@@ -129,8 +120,8 @@ func (a *attempt) who() string {
 	return fmt.Sprintf("@%s #%d", a.name, a.try)
 }
 
-// begin marks the request as sent, notes the cookies the jar will add
-// (names only) and, at -trace, prints the request.
+// begin marks the request as sent and notes the cookies the jar will add
+// (names only).
 func (a *attempt) begin(req *http.Request) {
 	if jar := a.c.client.Jar; jar != nil {
 		for _, ck := range jar.Cookies(req.URL) {
@@ -140,88 +131,44 @@ func (a *attempt) begin(req *http.Request) {
 	a.start = time.Now()
 	atomic.AddInt64(&a.c.stats.inFlight, 1)
 	a.inFlight = true
-	if a.c.traceOn() {
-		var hdr []string
-		for _, k := range sortedKeys(req.Header) {
-			hdr = append(hdr, k+": "+strings.Join(req.Header[k], ", "))
-		}
-		cookies := "none"
-		if len(a.cookies) > 0 {
-			cookies = strings.Join(a.cookies, ", ") + " (values hidden)"
-		}
-		a.c.tracef("%s -> %s %s | %s | cookies: %s", a.who(), req.Method, req.URL, strings.Join(hdr, " | "), cookies)
-	}
 }
 
-// response keeps what the answer says and, at -trace, prints its headers.
-// Set-Cookie values are hidden: they are session tokens.
+// response keeps what the answer says.
 func (a *attempt) response(resp *http.Response) {
 	a.code = resp.StatusCode
 	a.proto = resp.Proto
 	a.header = resp.Header
-	if !a.c.traceOn() {
-		return
-	}
-	for _, k := range sortedKeys(resp.Header) {
-		vals := resp.Header[k]
-		if k == "Set-Cookie" {
-			vals = maskSetCookies(vals)
-		}
-		a.c.tracef("%s  header  %s: %s", a.who(), k, strings.Join(vals, "; "))
-	}
 }
 
 // clientTrace returns the httptrace hooks of the request: they record the
-// timings, count new and reused connections, and print every step at
-// -trace.
+// timings and count new and reused connections.
 func (a *attempt) clientTrace() *httptrace.ClientTrace {
 	c := a.c
 	return &httptrace.ClientTrace{
-		DNSStart: func(info httptrace.DNSStartInfo) {
+		DNSStart: func(httptrace.DNSStartInfo) {
 			a.dnsStart = time.Now()
-			c.tracef("%s DNS start: %s", a.who(), info.Host)
 		},
-		DNSDone: func(info httptrace.DNSDoneInfo) {
+		DNSDone: func(httptrace.DNSDoneInfo) {
 			a.dnsDone = time.Now()
-			if info.Err != nil {
-				c.tracef("%s DNS FAILED: %v", a.who(), info.Err)
-				return
-			}
-			if c.traceOn() {
-				addrs := make([]string, len(info.Addrs))
-				for i, ad := range info.Addrs {
-					addrs[i] = ad.String()
-				}
-				c.tracef("%s DNS -> %s (%.1fms)", a.who(), strings.Join(addrs, ", "), ms(a.dnsDone.Sub(a.dnsStart)))
-			}
 		},
 		ConnectStart: func(network, addr string) {
 			if a.connectStart.IsZero() {
 				a.connectStart = time.Now()
 			}
-			c.tracef("%s TCP start -> %s %s", a.who(), network, addr)
 		},
 		ConnectDone: func(network, addr string, err error) {
 			a.connectDone = time.Now()
-			if err != nil {
-				c.tracef("%s TCP FAILED -> %s: %v", a.who(), addr, err)
-				return
-			}
-			c.tracef("%s TCP connected -> %s (%.1fms)", a.who(), addr, ms(a.connectDone.Sub(a.connectStart)))
 		},
 		TLSHandshakeStart: func() {
 			a.tlsStart = time.Now()
-			c.tracef("%s TLS start", a.who())
 		},
 		TLSHandshakeDone: func(state tls.ConnectionState, err error) {
 			a.tlsDone = time.Now()
 			if err != nil {
-				c.tracef("%s TLS FAILED: %v", a.who(), err)
 				return
 			}
 			a.tlsVersion = tlsVersionName(state.Version)
 			a.alpn = state.NegotiatedProtocol
-			c.tracef("%s TLS done: %s proto=%s (%.1fms)", a.who(), a.tlsVersion, a.alpn, ms(a.tlsDone.Sub(a.tlsStart)))
 		},
 		GotConn: func(info httptrace.GotConnInfo) {
 			a.connReused = info.Reused
@@ -231,21 +178,15 @@ func (a *attempt) clientTrace() *httptrace.ClientTrace {
 			}
 			if info.Reused {
 				atomic.AddInt64(&c.stats.connReuse, 1)
-				c.tracef("%s conn REUSED %s (idle %v)", a.who(), a.remote, info.IdleTime)
 			} else {
 				atomic.AddInt64(&c.stats.connNew, 1)
-				c.tracef("%s conn NEW %s", a.who(), a.remote)
 			}
 		},
-		WroteRequest: func(info httptrace.WroteRequestInfo) {
+		WroteRequest: func(httptrace.WroteRequestInfo) {
 			a.wrote = time.Now()
-			if info.Err != nil {
-				c.tracef("%s writing the request FAILED: %v", a.who(), info.Err)
-			}
 		},
 		GotFirstResponseByte: func() {
 			a.firstByte = time.Now()
-			c.tracef("%s TTFB=%.1fms", a.who(), ms(a.firstByte.Sub(a.start)))
 		},
 	}
 }
@@ -370,15 +311,6 @@ func maskSetCookies(vals []string) []string {
 		out[i] = head
 	}
 	return out
-}
-
-func sortedKeys(h http.Header) []string {
-	keys := make([]string, 0, len(h))
-	for k := range h {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func tlsVersionName(v uint16) string {

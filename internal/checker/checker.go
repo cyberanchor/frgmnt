@@ -144,7 +144,7 @@ type Config struct {
 
 	// Trace is for the web panel: it writes the structured trace of this
 	// worker's runs to <data>/traces/<id>.jsonl. The engine does not read
-	// it (the console has -trace-file).
+	// it (the console has -trace FILE).
 	Trace bool `json:"trace,omitempty"`
 }
 
@@ -302,7 +302,7 @@ type Checker struct {
 	// network error), requests go out one at a time through the gate.
 	gate *gate
 
-	log Logger // optional detail for the console's -debug and -trace
+	log Logger // optional detail: the debug lines and the structured trace
 }
 
 // Blocked reports whether Run gave up: Fragment kept answering with a
@@ -837,13 +837,6 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 		}
 		if !pi.Found {
 			c.debugf("%s STATUS NOT FOUND in %d bytes (increase -readlimit)", at.who(), n)
-			if c.traceOn() && n > 0 {
-				preview := string(body)
-				if len(preview) > 300 {
-					preview = preview[:300] + "…"
-				}
-				c.tracef("%s body preview:\n%s", at.who(), preview)
-			}
 		} else {
 			c.debugf("%s parsed -> %s (confidence=%d; %s; offset: %d bytes, %.1f%% of readLimit)",
 				at.who(), pi.Status, pi.Confidence, pi.Evidence, pi.Offset, float64(pi.Offset)/float64(c.cfg.ReadLimit)*100)

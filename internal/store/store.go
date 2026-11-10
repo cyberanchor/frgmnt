@@ -837,6 +837,11 @@ func (s *Store) loadSettings() error {
 	if loaded.LogLevel == "" {
 		loaded.LogLevel = def.LogLevel
 	}
+	if loaded.LogLevel == "trace" {
+		// The trace level is gone (its detail is in a worker's trace
+		// file); a saved "trace" means debug.
+		loaded.LogLevel = "debug"
+	}
 	if loaded.DefaultWorkers == 0 {
 		loaded.DefaultWorkers = def.DefaultWorkers
 	}

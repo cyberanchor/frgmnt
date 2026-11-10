@@ -49,7 +49,7 @@ func Main(args []string) int {
 	var (
 		addr         = fs.String("addr", "127.0.0.1:8080", "HTTP listen address")
 		dataDir      = fs.String("data", "./data", "directory for SQLite DB and settings.json")
-		logLevel     = fs.String("log-level", "info", "log level: error, warn, info, debug, trace")
+		logLevel     = fs.String("log-level", "info", "log level: error, warn, info, debug (a worker's every request is in its trace file)")
 		cacheDir     = fs.String("cache-dir", "", "page cache directory (default <data>/pagecache)")
 		cacheTTL     = fs.Duration("cache-ttl", 2*time.Minute, "TTL for volatile pages (auction/available)")
 		cacheSoldTTL = fs.Duration("cache-sold-ttl", 7*24*time.Hour, "TTL for sold/bought pages; negative = never expire")
@@ -87,6 +87,12 @@ func Main(args []string) int {
 		log.Fatalf("resolve data dir: %v", err)
 	}
 
+	// "trace" was a level of its own (every step of every request in the
+	// log); that detail is in a worker's trace file now, and trace means
+	// debug.
+	if strings.EqualFold(strings.TrimSpace(*logLevel), "trace") {
+		*logLevel = "debug"
+	}
 	level := logbus.ParseLevel(*logLevel)
 	bus := logbus.New(2000, level)
 	defer bus.Close()

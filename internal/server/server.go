@@ -495,6 +495,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// "trace" was a log level of its own: every step of every request
+		// in the log. That detail is in a worker's trace file now ("Write a
+		// trace"), and the old value means debug.
+		if v.LogLevel == "trace" {
+			v.LogLevel = "debug"
+		}
 		if err := validateSettings(v); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -526,9 +532,9 @@ func validateSettings(v store.Settings) error {
 		return fmt.Errorf(`theme must be "light" or "dark", got %q`, v.Theme)
 	}
 	switch v.LogLevel {
-	case "error", "warn", "info", "debug", "trace":
+	case "error", "warn", "info", "debug":
 	default:
-		return fmt.Errorf("log_level must be error, warn, info, debug or trace, got %q", v.LogLevel)
+		return fmt.Errorf("log_level must be error, warn, info or debug, got %q", v.LogLevel)
 	}
 	for _, err := range []error{
 		check("default_workers", v.DefaultWorkers, 1, checker.MaxWorkers),

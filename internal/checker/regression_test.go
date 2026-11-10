@@ -612,7 +612,7 @@ func TestResultSplitsNetworkAndWaiting(t *testing.T) {
 	}
 }
 
-// logCapture collects Debugf and Tracef lines.
+// logCapture collects Debugf lines.
 type logCapture struct {
 	mu    sync.Mutex
 	lines []string
@@ -676,10 +676,10 @@ func TestDebugLinePerTryAndProbe(t *testing.T) {
 	}
 }
 
-// -trace printed every header of an answer as it was, so the session
-// cookie (Set-Cookie: stel_ssid=...) landed in the log. Values are hidden
-// now, in the answer and in the request (only the names of the cookies
-// sent are shown), and the request itself is printed.
+// The text trace printed every header of an answer as it was, so the
+// session cookie (Set-Cookie: stel_ssid=...) landed in the log. Neither the
+// debug lines nor the structured trace carry a cookie value: the events
+// name the cookies an answer sets and the request sends back.
 func TestTraceHidesCookieValues(t *testing.T) {
 	withServer(t, func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/username/")
@@ -687,20 +687,35 @@ func TestTraceHidesCookieValues(t *testing.T) {
 		http.Redirect(w, r, "/?query="+name, http.StatusFound)
 	})
 	var lines logCapture
+	var mu sync.Mutex
+	var events []TraceEvent
 	c := New(Config{Workers: 1, Timeout: 2 * time.Second})
 	defer c.Close()
-	c.SetLogger(Logger{Debugf: lines.add, Tracef: lines.add})
+	c.SetLogger(Logger{Debugf: lines.add, Event: func(e TraceEvent) {
+		mu.Lock()
+		events = append(events, e)
+		mu.Unlock()
+	}})
 	_ = c.CheckOne(context.Background(), "cookiename")
 	_ = c.CheckOne(context.Background(), "cookiename2") // sends the cookie back
-	out := lines.text()
-	if strings.Contains(out, "SECRET123") {
-		t.Fatalf("a cookie value reached the trace:\n%s", out)
+	mu.Lock()
+	defer mu.Unlock()
+	raw, err := json.Marshal(events)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, want := range []string{"Set-Cookie: stel_ssid=…; Path=/; HttpOnly", "-> GET http", "User-Agent: ",
-		"cookies: none", "cookies: stel_ssid (values hidden)"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("no %q in the trace:\n%s", want, out)
+	if strings.Contains(lines.text(), "SECRET123") || strings.Contains(string(raw), "SECRET123") {
+		t.Fatalf("a cookie value reached the log or the trace:\n%s\n%s", lines.text(), raw)
+	}
+	var sets, sent []string
+	for _, e := range events {
+		if e.Kind == "attempt" {
+			sets = append(sets, strings.Join(e.SetCookies, ","))
+			sent = append(sent, strings.Join(e.CookiesSent, ","))
 		}
+	}
+	if !reflect.DeepEqual(sets, []string{"stel_ssid", "stel_ssid"}) || !reflect.DeepEqual(sent, []string{"", "stel_ssid"}) {
+		t.Errorf("cookie names set %q and sent %q, want stel_ssid set twice and sent by the second request", sets, sent)
 	}
 }
 
@@ -712,30 +727,31 @@ func TestMaskSetCookies(t *testing.T) {
 	}
 }
 
-// Logger.Level is asked before every debug and trace line, so a host whose
-// level changes during a run (the panel) gets only what it wants.
-func TestLoggerLevelGatesDebugAndTrace(t *testing.T) {
+// Logger.Level is asked before every debug line, so a host whose level
+// changes during a run (the panel) gets only what it wants. The structured
+// trace does not depend on it.
+func TestLoggerLevelGatesDebug(t *testing.T) {
 	withServer(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/?query="+strings.TrimPrefix(r.URL.Path, "/username/"), http.StatusFound)
 	})
-	var debug, trace logCapture
+	var debug logCapture
 	var level atomic.Int32
+	var events atomic.Int32
 	c := New(Config{Workers: 1, Timeout: 2 * time.Second})
 	defer c.Close()
-	c.SetLogger(Logger{Debugf: debug.add, Tracef: trace.add, Level: func() LogLevel { return LogLevel(level.Load()) }})
+	c.SetLogger(Logger{Debugf: debug.add, Level: func() LogLevel { return LogLevel(level.Load()) },
+		Event: func(TraceEvent) { events.Add(1) }})
 	_ = c.CheckOne(context.Background(), "levelname")
-	if debug.text() != "" || trace.text() != "" {
-		t.Fatalf("lines at LogInfo:\n%s\n%s", debug.text(), trace.text())
+	if debug.text() != "" {
+		t.Fatalf("lines at LogInfo:\n%s", debug.text())
+	}
+	if events.Load() == 0 {
+		t.Fatal("no trace events at LogInfo; the trace must not follow the log level")
 	}
 	level.Store(int32(LogDebug))
 	_ = c.CheckOne(context.Background(), "levelname")
-	if debug.text() == "" || trace.text() != "" {
-		t.Fatalf("at LogDebug: debug %q, trace %q", debug.text(), trace.text())
-	}
-	level.Store(int32(LogTrace))
-	_ = c.CheckOne(context.Background(), "levelname")
-	if !strings.Contains(trace.text(), "-> GET http") {
-		t.Fatalf("no request line at LogTrace: %q", trace.text())
+	if !strings.Contains(debug.text(), "@levelname #1 | -> free") {
+		t.Fatalf("at LogDebug: %q", debug.text())
 	}
 }
 

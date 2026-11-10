@@ -702,7 +702,8 @@ async function loadSettings() {
 function renderSettings() {
     const s = state.settings || {};
     $("#set-theme").value = s.theme || "dark";
-    $("#set-log-level").value = s.log_level || "info";
+    // "trace" was a level of its own; it means debug now.
+    $("#set-log-level").value = s.log_level === "trace" ? "debug" : (s.log_level || "info");
     $("#set-default-workers").value = s.default_workers ?? 50;
     $("#set-default-rate").value = s.default_rate_rps ?? 0;
     $("#set-default-retries").value = s.default_retries ?? 2;

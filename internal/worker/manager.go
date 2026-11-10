@@ -637,10 +637,10 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	chk := checker.New(cfg)
 	defer chk.Close()
 	// The engine's output goes to the tile's log, at the level of the bus:
-	// the warnings (throttle pauses, HTTP 429, the stop), at debug a line
-	// per HTTP try with its timings, at trace every step of every request.
-	// The panel got only the warnings, and before 2.0.0 nothing at all, so
-	// its debug and trace levels showed no HTTP detail.
+	// the warnings (throttle pauses, HTTP 429, the stop) and, at debug, a
+	// line per HTTP try with its timings. Every step of every request is in
+	// the worker's trace file ("Write a trace"), not in the log; an old
+	// "trace" log level counts as debug.
 	lg := checker.Logger{
 		Warnf: func(format string, args ...any) {
 			m.bus.Publish(logbus.LevelWarn, w.id, fmt.Sprintf(format, args...))
@@ -648,14 +648,8 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 		Debugf: func(format string, args ...any) {
 			m.bus.Publish(logbus.LevelDebug, w.id, fmt.Sprintf(format, args...))
 		},
-		Tracef: func(format string, args ...any) {
-			m.bus.Publish(logbus.LevelTrace, w.id, fmt.Sprintf(format, args...))
-		},
 		Level: func() checker.LogLevel {
-			switch m.bus.Level() {
-			case logbus.LevelTrace:
-				return checker.LogTrace
-			case logbus.LevelDebug:
+			if m.bus.Level() >= logbus.LevelDebug {
 				return checker.LogDebug
 			}
 			return checker.LogInfo

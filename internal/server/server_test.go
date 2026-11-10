@@ -419,6 +419,20 @@ func TestSettingsPartialUpdateKeepsOtherFields(t *testing.T) {
 	}
 }
 
+// "trace" was a log level of its own (every step of every request in the
+// Logs tab). That detail is in a worker's trace file now: an old client
+// that still sends "trace" gets debug, not a 400.
+func TestSettingsTraceLevelMeansDebug(t *testing.T) {
+	s, st := newTestServer(t)
+	rec := do(t, s, "PUT", "/api/settings", "application/json", `{"log_level":"trace"}`, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"log_level":"debug"`) {
+		t.Fatalf("PUT log_level trace: %d %s", rec.Code, rec.Body.String())
+	}
+	if got := st.GetSettings().LogLevel; got != "debug" {
+		t.Errorf("saved log level %q, want debug", got)
+	}
+}
+
 // Settings were not validated: default_rate_rps -5 was saved, and from
 // then on every POST /api/workers failed with 400.
 func TestSettingsRejectsOutOfRange(t *testing.T) {

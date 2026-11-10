@@ -10,13 +10,15 @@
 //	frgmnt check -input names.txt -output results.txt -resume -append
 //	frgmnt check -input - -output results.txt           # stdin
 //	frgmnt check -input names.txt -output results.txt -debug
-//	frgmnt check -input names.txt -output results.txt -trace
+//	frgmnt check -input names.txt -output results.txt -trace run.jsonl
 //
-// Log levels:
+// Diagnostics (independent: either, both or none):
 //
-//	(default) — results + progress line once per second
-//	-debug    — HTTP codes, body sizes, parser verdicts, cache use
-//	-trace    — everything from -debug plus DNS / TCP / TLS / headers / body preview
+//	(default)    — results + progress line once per second
+//	-debug       — one line per HTTP try with its timings, the verdicts and
+//	               cache use on the console, timing figures at the end
+//	-trace FILE  — the structured trace of the run in FILE as JSON Lines:
+//	               every request, cache lookup, name and engine event
 //
 // Failure handling:
 //
@@ -39,6 +41,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -92,37 +95,26 @@ const (
 	// LevelNormal prints results and a periodic progress line only.
 	LevelNormal LogLevel = iota
 	// LevelDebug adds one line per HTTP try with its timings, the HTTP
-	// codes, redirects, verdicts and cache use.
+	// codes, redirects, verdicts and cache use. There used to be a trace
+	// level above it (every step of every request as text, which also
+	// turned debug on); that detail goes to the -trace file now.
 	LevelDebug
-	// LevelTrace adds every step: the request, DNS / TCP / TLS, the headers
-	// of the answer, body previews.
-	LevelTrace
 )
 
 func (l LogLevel) String() string {
-	switch l {
-	case LevelDebug:
+	if l == LevelDebug {
 		return "debug"
-	case LevelTrace:
-		return "trace"
 	}
 	return "normal"
 }
 
-// logLevel is the active verbosity, set by Main from -debug/-trace.
+// logLevel is the active verbosity, set by Main from -debug.
 var logLevel LogLevel
 
 // debugf prints when logLevel >= LevelDebug.
 func debugf(format string, args ...any) {
 	if logLevel >= LevelDebug {
 		log.Printf("[DEBUG] "+format, args...)
-	}
-}
-
-// tracef prints when logLevel >= LevelTrace.
-func tracef(format string, args ...any) {
-	if logLevel >= LevelTrace {
-		log.Printf("[TRACE] "+format, args...)
 	}
 }
 
@@ -335,7 +327,7 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 				maxOff, readLimit, maxOff+safetyMargin)
 		}
 		if e.Unknown > 0 {
-			line += fmt.Sprintf("\n  WARN: unknown=%d — either readLimit is too small or the redirect target is new; re-run with -trace", e.Unknown)
+			line += fmt.Sprintf("\n  WARN: unknown=%d — either readLimit is too small or the redirect target is new; re-run with -trace FILE to see the answers", e.Unknown)
 		}
 	}
 	return line
@@ -689,9 +681,9 @@ func Main(args []string) int {
 		quiet      = fs.Bool("quiet", false, "Stdout: print only free results and errors")
 		insecure   = fs.Bool("insecure", false, "Skip TLS certificate verification (debug only)")
 
-		debugFlag = fs.Bool("debug", false, "Enable debug-level logging: one line per HTTP try with its timings")
-		traceFlag = fs.Bool("trace", false, "Enable trace-level logging: every step of every request (implies -debug)")
-		traceOut  = fs.String("trace-file", "", "Write the structured trace to this file as JSON Lines: every request, cache lookup, name and engine event (appended with -resume/-append)")
+		debugFlag = fs.Bool("debug", false, "Print one line per HTTP try with its timings, the verdicts and cache use, and timing figures at the end")
+		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines: every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
+		traceOld  = fs.String("trace-file", "", "Deprecated spelling of -trace FILE")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
 	fs.Usage = func() { printUsage(fs) }
@@ -708,11 +700,19 @@ func Main(args []string) int {
 	}
 
 	logLevel = LevelNormal
-	switch {
-	case *traceFlag:
-		logLevel = LevelTrace
-	case *debugFlag:
+	if *debugFlag {
 		logLevel = LevelDebug
+	}
+	tracePath := *traceOut
+	if *traceOld != "" {
+		if tracePath == "" {
+			tracePath = *traceOld
+		}
+		log.Printf("[WARN] -trace-file is an old spelling; use -trace %s", *traceOld)
+	}
+	if err := checkTracePath(tracePath); err != nil {
+		log.Printf("[ERROR] %v", err)
+		return 2
 	}
 
 	if *inputPath == "" || *outputPath == "" {
@@ -767,6 +767,10 @@ func Main(args []string) int {
 	// With -filter the results file lacks the names the filter left out;
 	// <output>.checked lists every name that got a verdict.
 	checkedPath := *outputPath + ".checked"
+	if err := traceConflict(tracePath, inInfo, *inputPath, *outputPath, checkedPath); err != nil {
+		log.Printf("[ERROR] %v", err)
+		return 2
+	}
 	var skip *checker.NameSet
 	if *resume {
 		s, err := loadResumeSet(*outputPath)
@@ -832,14 +836,11 @@ func Main(args []string) int {
 	if logLevel >= LevelDebug {
 		logger.Debugf = debugf
 	}
-	if logLevel >= LevelTrace {
-		logger.Tracef = tracef
-	}
 	var trace *tracelog.Writer
-	if *traceOut != "" {
-		trace, err = tracelog.Open(*traceOut, *appendFlag || *resume, 0)
+	if tracePath != "" {
+		trace, err = tracelog.Open(tracePath, *appendFlag || *resume, 0)
 		if err != nil {
-			log.Printf("[ERROR] -trace-file: %v", err)
+			log.Printf("[ERROR] -trace: %v", err)
 			return 2
 		}
 		logger.Event = trace.Write
@@ -999,13 +1000,67 @@ func Main(args []string) int {
 		trace.Write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
 		n, _, err := trace.Close()
 		if err != nil {
-			log.Printf("[ERROR] -trace-file %s: %v (the trace is incomplete)", *traceOut, err)
+			log.Printf("[ERROR] -trace %s: %v (the trace is incomplete)", tracePath, err)
 		} else {
-			log.Printf("[INFO] trace: %d events in %s", n, *traceOut)
+			log.Printf("[INFO] trace: %d events in %s", n, tracePath)
 		}
 	}
 	return exitCode
 }
+
+// checkTracePath catches the old boolean -trace. It takes a file now, so
+// "-trace -workers 200" reads "-workers" as the file name (and the rest of
+// the command line goes wrong), and "-trace=true" reads "true".
+func checkTracePath(p string) error {
+	if strings.HasPrefix(p, "-") || p == "true" || p == "false" {
+		return fmt.Errorf("-trace takes the path of the trace file (for example -trace run.jsonl), got %q; "+
+			"for one line per request on the console use -debug", p)
+	}
+	return nil
+}
+
+// traceConflict refuses a trace path that is one of the run's other files:
+// the trace is opened with O_TRUNC, so "-trace results.txt" would wipe the
+// results (and the input with "-trace names.txt"). The input is compared
+// by its open file too, so "-input - < names.txt" is caught.
+func traceConflict(tracePath string, inInfo os.FileInfo, inputPath, outputPath, checkedPath string) error {
+	if tracePath == "" {
+		return nil
+	}
+	for _, f := range []struct{ flag, path string }{
+		{"-input", inputPath}, {"-output", outputPath}, {"the checked list of -filter", checkedPath},
+	} {
+		if f.path != "-" && sameFile(tracePath, f.path) {
+			return fmt.Errorf("-trace %s is the same file as %s; write the trace to another file", tracePath, f.flag)
+		}
+	}
+	if inInfo != nil && inInfo.Mode().IsRegular() {
+		if ti, err := os.Stat(tracePath); err == nil && os.SameFile(inInfo, ti) {
+			return fmt.Errorf("-trace %s is the input file; write the trace to another file", tracePath)
+		}
+	}
+	return nil
+}
+
+// sameFile reports whether a and b name one file: the same absolute path,
+// or, when both exist, the same file through another path or a link.
+func sameFile(a, b string) bool {
+	if aa, err := filepath.Abs(a); err == nil {
+		if bb, err := filepath.Abs(b); err == nil && aa == bb {
+			return true
+		}
+	}
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	return err == nil && os.SameFile(ai, bi)
+}
+
+// hiddenFlags work but are left out of -h: old spellings kept so that
+// scripts do not break.
+var hiddenFlags = map[string]bool{"trace-file": true}
 
 // printUsage is installed as flag.Usage and is also called manually when
 // required flags are missing.
@@ -1021,10 +1076,22 @@ func printUsage(fs *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -resume -append\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  cat names.txt | %s -input - -output results.txt -no-dedup\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -debug -workers 200 -rate 1000\n", ProgName)
+	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -trace run.jsonl\n", ProgName)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Statuses describe Fragment, not Telegram: \"free\" means Fragment has no page")
 	fmt.Fprintln(os.Stderr, "for the name (not a collectible, not for sale); a regular account may still hold it.")
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Flags:")
-	fs.PrintDefaults()
+	shown := flag.NewFlagSet(fs.Name(), flag.ContinueOnError)
+	shown.SetOutput(os.Stderr)
+	fs.VisitAll(func(f *flag.Flag) {
+		if hiddenFlags[f.Name] {
+			return
+		}
+		shown.Var(f.Value, f.Name, f.Usage)
+		// The default as declared, not the value parsed from the command
+		// line (printUsage also runs after Parse).
+		shown.Lookup(f.Name).DefValue = f.DefValue
+	})
+	shown.PrintDefaults()
 }

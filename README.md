@@ -126,7 +126,8 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-filter` | | Write only these statuses, e.g. `free,auction`; every name with a verdict is also listed in `<output>.checked`, so `-resume` skips the ones the filter left out |
 | `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again) |
 | `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
-| `-quiet` / `-debug` / `-trace` | | Less or more output on stdout and stderr |
+| `-quiet` / `-debug` | | Less output on stdout, or one line per HTTP try with its timings on stderr and timing figures at the end |
+| `-trace FILE` | | Structured trace of the run as JSON Lines; independent of `-debug` |
 | `-insecure` | | Skip TLS verification (debugging only) |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 
@@ -135,7 +136,8 @@ short are not written, so `-resume` checks them again.
 
 Exit codes: `0` done; `1` the results file could not be written, or every
 checked name ended with an error; `2` bad flags (unknown `-filter` status,
-`-input` and `-output` being the same file); `3` stopped because Fragment
+`-input` and `-output` being the same file, `-trace` without a file or on
+a file of the run); `3` stopped because Fragment
 answers with a Cloudflare challenge (see above).
 
 ## Web panel

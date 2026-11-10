@@ -1,5 +1,5 @@
 // Package tracelog writes the structured trace of the engine
-// (checker.TraceEvent) as JSON Lines, for the console's -trace-file and
+// (checker.TraceEvent) as JSON Lines, for the console's -trace and
 // the panel's per-worker trace.
 package tracelog
 
