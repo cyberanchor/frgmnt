@@ -350,8 +350,10 @@ func (t *Writer) put(line []byte) bool {
 // rotate turns the current file into the older segment (replacing the
 // one before it) and starts a new current file with a segment event.
 func (t *Writer) rotate() bool {
+	// Counted after the close: gzip writes its last block then.
+	err := t.seg.close()
 	t.bytesDone += t.seg.cnt.n
-	if err := t.seg.close(); err != nil {
+	if err != nil {
 		t.seg = nil
 		t.fail(err)
 		return false
@@ -418,8 +420,11 @@ func (t *Writer) finish() {
 	if t.seg == nil {
 		return
 	}
+	// Counted after the close: gzip writes its last block then (the
+	// count used to miss it, 82 KB reported for a 95 KB file).
+	err := t.seg.close()
 	t.bytesDone += t.seg.cnt.n
-	if err := t.seg.close(); err != nil && t.err == nil {
+	if err != nil && t.err == nil {
 		t.err = err
 	}
 	t.seg = nil

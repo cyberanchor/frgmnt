@@ -52,8 +52,12 @@ func TestWriterConcurrentAppend(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
-	if st, err := w.Close(); st.Events != 2000 || st.Dropped != 0 || err != nil {
+	st, err := w.Close()
+	if st.Events != 2000 || st.Dropped != 0 || err != nil {
 		t.Fatalf("Close = %+v, %v; want 2000 events", st, err)
+	}
+	if fi, _ := os.Stat(path); st.Bytes != fi.Size() {
+		t.Errorf("Stats.Bytes %d, the file has %d", st.Bytes, fi.Size())
 	}
 	events := read(t, path)
 	if len(events) != 2000 || events[0].Seq != 1 {
@@ -83,6 +87,7 @@ func TestWriterConcurrentAppend(t *testing.T) {
 // the file still reads as one stream.
 func TestWriterGzip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var written int64
 	for run := 0; run < 2; run++ {
 		w, err := Open(path, Options{Append: run > 0})
 		if err != nil {
@@ -91,9 +96,16 @@ func TestWriterGzip(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			w.Write(checker.TraceEvent{Kind: "attempt", Name: fmt.Sprintf("r%dn%d", run, i), Evidence: "<html>"})
 		}
-		if _, err := w.Close(); err != nil {
+		st, err := w.Close()
+		if err != nil {
 			t.Fatal(err)
 		}
+		written += st.Bytes
+	}
+	// Stats.Bytes counts what this Writer wrote, the last gzip block
+	// included: both runs add up to the file.
+	if fi, _ := os.Stat(path); written != fi.Size() {
+		t.Errorf("Stats.Bytes add up to %d, the file has %d", written, fi.Size())
 	}
 	f, err := os.Open(path)
 	if err != nil {
