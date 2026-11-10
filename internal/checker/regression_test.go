@@ -498,8 +498,13 @@ func TestRateCountsRequestsNotNames(t *testing.T) {
 		t.Fatalf("%d free and %d requests, want 5 and 10", free, len(hits))
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i] < hits[j] })
+	// The limiter spaces the starts 50 ms apart from a first start that
+	// comes after begin, so request k cannot arrive before k*50 ms. The
+	// bound used to count from the first arrival: that request opens the
+	// connection, and on a loaded machine it came ~30 ms late while the
+	// next one did not, so a correct run failed.
 	for k, d := range hits {
-		if due := hits[0] + time.Duration(k)*50*time.Millisecond - 5*time.Millisecond; d < due {
+		if due := time.Duration(k)*50*time.Millisecond - 5*time.Millisecond; d < due {
 			t.Errorf("request %d at %v, due no earlier than %v: a retry went past -rate (%v)", k, d, due, hits)
 			break
 		}
