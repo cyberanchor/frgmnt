@@ -856,7 +856,7 @@ func TestProgressShowsThePipelineAtDebug(t *testing.T) {
 	e := checker.Stats{Checked: 10, Busy: 5, InFlight: 2, WaitRate: 3}
 	q := queues{in: func() int { return 4096 }, out: func() int { return 1 }}
 	got := pipelineLine(e, q, 8)
-	want := "queue in=4096 out=1 | workers net=2 gate=0 pause=0 rate=3 retry=0 probe=0 idle=3"
+	want := "queue in=4096 out=1 | workers net=2 conn=0 gate=0 pause=0 rate=3 retry=0 probe=0 idle=3"
 	if got != want {
 		t.Errorf("pipelineLine = %q, want %q", got, want)
 	}

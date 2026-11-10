@@ -833,6 +833,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 						"queue_in": len(in), "queue_out": len(out), "checked": e.Checked, "workers": cfg.Workers,
 						"busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate, "wait_pause": e.WaitPause,
 						"wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
+						"wait_conn": e.WaitConn, "conn_open": e.ConnOpen, "bytes_in": e.BytesIn, "bytes_out": e.BytesOut,
 						"trace": trace.Stats(),
 					}})
 				}

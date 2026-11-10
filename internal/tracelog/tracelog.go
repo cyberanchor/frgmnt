@@ -487,6 +487,7 @@ func StatsInfo(e checker.Stats) map[string]any {
 		"errors": e.Errors, "retries": e.Retries, "rate_limited": e.RateLimit, "pauses": e.Pauses,
 		"challenges": e.Challenges, "conn_new": e.ConnNew, "conn_reused": e.ConnReuse,
 		"cache_hits": e.CacheHits, "cache_stale": e.CacheStale, "cache_misses": e.CacheMisses,
+		"bytes_in": e.BytesIn, "bytes_out": e.BytesOut,
 	}
 }
 

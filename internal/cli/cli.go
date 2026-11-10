@@ -173,6 +173,7 @@ type Stats struct {
 	netRedirect durHist
 	netPage     durHist
 	wait        durHist
+	connWait    durHist
 	tries       [4]int64
 
 	startTime time.Time
@@ -248,6 +249,7 @@ func (s *Stats) observe(r checker.Result) {
 		s.netPage.add(r.Net)
 	}
 	s.wait.add(r.Wait)
+	s.connWait.add(r.ConnWait)
 	k := min(max(r.Attempts, 1), len(s.tries))
 	atomic.AddInt64(&s.tries[k-1], 1)
 	if r.Offset > 0 {
@@ -305,8 +307,8 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 		e.Free, e.Reserved, e.Auction, e.Available, e.Taken, e.Sold, e.Unknown, e.Errors,
 		elapsed, rps,
 	)
-	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Rate-limits: %d | Retries: %d",
-		e.ConnNew, e.ConnReuse, e.RateLimit, e.Retries)
+	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Wire: in=%s, out=%s | Rate-limits: %d | Retries: %d",
+		e.ConnNew, e.ConnReuse, fmtBytes(e.BytesIn), fmtBytes(e.BytesOut), e.RateLimit, e.Retries)
 	line += fmt.Sprintf("\n  Page cache: hits=%d, stale=%d, misses=%d", e.CacheHits, e.CacheStale, e.CacheMisses)
 	if e.Challenges > 0 {
 		line += fmt.Sprintf("\n  Cloudflare challenges: %d", e.Challenges)
@@ -319,7 +321,8 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 			line += "\n  Network per name, pages (the other verdicts): " + s.netPage.summary()
 		}
 		if s.wait.count() > 0 {
-			line += "\n  Waiting per name (-rate starts, pauses, retry delays, probes): " + s.wait.summary()
+			line += "\n  Waiting per name (-rate starts, pauses, retry delays, probes, connections): " + s.wait.summary()
+			line += "\n  Waiting for a free connection per name (-conns): " + s.connWait.summary()
 			line += fmt.Sprintf("\n  Tries per name: 1: %d | 2: %d | 3: %d | 4+: %d",
 				atomic.LoadInt64(&s.tries[0]), atomic.LoadInt64(&s.tries[1]),
 				atomic.LoadInt64(&s.tries[2]), atomic.LoadInt64(&s.tries[3]))
@@ -639,8 +642,9 @@ type queues struct {
 // queues, then the workers by what they do.
 func pipelineLine(e checker.Stats, q queues, workers int) string {
 	idle := int64(workers) - e.Busy
-	return fmt.Sprintf("queue in=%d out=%d | workers net=%d gate=%d pause=%d rate=%d retry=%d probe=%d idle=%d",
-		q.in(), q.out(), e.InFlight, e.WaitGate, e.WaitPause, e.WaitRate, e.WaitRetry, e.WaitProbe, max(idle, 0))
+	return fmt.Sprintf("queue in=%d out=%d | workers net=%d conn=%d gate=%d pause=%d rate=%d retry=%d probe=%d idle=%d",
+		q.in(), q.out(), max(e.InFlight-e.WaitConn, 0), e.WaitConn, e.WaitGate, e.WaitPause, e.WaitRate,
+		e.WaitRetry, e.WaitProbe, max(idle, 0))
 }
 
 // pipelineInfo is the same for the "pipeline" event of the trace.
@@ -649,6 +653,7 @@ func pipelineInfo(e checker.Stats, q queues, workers int, instRPS float64) map[s
 		"queue_in": q.in(), "queue_out": q.out(), "checked": e.Checked, "inst_rps": instRPS,
 		"workers": workers, "busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate,
 		"wait_pause": e.WaitPause, "wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
+		"wait_conn": e.WaitConn, "conn_open": e.ConnOpen, "bytes_in": e.BytesIn, "bytes_out": e.BytesOut,
 	}
 }
 

@@ -85,6 +85,9 @@ type Result struct {
 	Net      time.Duration `json:"net_ns,omitempty"`
 	Wait     time.Duration `json:"wait_ns,omitempty"`
 	Attempts int           `json:"attempts,omitempty"`
+	// ConnWait is the part of Wait spent waiting for a free connection
+	// (all -conns busy); it used to be counted as network time.
+	ConnWait time.Duration `json:"conn_wait_ns,omitempty"`
 
 	// Confidence is 0..100 and explains how certain the parser is.
 	// Cached is true when the answer came from the on-disk page cache.
@@ -258,6 +261,16 @@ type Stats struct {
 	WaitRate  int64 `json:"wait_rate"`
 	WaitRetry int64 `json:"wait_retry"`
 	WaitProbe int64 `json:"wait_probe"`
+	// WaitConn counts the requests waiting for a connection: all -conns
+	// connections are busy, or one is being opened for them. InFlight
+	// includes them.
+	WaitConn int64 `json:"wait_conn"`
+
+	// The connections to Fragment: open now, and the bytes on the wire
+	// (TLS included) since the start.
+	ConnOpen int64 `json:"conn_open"`
+	BytesIn  int64 `json:"bytes_in"`
+	BytesOut int64 `json:"bytes_out"`
 }
 
 // Checker performs concurrent Fragment lookups against a single Config.
@@ -301,6 +314,8 @@ type Checker struct {
 	// Until the first outcome that is not a challenge (an answer or a
 	// network error), requests go out one at a time through the gate.
 	gate *gate
+
+	connSeq atomic.Int64 // ids of the connections (cid in the trace)
 
 	log Logger // optional detail: the debug lines and the structured trace
 }
@@ -373,7 +388,6 @@ func New(cfg Config) *Checker {
 	cfg = normalizeConfig(cfg)
 	c := &Checker{
 		cfg:     cfg,
-		client:  newHTTPClient(cfg),
 		limiter: newRateLimiter(cfg.RateRPS),
 		stats:   newLiveStats(),
 		cache:   newPageCache(cfg.CacheDir, cfg.CacheTTL, cfg.CacheSoldTTL),
@@ -381,6 +395,7 @@ func New(cfg Config) *Checker {
 
 		blockedCh: make(chan struct{}),
 	}
+	c.client = c.newHTTPClient()
 	c.pool.New = func() any {
 		b := make([]byte, cfg.ReadLimit)
 		return &b
@@ -467,18 +482,19 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 // entries are used as a fallback if the network ultimately fails.
 func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	start := time.Now()
-	var net time.Duration // the time of this name's own requests
+	var net, connWait time.Duration // this name's own requests on the network, and waiting for a connection
 	tries := 0
 	defer func() {
 		res.Took = time.Since(start)
 		res.Net = net
 		res.Wait = res.Took - net
+		res.ConnWait = connWait
 		res.Attempts = tries
 		if c.eventsOn() {
 			c.event(TraceEvent{Kind: "result", Name: res.Username, Status: res.Status,
 				Confidence: res.Confidence, Evidence: res.Evidence, Offset: res.Offset, Error: res.Error,
 				Attempts: res.Attempts, TookMs: ms(res.Took), NetMs: ms(res.Net), WaitMs: ms(res.Wait),
-				Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
+				ConnWaitMs: ms(res.ConnWait), Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
 				Cancelled: ctx.Err() != nil && res.Status == StatusError})
 		}
 	}()
@@ -540,6 +556,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			tries++
 			r, retry, errStr := c.doRequest(ctx, name, reqURL, tries)
 			net += r.Net
+			connWait += r.ConnWait
 			if !retry {
 				return r
 			}
@@ -678,7 +695,8 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 	// includes draining and closing the body; then the try reports itself.
 	defer func() {
 		at.done()
-		res.Net = at.netTime()
+		tm := at.timing(at.snapshot())
+		res.Net, res.ConnWait = tm.net, tm.connWait
 		at.finish(res, retry)
 	}()
 	release, w, err := c.admit(ctx)
@@ -725,13 +743,19 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 		return Result{Username: name, Status: StatusError, Error: err.Error()}, isRetriableNet(err), err.Error()
 	}
 	defer resp.Body.Close()
-	defer drainBody(resp.Body)
+	// The body as it came (compressed), counted; the rest after what the
+	// parser reads is drained so the connection can be reused.
+	raw := &countReader{r: resp.Body, eof: at.bodyEOF}
+	defer func() {
+		drainBody(raw)
+		at.rawBytes = raw.n
+	}()
 	at.response(resp)
 
-	var bodyReader io.Reader = resp.Body
+	var bodyReader io.Reader = raw
 	switch ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); ce {
 	case "gzip":
-		gz, gzErr := gzip.NewReader(resp.Body)
+		gz, gzErr := gzip.NewReader(raw)
 		if gzErr != nil {
 			c.debugf("%s gzip error: %v", at.who(), gzErr)
 			return Result{Username: name, Status: StatusError, Error: "gzip: " + gzErr.Error()}, false, gzErr.Error()
@@ -980,11 +1004,14 @@ func parseRetryAfter(raw string, fallback time.Duration) time.Duration {
 // HTTP client + rate limiter
 // -----------------------------------------------------------------------------
 
-// newHTTPClient builds the client of one Checker. c.Timeout bounds the
+// newHTTPClient builds the client of one Checker. Timeout bounds the
 // whole request and every phase of it: the dial, TLS handshake and
 // response-header timeouts used to be fixed at 10 s, so a timeout above
-// 10 s (-timeout 30s) still gave up after 10 s.
-func newHTTPClient(c Config) *http.Client {
+// 10 s (-timeout 30s) still gave up after 10 s. Every connection goes
+// through Checker.dial, which counts its bytes and puts its life in the
+// trace.
+func (chk *Checker) newHTTPClient() *http.Client {
+	c := chk.cfg
 	transport := &http.Transport{
 		MaxIdleConns:          c.MaxConns,
 		MaxIdleConnsPerHost:   c.MaxConns,
@@ -995,10 +1022,10 @@ func newHTTPClient(c Config) *http.Client {
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     true,
 		DisableCompression:    true,
-		DialContext: (&net.Dialer{
+		DialContext: chk.dial(&net.Dialer{
 			Timeout:   c.Timeout,
 			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		}),
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: c.InsecureTLS,
@@ -1101,7 +1128,9 @@ type liveStats struct {
 	challenges  int64
 	pauses      int64
 
-	busy, inFlight, waitGate, waitPause, waitRate, waitRetry, waitProbe int64
+	busy, inFlight, waitGate, waitPause, waitRate, waitRetry, waitProbe, waitConn int64
+
+	connOpen, bytesIn, bytesOut int64
 }
 
 func newLiveStats() *liveStats { return &liveStats{} }
@@ -1158,6 +1187,11 @@ func (s *liveStats) snapshot() Stats {
 		WaitRate:  atomic.LoadInt64(&s.waitRate),
 		WaitRetry: atomic.LoadInt64(&s.waitRetry),
 		WaitProbe: atomic.LoadInt64(&s.waitProbe),
+		WaitConn:  atomic.LoadInt64(&s.waitConn),
+
+		ConnOpen: atomic.LoadInt64(&s.connOpen),
+		BytesIn:  atomic.LoadInt64(&s.bytesIn),
+		BytesOut: atomic.LoadInt64(&s.bytesOut),
 	}
 }
 
@@ -1404,8 +1438,10 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 		return false
 	}
 	at.response(resp)
-	drainBody(resp.Body)
+	raw := &countReader{r: resp.Body, eof: at.bodyEOF}
+	drainBody(raw)
 	resp.Body.Close()
+	at.rawBytes = raw.n
 	at.done()
 	switch {
 	case resp.StatusCode == http.StatusOK:
