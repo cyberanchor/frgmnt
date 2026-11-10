@@ -18,6 +18,7 @@ import (
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
+	"github.com/cyberanchor/frgmnt/internal/rtstats"
 	"github.com/cyberanchor/frgmnt/internal/store"
 	"github.com/cyberanchor/frgmnt/internal/tracelog"
 	"github.com/cyberanchor/frgmnt/internal/version"
@@ -849,6 +850,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 			defer close(pipeStopped)
 			tick := time.NewTicker(time.Second)
 			defer tick.Stop()
+			rt := rtstats.NewReader() // the whole process: every tile shares it
 			for {
 				select {
 				case <-pipeDone:
@@ -860,7 +862,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 						"busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate, "wait_pause": e.WaitPause,
 						"wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
 						"wait_conn": e.WaitConn, "conn_open": e.ConnOpen, "bytes_in": e.BytesIn, "bytes_out": e.BytesOut,
-						"trace": trace.Stats(),
+						"trace": trace.Stats(), "runtime": rt.Read(),
 					}})
 				}
 			}
@@ -901,6 +903,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 			info["stopped"] = true
 		}
 		info["trace"] = trace.Stats()
+		info["runtime"] = rtstats.NewReader().Read()
 		trace.Write(checker.TraceEvent{Kind: "run_end", Info: info})
 		st, err := trace.Close()
 		if err != nil {

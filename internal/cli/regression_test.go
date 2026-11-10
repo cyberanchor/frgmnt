@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/rtstats"
 	"github.com/cyberanchor/frgmnt/internal/tracelog"
 )
 
@@ -866,6 +867,10 @@ func TestProgressShowsThePipelineAtDebug(t *testing.T) {
 	if got != want {
 		t.Errorf("pipelineLine = %q, want %q", got, want)
 	}
+	rl := runtimeLine(rtstats.Sample{Goroutines: 57, HeapBytes: 3 << 20, RSSBytes: 40 << 20, SchedLatP99Ms: 1.25, GCCycles: 12})
+	if want := "go=57 heap=3.0 MB rss=40.0 MB sched_p99=1.2ms gc=12"; rl != want {
+		t.Errorf("runtimeLine = %q, want %q", rl, want)
+	}
 	info := pipelineInfo(e, q, 8, 2.5)
 	if info["queue_in"] != 4096 || info["wait_rate"] != int64(3) || info["inst_rps"] != 2.5 {
 		t.Errorf("pipelineInfo = %v", info)
@@ -897,7 +902,8 @@ func TestTraceFileHasPipelineEvents(t *testing.T) {
 		}
 		if e.Kind == "pipeline" {
 			n++
-			if _, ok := e.Info["wait_rate"]; !ok || e.Info["workers"] != float64(2) {
+			rt, _ := e.Info["runtime"].(map[string]any)
+			if _, ok := e.Info["wait_rate"]; !ok || e.Info["workers"] != float64(2) || rt["goroutines"] == nil || rt["heap_bytes"] == nil {
 				t.Errorf("pipeline info %v", e.Info)
 			}
 		}

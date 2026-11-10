@@ -51,6 +51,7 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/rtstats"
 	"github.com/cyberanchor/frgmnt/internal/tracelog"
 	"github.com/cyberanchor/frgmnt/internal/version"
 )
@@ -672,6 +673,7 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queu
 	var lastChecked int64
 	lastTime := time.Now()
 	traceStopWarned := false
+	rt := rtstats.NewReader()
 	for {
 		select {
 		case <-ctx.Done():
@@ -686,14 +688,19 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queu
 			lastChecked = e.Checked
 			lastTime = now
 			line := fmt.Sprintf("[progress] %s | inst=%.0f r/s", stats.snapshot(e), instRPS)
+			var rs rtstats.Sample
+			if logLevel >= LevelDebug || trace != nil {
+				rs = rt.Read()
+			}
 			if logLevel >= LevelDebug {
-				line += " | " + pipelineLine(e, q, chk.Config().Workers)
+				line += " | " + pipelineLine(e, q, chk.Config().Workers) + " | " + runtimeLine(rs)
 			}
 			log.Print(line)
 			if trace != nil {
 				ts := trace.Stats()
 				info := pipelineInfo(e, q, chk.Config().Workers, instRPS)
 				info["trace"] = ts
+				info["runtime"] = rs
 				if ost != nil {
 					info["output"] = ost.info()
 				}
@@ -721,6 +728,17 @@ func pipelineLine(e checker.Stats, q queues, workers int) string {
 	return fmt.Sprintf("queue in=%d out=%d | workers net=%d conn=%d gate=%d pause=%d rate=%d retry=%d probe=%d idle=%d",
 		q.in(), q.out(), max(e.InFlight-e.WaitConn, 0), e.WaitConn, e.WaitGate, e.WaitPause, e.WaitRate,
 		e.WaitRetry, e.WaitProbe, max(idle, 0))
+}
+
+// runtimeLine is the state of the process in the -debug progress line:
+// goroutines, live heap, resident memory, how long goroutines waited for a
+// CPU (p99 in the last second) and the GC cycles so far.
+func runtimeLine(s rtstats.Sample) string {
+	line := fmt.Sprintf("go=%d heap=%s", s.Goroutines, fmtBytes(int64(s.HeapBytes)))
+	if s.RSSBytes > 0 {
+		line += " rss=" + fmtBytes(s.RSSBytes)
+	}
+	return line + fmt.Sprintf(" sched_p99=%.1fms gc=%d", s.SchedLatP99Ms, s.GCCycles)
 }
 
 // pipelineInfo is the same for the "pipeline" event of the trace.
@@ -1137,6 +1155,7 @@ func Main(args []string) int {
 		}
 		info["trace"] = trace.Stats()
 		info["output"] = out.st.info()
+		info["runtime"] = rtstats.NewReader().Read()
 		// How long the end took: the checks after the stop, then writing
 		// the last results out.
 		shutdown := map[string]any{"results_ms": writeDoneAt.Sub(runDoneAt).Milliseconds()}

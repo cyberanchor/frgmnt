@@ -1163,7 +1163,9 @@ func TestTileTraceHasPipelineEvents(t *testing.T) {
 	for _, e := range events {
 		if e.Kind == "pipeline" {
 			n++
-			if ts, _ := e.Info["trace"].(map[string]any); e.Info["workers"] != float64(1) || e.Info["busy"] == nil || ts["events"] == nil {
+			ts, _ := e.Info["trace"].(map[string]any)
+			rt, _ := e.Info["runtime"].(map[string]any)
+			if e.Info["workers"] != float64(1) || e.Info["busy"] == nil || ts["events"] == nil || rt["goroutines"] == nil {
 				t.Errorf("pipeline info %v", e.Info)
 			}
 		}
