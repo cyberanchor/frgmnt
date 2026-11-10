@@ -795,7 +795,7 @@ func Main(args []string) int {
 		debugFlag = fs.Bool("debug", false, "Print one line per HTTP try with its timings, the verdicts and cache use, and timing figures at the end")
 		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines (gzip when it ends in .gz): every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
 		traceOld  = fs.String("trace-file", "", "Deprecated spelling of -trace FILE")
-		traceBody = fs.String("trace-bodies", checker.BodiesAnomalies, "Pages the -trace keeps, whole and decoded (up to 1 MB each): anomalies (unknown answers, challenges, unexpected codes, errors), all, or none")
+		traceBody = fs.String("trace-bodies", checker.BodiesAnomalies, "Pages the -trace keeps, whole and decoded (up to 1 MB each), by `MODE`: anomalies (unknown answers, challenges, unexpected codes, errors), all, or none")
 		pprofAddr = fs.String("pprof", "", "Serve pprof on `ADDR` while the run goes on, e.g. 127.0.0.1:6060 (/debug/pprof/: CPU, heap, goroutines, block and mutex contention, execution trace)")
 		cpuProf   = fs.String("cpuprofile", "", "Write a CPU profile of the run to `FILE` (go tool pprof FILE)")
 		memProf   = fs.String("memprofile", "", "Write the heap profile at the end of the run to `FILE` (live and allocated memory: go tool pprof [-sample_index=alloc_space] FILE)")
@@ -804,7 +804,7 @@ func Main(args []string) int {
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
 	traceMax := byteSize(1 << 30)
-	fs.Var(&traceMax, "trace-max", "Largest size of the -trace files on disk, e.g. 512M or 2G (0 = no limit). The trace keeps the end of the run: FILE holds the newest part, FILE with .1 before the extension the part before it")
+	fs.Var(&traceMax, "trace-max", "Largest `SIZE` of the -trace files on disk, e.g. 512M or 2G (0 = no limit). The trace keeps the end of the run: FILE holds the newest part, FILE with .1 before the extension the part before it")
 	fs.Usage = func() { printUsage(fs) }
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {

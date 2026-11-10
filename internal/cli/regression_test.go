@@ -1044,7 +1044,8 @@ func TestUsageShowsTraceFile(t *testing.T) {
 	os.Stderr = stderr
 	_ = w.Close()
 	out, _ := io.ReadAll(r)
-	if code != 0 || !strings.Contains(string(out), "-trace FILE") || strings.Contains(string(out), "-trace-file") ||
+	if code != 0 || !strings.Contains(string(out), "-trace FILE") || !strings.Contains(string(out), "-trace-max SIZE") ||
+		!strings.Contains(string(out), "-trace-bodies MODE") || strings.Contains(string(out), "-trace-file") ||
 		strings.Contains(string(out), "implies -debug") {
 		t.Errorf("-h (exit %d):\n%s", code, out)
 	}
