@@ -1,5 +1,70 @@
 # Changelog
 
+## 3.0.0 (2026-11-10)
+
+The trace covers everything a run does, down to the bytes on the wire, and
+the program can be profiled.
+
+### Changed behaviour: read before upgrading
+
+- `-trace` takes a file now: `-trace run.jsonl.gz` writes the structured
+  trace (it was a flag that printed every step on the console and turned
+  `-debug` on). `-debug` and `-trace` are independent. The text trace level
+  is gone; `-trace-file` still works. A script that says `-trace -workers
+  200` or `-trace=true` gets exit 2 and an explanation.
+- The panel's "trace" log level is gone (a saved or sent "trace" means
+  debug); every step of every request is in the worker's trace file.
+- Panel traces are gzip (`<data>/traces/<id>.jsonl.gz`) and keep the last
+  100 MB (they kept the first 100 MB, so the end of a long run was cut);
+  the download is `application/gzip`.
+- Result times split three ways: `Took = Net + Wait + Work`. The wait for
+  a free connection (`-conns`) moved from Net to Wait, parsing and the page
+  cache from Net to Work (a new `work_ns` column in the panel).
+
+### Added
+
+- The trace (console `-trace FILE`, panel "Write a trace"):
+  - every request with all its headers both ways (cookie values hidden),
+    status line, length, trailers, every timing (DNS with its addresses,
+    TCP, TLS, headers written, first byte, body), the wait for a
+    connection, the bytes on the wire (HTTP/1.x) and of the body;
+  - the pages: `-trace-bodies anomalies` (default: unknown answers,
+    challenges, unexpected codes, errors), `all`, `none`; up to 1 MB each;
+  - connections: `conn_open`, `conn_tls` (version, cipher, ALPN,
+    certificate), `conn_close` (lifetime, bytes, requests), `conn_error`;
+  - the engine's decisions: why each try was repeated and how long it
+    waited, reused probes, challenge runs, `stop` with the reason;
+  - ids that tie it together: `nid` (a check of a name), `aid` (a request),
+    `cid` (a connection), `w` (the worker), `seq` (the line);
+  - around the engine: the list read (`input`, `input_skip`), the output
+    written, the time the end took, the panel's writes to SQLite
+    (`db_flush`) and the list a run started from;
+  - the process every second (`runtime`): goroutines, heap, GC pauses,
+    scheduling latency, CPU, resident memory, open files;
+  - `run_start` with the build, the machine and the whole config.
+- The trace writer: one goroutine, gzip for `.gz`, `-trace-max` (default
+  1G) keeping the tail in two segments, and it stops when less than 256 MB
+  are free on its disk.
+- Profiling: `-pprof ADDR`, `-cpuprofile`, `-memprofile`, `-exectrace`
+  in the console, `frgmnt web -pprof` (behind the login); pprof labels per
+  component and tile; a `check` task per name in the execution trace.
+- `-tls-keylog FILE` (console and panel): the TLS keys for Wireshark.
+- The panel logs every request to it at the debug level (not its own
+  quick polls, never a token).
+- README: "Debug, trace and profiling".
+
+### Fixed
+
+- The httptrace hooks wrote a request's record from the transport's
+  goroutines without a lock (a data race under HTTP/2 and on cancelled
+  dials).
+- The trace lost the `conn_close` events and could have a progress event
+  after `run_end`; a `-trace` path equal to `-output` (or the input)
+  wiped that file; a broken page-cache entry was a silent miss;
+  `wait_probe` counted the worker making the probe twice.
+- A rate test failed on a loaded machine (it measured from the first
+  arrival instead of the run's start).
+
 ## 2.1.0 (2026-11-09)
 
 Debug and trace cover every request and every step of the engine.

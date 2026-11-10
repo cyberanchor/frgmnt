@@ -40,7 +40,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
 ```
 
 Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
-`frgmnt 2.1.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
+`frgmnt 3.0.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
 `./frgmnt web -h` and `./frgmnt token -h` list every flag. The old shorthands still work:
 `./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
 
@@ -129,6 +129,9 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-quiet` / `-debug` | | Less output on stdout, or one line per HTTP try with its timings on stderr and timing figures at the end |
 | `-trace FILE` | | Structured trace of the run as JSON Lines (gzip when `FILE` ends in `.gz`); independent of `-debug` |
 | `-trace-max` | `1G` | Largest size of the trace on disk (`0` = no limit); it keeps the end of the run: `FILE` holds the newest part, `FILE` with `.1` before the extension the part before it. The trace also stops when less than 256 MB are free on the disk |
+| `-trace-bodies` | `anomalies` | Pages the trace keeps whole: `anomalies` (unknown answers, challenges, unexpected codes, errors), `all`, `none` |
+| `-pprof ADDR` / `-cpuprofile` / `-memprofile` / `-exectrace FILE` | | Profiling: live pprof, a CPU profile, the heap profile, the execution trace (see [Debug, trace and profiling](#debug-trace-and-profiling)) |
+| `-tls-keylog FILE` | | Append the TLS keys of the run to `FILE` for Wireshark (keep it private) |
 | `-insecure` | | Skip TLS verification (debugging only) |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 
@@ -137,8 +140,8 @@ short are not written, so `-resume` checks them again.
 
 Exit codes: `0` done; `1` the results file could not be written, or every
 checked name ended with an error; `2` bad flags (unknown `-filter` status,
-`-input` and `-output` being the same file, `-trace` without a file or on
-a file of the run); `3` stopped because Fragment
+`-input` and `-output` being the same file, `-trace` without a file, a
+trace or profile on a file of the run); `3` stopped because Fragment
 answers with a Cloudflare challenge (see above).
 
 ## Web panel
@@ -181,6 +184,8 @@ answers with a Cloudflare challenge (see above).
 | `-allow-host` | | Host names the panel answers to besides `localhost`, comma-separated: the domain of a reverse proxy in front of it |
 | `-tls-cert` / `-tls-key` | | PEM certificate (full chain) and key: serve HTTPS; the files are read again every 10 s, so renewals apply without a restart |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
+| `-pprof` | | Serve pprof under `/debug/pprof/`, behind the login |
+| `-tls-keylog` | | Append the TLS keys of every run to a file for Wireshark (keep it private) |
 | `-version` | | Print the version |
 
 ### Access
@@ -243,6 +248,8 @@ also when the proxy sends its own `Host`).
 | GET | `/api/workers/{id}/results` | `?after=ID&limit=N`, with counts per status |
 | GET | `/api/workers/{id}/results/download` | Plain-text results |
 | GET | `/api/workers/{id}/events` | SSE: progress and log of one worker |
+| GET / DELETE | `/api/workers/{id}/trace` | The worker's trace (gzip JSON Lines, the older segment first), or delete it (not while it runs) |
+| GET | `/debug/pprof/...` | pprof, with `frgmnt web -pprof` only |
 | GET | `/api/logs` · `/api/logs/stream` | Recent log entries (`?topic=ID&limit=N`), SSE live tail |
 
 Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
@@ -252,7 +259,9 @@ Bodies are JSON (50 MB cap; uploads 100 MB). Config limits: `workers` and
 up to 24 hours. 0 or a missing
 field means the default; a negative or too large value is answered with 400.
 `cache_dir` cannot be set through the API: the page cache directory is set
-for the whole panel with `-cache-dir`.
+for the whole panel with `-cache-dir`. `trace` (true/false) writes the
+worker's trace, `trace_bodies` (`anomalies`, `all`, `none`) chooses the
+pages it keeps.
 
 ```bash
 TOKEN=$(./frgmnt token -data ./data -name script 2>/dev/null)
@@ -270,6 +279,7 @@ data/
   settings.json    # global settings, editable by hand
   auth.key         # the key that signs access tokens (mode 0600); replace it with "frgmnt token -rotate"
   pagecache/       # gzipped Fragment pages + JSON metadata, two-level shards
+  traces/          # <id>.jsonl.gz (+ <id>.1.jsonl.gz): the traces of workers with "Write a trace" (mode 0600)
 ```
 
 ## Large lists and load
@@ -339,6 +349,101 @@ so parser fixes apply to old entries.
 When Fragment cannot be reached, a stale **sold** or **taken** entry is served
 and marked as such (`network failed (...); served stale cache`). Stale auction
 or sale pages are not served: those are likely over.
+
+## Debug, trace and profiling
+
+Three tools, each independent of the others:
+
+| What | Console | Panel |
+| ---- | ------- | ----- |
+| One line per HTTP try (outcome, waits, DNS/TCP/TLS/first byte/body, connection) and timing figures at the end | `-debug` | log level `debug` (the Logs tab), with every request to the panel itself |
+| The structured trace: every request and answer, every engine decision, the connections, the process | `-trace run.jsonl.gz` | "Write a trace" in the worker's settings, **Download trace** in its details |
+| Profiles: CPU, heap, goroutines, blocking, mutexes, the execution trace | `-pprof`, `-cpuprofile`, `-memprofile`, `-exectrace` | `frgmnt web -pprof` |
+
+### The trace
+
+JSON Lines, gzip when the file ends in `.gz` (about 11 times smaller; read it with `zcat`
+or `gzip -dc`). Every line has `seq` (numbered from 1 across the file's segments: a
+gap means lost lines), `ts` and `kind`. Events of one check of a name share `nid`,
+every HTTP request has its `aid`, every connection its `cid`, and `w` is the worker
+that did it.
+
+| kind | What it records |
+| ---- | --------------- |
+| `run_start` | version, `schema` (2), `env` (Go version, OS, CPUs, PID, VCS revision), `config` (the whole effective config), the arguments or the panel's worker and its last list |
+| `input`, `input_skip` | the list as read (bytes, queued, duplicates, `-resume` skips); the first 1,000 names left out and why |
+| `cache` | `hit`, `stale`, `miss` or `error` (a broken entry, and why), with its age and read time |
+| `attempt` | one HTTP try: `method`, `req_headers` as sent, the waits before it (`wait_gate_ms`, `wait_pause_ms`, `wait_rate_ms`, `conn_wait_ms`, `retry_delay_ms`, `probe_wait_ms`) and `retry_reason`; `dns_ms`/`dns_addrs`, `connect_ms`, `tls_ms`, `wrote_headers_ms`, `ttfb_ms`, `body_ms`, `net_ms`, `work_ms`; `status_line`, every `resp_headers`, `content_length`, `trailers`; `bytes` read for the parser, `body_raw_bytes` received, `wire_in`/`wire_out` on HTTP/1.x; `parse_us`, `cache_write_ms`; the verdict with `confidence` and `evidence`; `body` (or `body_b64`) when kept |
+| `probe` | the throttle probe, like an attempt, with `healthy`; `reused` when another worker's probe answered |
+| `result` | one name: status, `attempts`, `took_ms` = `net_ms` + `wait_ms` + `work_ms`, `conn_wait_ms` |
+| `conn_open`, `conn_tls`, `conn_close`, `conn_error` | a connection: dial time and addresses; TLS version, cipher, ALPN, resumption, certificate; lifetime, `bytes_in`/`bytes_out` on the wire, `requests` |
+| `gate`, `pause`, `throttle_over`, `blocked`, `stop` | the engine's decisions and why the run ended |
+| `pipeline` (every second) | queues, what the workers do, the writer's and the trace's counters, `runtime` (goroutines, heap, GC pauses, scheduling latency p50/p99, CPU, RSS, open files) |
+| `db_flush` (panel) | every write of results to SQLite: rows, time, errors |
+| `segment`, `trace_stopped` | the trace kept its tail (the start was dropped to stay under `-trace-max`), or stopped on a low disk |
+| `run_end` | every counter, the output written, the time the end took, the runtime |
+
+Pages: `-trace-bodies anomalies` (the default) keeps the whole decoded page of unknown
+answers, challenges, unexpected codes and errors, up to 1 MB; `all` keeps every page.
+Cookie values never appear (names only), and access tokens are never logged.
+
+Size and cost, measured against a local stand-in with real Fragment pages and headers:
+
+| | per name, plain | per name, `.gz` | CPU of the checker |
+| - | --------------- | --------------- | ------------------ |
+| no trace | | | +1% over 2.1.0 |
+| free names | 1.7 KB | 157 B | +35% |
+| pages (16 KB each) | 2.0 KB | 200 B | +35% |
+| pages, `-trace-bodies all` | 19 KB | 3 KB | +100% |
+
+A million names make about 160–200 MB of `.gz` trace without pages. The console keeps
+the last `-trace-max` (1 GB), the panel the last 100 MB per worker, and a trace stops
+when less than 256 MB are free on its disk.
+
+```bash
+T=run.jsonl.gz
+zcat $T | jq -c 'select(.kind=="result") | [.took_ms, .name, .net_ms, .wait_ms, .work_ms, .attempts]' | sort -t'[' -k2 -g -r | head  # slowest names
+zcat $T | jq -n '[inputs | select(.kind=="result")] | {net: (map(.net_ms // 0)|add), wait: (map(.wait_ms // 0)|add), work: (map(.work_ms // 0)|add)}'  # where the time went
+zcat $T | jq -c 'select(.kind=="conn_close") | {cid, requests, bytes_in, lifetime_ms}'  # the connections
+zcat $T | jq -r 'select(.kind=="attempt" and .retry_reason) | .retry_reason' | sort | uniq -c   # why tries were repeated
+zcat $T | jq -c 'select(.kind=="pause" or .kind=="throttle_over" or .kind=="blocked" or .kind=="stop")'  # throttling and the end
+zcat $T | jq -c 'select(.nid==42)'                                     # everything about one check
+zcat $T | jq -r 'select(.name=="durov" and .body) | .body' > durov.html  # a kept page
+zcat $T | jq -c 'select(.kind=="pipeline") | .info.runtime | {goroutines, heap_bytes, sched_lat_p99_ms}'
+```
+
+### Profiling
+
+```bash
+./frgmnt check -input names.txt -output r.txt -pprof 127.0.0.1:6060 &
+go tool pprof -top http://127.0.0.1:6060/debug/pprof/profile?seconds=30     # CPU
+go tool pprof -tagfocus component=check-worker http://127.0.0.1:6060/debug/pprof/profile?seconds=30
+go tool pprof http://127.0.0.1:6060/debug/pprof/heap                        # memory (-sample_index=alloc_space)
+go tool pprof http://127.0.0.1:6060/debug/pprof/block                       # where goroutines wait
+./frgmnt check -input names.txt -output r.txt -cpuprofile cpu.pprof -memprofile mem.pprof -exectrace exec.trace
+go tool trace exec.trace    # "User-defined tasks": one "check" per name, with its regions
+curl -H "Authorization: Bearer $TOKEN" -o cpu.pprof "https://panel/debug/pprof/profile?seconds=30"  # panel (frgmnt web -pprof)
+```
+
+Labels: `component` = `check-worker`, `producer`, `writer`, `progress`, `persister`,
+`trace-writer`, `http-api`; `tile` = the worker id in the panel. `-pprof` also turns on
+the block profile (one event per millisecond blocked) and the mutex profile (1 in 100).
+pprof shows the command line, every goroutine's stack and the memory: `-pprof` warns when
+its address is not on this machine, and the panel serves it behind its login.
+
+### Every byte on the wire
+
+The trace has the requests and answers as the program sees them. The bytes on the
+wire (TLS records, HTTP/2 frames) need a capture and the session keys:
+
+```bash
+sudo tcpdump -i any -w fragment.pcap 'tcp port 443' &
+./frgmnt check -input names.txt -output r.txt -tls-keylog keys.log
+tshark -r fragment.pcap -o tls.keylog_file:keys.log -Y http2   # or Wireshark: TLS → (Pre)-Master-Secret log filename
+GODEBUG=http2debug=2 ./frgmnt check ...                        # the HTTP/2 frames on stderr, very verbose
+```
+
+`keys.log` decrypts the whole capture: keep it private and delete it after use.
 
 ## Build and tests
 
