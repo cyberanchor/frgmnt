@@ -88,6 +88,10 @@ type Result struct {
 	// ConnWait is the part of Wait spent waiting for a free connection
 	// (all -conns busy); it used to be counted as network time.
 	ConnWait time.Duration `json:"conn_wait_ns,omitempty"`
+	// Work is the time spent on this machine: parsing the pages, reading
+	// and writing the page cache. Took = Net + Wait + Work; parsing and
+	// the cache write used to count as network time.
+	Work time.Duration `json:"work_ns,omitempty"`
 
 	// Confidence is 0..100 and explains how certain the parser is.
 	// Cached is true when the answer came from the on-disk page cache.
@@ -146,10 +150,23 @@ type Config struct {
 	ThrottleMax time.Duration `json:"throttle_max_ns,omitempty"`
 
 	// Trace is for the web panel: it writes the structured trace of this
-	// worker's runs to <data>/traces/<id>.jsonl. The engine does not read
-	// it (the console has -trace FILE).
+	// worker's runs to <data>/traces/<id>.jsonl.gz. The engine does not
+	// read it (the console has -trace FILE).
 	Trace bool `json:"trace,omitempty"`
+
+	// TraceBodies says which pages the trace keeps (whole, decoded, up to
+	// 1 MB each): "anomalies" (the default, also ""): unknown answers,
+	// challenges, unexpected codes and errors; "all": every answer;
+	// "none". It only matters when the trace is on.
+	TraceBodies string `json:"trace_bodies,omitempty"`
 }
+
+// Values of Config.TraceBodies.
+const (
+	BodiesAnomalies = "anomalies"
+	BodiesAll       = "all"
+	BodiesNone      = "none"
+)
 
 // Upper bounds for Config values. The web API rejects values above them;
 // normalizeConfig clamps anything that still gets through (for example a
@@ -196,6 +213,11 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
+	switch c.TraceBodies {
+	case "", BodiesAnomalies, BodiesAll, BodiesNone:
+	default:
+		return fmt.Errorf("trace_bodies must be anomalies, all or none, got %q", c.TraceBodies)
+	}
 	return nil
 }
 
@@ -240,6 +262,9 @@ type Stats struct {
 	CacheHits   int64 `json:"cache_hits"`
 	CacheStale  int64 `json:"cache_stale"`
 	CacheMisses int64 `json:"cache_misses"`
+	// CacheErrors counts the misses where an entry was there but could
+	// not be read (a broken file, a permission); part of CacheMisses.
+	CacheErrors int64 `json:"cache_errors"`
 
 	// Challenges counts Cloudflare challenge answers (HTTP 403 with
 	// cf-mitigated: challenge, or a "Just a moment..." page).
@@ -482,19 +507,22 @@ func (c *Checker) worker(ctx context.Context, in <-chan string, out chan<- Resul
 // entries are used as a fallback if the network ultimately fails.
 func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 	start := time.Now()
-	var net, connWait time.Duration // this name's own requests on the network, and waiting for a connection
+	// This name's own requests on the network, the wait for a connection
+	// (part of Wait), and the work on this machine (parsing, page cache).
+	var net, connWait, work time.Duration
 	tries := 0
 	defer func() {
 		res.Took = time.Since(start)
 		res.Net = net
-		res.Wait = res.Took - net
+		res.Work = work
+		res.Wait = max(res.Took-net-work, 0)
 		res.ConnWait = connWait
 		res.Attempts = tries
 		if c.eventsOn() {
 			c.event(TraceEvent{Kind: "result", Name: res.Username, Status: res.Status,
 				Confidence: res.Confidence, Evidence: res.Evidence, Offset: res.Offset, Error: res.Error,
 				Attempts: res.Attempts, TookMs: ms(res.Took), NetMs: ms(res.Net), WaitMs: ms(res.Wait),
-				ConnWaitMs: ms(res.ConnWait), Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
+				ConnWaitMs: ms(res.ConnWait), WorkMs: ms(res.Work), Cached: res.Cached, Stale: res.Stale, NotSent: res.notSent,
 				Cancelled: ctx.Err() != nil && res.Status == StatusError})
 		}
 	}()
@@ -505,10 +533,16 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 
 	var stale *Result
 	if c.cache != nil {
-		if ent, body, ok := c.cache.get(name); ok {
+		readStart := time.Now()
+		ent, body, ok, cerr := c.cache.get(name)
+		read := time.Since(readStart)
+		work += read
+		if ok {
 			// Re-parse the cached HTML with the current parser so parser
 			// improvements apply retroactively to old cache entries.
+			parseStart := time.Now()
 			pi := ParseStatusDetailed(body)
+			work += time.Since(parseStart)
 			st, conf, ev := pi.Status, pi.Confidence, pi.Evidence
 			if !pi.Found {
 				st, conf, ev = ent.Status, ent.Confidence, ent.Evidence
@@ -524,12 +558,12 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			if c.cache.fresh(st, ent.FetchedAt) {
 				atomic.AddInt64(&c.stats.cacheHits, 1)
 				c.debugf("cache hit: %s -> %s (confidence=%d; %s; %v old)", name, st, conf, ev, age.Round(time.Second))
-				c.event(TraceEvent{Kind: "cache", Name: name, Cache: "hit", Status: st, AgeMs: ms(age)})
+				c.event(TraceEvent{Kind: "cache", Name: name, Cache: "hit", Status: st, AgeMs: ms(age), ReadMs: ms(read)})
 				return cached
 			}
 			atomic.AddInt64(&c.stats.cacheStale, 1)
 			c.debugf("cache stale: %s -> %s (%v old); re-checking", name, st, age.Round(time.Second))
-			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "stale", Status: st, AgeMs: ms(age)})
+			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "stale", Status: st, AgeMs: ms(age), ReadMs: ms(read)})
 			// Only settled verdicts are served after a network failure: a
 			// sold or taken name rarely changes, while an auction or a sale
 			// seen days ago is likely over.
@@ -539,7 +573,15 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			}
 		} else {
 			atomic.AddInt64(&c.stats.cacheMisses, 1)
-			c.event(TraceEvent{Kind: "cache", Name: name, Cache: "miss"})
+			e := TraceEvent{Kind: "cache", Name: name, Cache: "miss", ReadMs: ms(read)}
+			if cerr != nil {
+				// An entry that is there but broken used to be a silent
+				// miss: it is checked over the network, and now it shows.
+				atomic.AddInt64(&c.stats.cacheErrors, 1)
+				e.Cache, e.Error = "error", cerr.Error()
+				c.debugf("cache error: %s: %v; checking it over the network", name, cerr)
+			}
+			c.event(e)
 		}
 	}
 
@@ -557,6 +599,7 @@ func (c *Checker) CheckOne(ctx context.Context, raw string) (res Result) {
 			r, retry, errStr := c.doRequest(ctx, name, reqURL, tries)
 			net += r.Net
 			connWait += r.ConnWait
+			work += r.Work
 			if !retry {
 				return r
 			}
@@ -696,7 +739,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 	defer func() {
 		at.done()
 		tm := at.timing(at.snapshot())
-		res.Net, res.ConnWait = tm.net, tm.connWait
+		res.Net, res.ConnWait, res.Work = tm.net, tm.connWait, tm.work
 		at.finish(res, retry)
 	}()
 	release, w, err := c.admit(ctx)
@@ -743,25 +786,34 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 		return Result{Username: name, Status: StatusError, Error: err.Error()}, isRetriableNet(err), err.Error()
 	}
 	defer resp.Body.Close()
-	// The body as it came (compressed), counted; the rest after what the
-	// parser reads is drained so the connection can be reused.
+	// The body as it came (compressed), counted. When the try is over, the
+	// trace keeps the page if it wants it (Config.TraceBodies), and the
+	// rest after what the parser read is drained so the connection can be
+	// reused.
 	raw := &countReader{r: resp.Body, eof: at.bodyEOF}
+	var bodyReader io.Reader = raw
+	var gz *gzip.Reader
 	defer func() {
+		if at.wantBody(res) {
+			at.keepBody(bodyReader)
+		}
+		if gz != nil {
+			gz.Close()
+		}
 		drainBody(raw)
 		at.rawBytes = raw.n
+		at.trailer = resp.Trailer
 	}()
 	at.response(resp)
 
-	var bodyReader io.Reader = raw
 	switch ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); ce {
 	case "gzip":
-		gz, gzErr := gzip.NewReader(raw)
+		g, gzErr := gzip.NewReader(raw)
 		if gzErr != nil {
 			c.debugf("%s gzip error: %v", at.who(), gzErr)
 			return Result{Username: name, Status: StatusError, Error: "gzip: " + gzErr.Error()}, false, gzErr.Error()
 		}
-		defer gz.Close()
-		bodyReader = gz
+		gz, bodyReader = g, g
 	case "", "identity":
 		// no decompression needed
 	default:
@@ -839,12 +891,17 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 		}
 		body := buf[:n]
 		if readErr != nil {
+			at.keepHead(body, true)
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
 			return Result{Username: name, Status: StatusError, Error: readErr.Error()}, isRetriableNet(readErr), readErr.Error()
 		}
 		c.debugf("%s body: %d bytes read (limit %d)", at.who(), n, c.cfg.ReadLimit)
+		parseStart := time.Now()
 		pi := ParseStatusDetailed(body)
+		at.parse = time.Since(parseStart)
+		at.work += at.parse
+		at.keepHead(body, !pi.Found || pi.Challenge)
 		if pi.Challenge {
 			*bufPtr = buf
 			c.pool.Put(bufPtr)
@@ -856,8 +913,19 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 		c.noteAnswer()
 		c.noteHealthy()
 		if c.cache != nil && pi.Found {
-			// Best-effort: never let a read-only cache directory fail a check.
-			_ = c.cache.put(name, reqURL, pi, body)
+			// Best-effort: never let a read-only cache directory fail a
+			// check. The error is in the trace and the debug line.
+			t := time.Now()
+			err := c.cache.put(name, reqURL, pi, body)
+			at.cacheWrite = time.Since(t)
+			at.work += at.cacheWrite
+			switch {
+			case err != nil:
+				at.cacheErr = err.Error()
+				c.debugf("%s page cache write failed: %v", at.who(), err)
+			case cacheableStatus(pi.Status):
+				at.cacheWriteBytes = n
+			}
 		}
 		if !pi.Found {
 			c.debugf("%s STATUS NOT FOUND in %d bytes (increase -readlimit)", at.who(), n)
@@ -879,6 +947,7 @@ func (c *Checker) doRequest(ctx context.Context, name, reqURL string, try int) (
 			// A proxy may drop cf-mitigated; the page itself still shows.
 			head, _ := io.ReadAll(io.LimitReader(bodyReader, 8<<10))
 			at.bodyDone, at.bytes = time.Now(), len(head)
+			at.keepHead(head, true)
 			if looksLikeChallenge(head) {
 				challenged = true
 				return c.challengeResult(at, resp.StatusCode)
@@ -1125,6 +1194,7 @@ type liveStats struct {
 	cacheHits   int64
 	cacheStale  int64
 	cacheMisses int64
+	cacheErrors int64
 	challenges  int64
 	pauses      int64
 
@@ -1177,6 +1247,7 @@ func (s *liveStats) snapshot() Stats {
 		CacheHits:   atomic.LoadInt64(&s.cacheHits),
 		CacheStale:  atomic.LoadInt64(&s.cacheStale),
 		CacheMisses: atomic.LoadInt64(&s.cacheMisses),
+		CacheErrors: atomic.LoadInt64(&s.cacheErrors),
 		Challenges:  atomic.LoadInt64(&s.challenges),
 		Pauses:      atomic.LoadInt64(&s.pauses),
 
@@ -1439,9 +1510,16 @@ func (c *Checker) probeHealthy(ctx context.Context) bool {
 	}
 	at.response(resp)
 	raw := &countReader{r: resp.Body, eof: at.bodyEOF}
+	// The probe's page goes in the trace with "all", and with "anomalies"
+	// when the answer is neither a page nor a redirect.
+	if mode := at.bodyMode(); mode == BodiesAll ||
+		mode == BodiesAnomalies && (resp.StatusCode < 200 || resp.StatusCode >= 400) {
+		at.keepBody(raw)
+	}
 	drainBody(raw)
 	resp.Body.Close()
 	at.rawBytes = raw.n
+	at.trailer = resp.Trailer
 	at.done()
 	switch {
 	case resp.StatusCode == http.StatusOK:

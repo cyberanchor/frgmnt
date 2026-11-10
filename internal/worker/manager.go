@@ -779,7 +779,8 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 				"retry_delay_ms": cfg.RetryDelay.Milliseconds(), "timeout_ms": cfg.Timeout.Milliseconds(),
 				"read_limit": cfg.ReadLimit, "rl_wait_max_ms": cfg.RLWaitMax.Milliseconds(),
 				"block_cooldown_ms": cfg.BlockCooldown.Milliseconds(), "throttle_max_ms": cfg.ThrottleMax.Milliseconds(),
-				"cache_dir": cfg.CacheDir, "log": m.bus.Level().String(),
+				"cache_dir": cfg.CacheDir, "log": m.bus.Level().String(), "trace_bodies": cfg.TraceBodies,
+				"trace_max": maxTraceBytes,
 			}})
 		}
 	}
@@ -1011,6 +1012,7 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 					"took_ms":    r.Took.Milliseconds(),
 					"net_ms":     r.Net.Milliseconds(),
 					"wait_ms":    r.Wait.Milliseconds(),
+					"work_ms":    r.Work.Milliseconds(),
 					"attempts":   r.Attempts,
 					"confidence": r.Confidence,
 					"evidence":   r.Evidence,
@@ -1030,6 +1032,7 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 				Cached:     r.Cached,
 				NetNs:      r.Net.Nanoseconds(),
 				WaitNs:     r.Wait.Nanoseconds(),
+				WorkNs:     r.Work.Nanoseconds(),
 				Attempts:   r.Attempts,
 			})
 			if len(batch) >= batchSize && !time.Now().Before(retryAt) {

@@ -34,9 +34,9 @@ func TestPageCacheRoundTrip(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	ent, got, ok := c.get("adam")
-	if !ok {
-		t.Fatal("get: cache miss after put")
+	ent, got, ok, err := c.get("adam")
+	if !ok || err != nil {
+		t.Fatalf("get: cache miss after put (%v)", err)
 	}
 	if string(got) != soldPageFixture {
 		t.Fatalf("body mismatch: %q", string(got))
@@ -64,8 +64,8 @@ func TestPageCacheVolatileDisabled(t *testing.T) {
 	if err := c.put("x", "u", info, []byte("body")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if _, _, ok := c.get("x"); ok {
-		t.Fatal("volatile status was cached despite CacheTTL<0")
+	if _, _, ok, err := c.get("x"); ok || err != nil {
+		t.Fatalf("volatile status was cached despite CacheTTL<0 (or an error: %v)", err)
 	}
 }
 

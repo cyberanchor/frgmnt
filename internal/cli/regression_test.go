@@ -1104,3 +1104,51 @@ func TestByteSizeFlag(t *testing.T) {
 		}
 	}
 }
+
+// -trace-bodies takes anomalies, all or none; anything else stops the run
+// before a file is touched. The -debug summary shows the work on this
+// machine apart from the network and the waiting.
+func TestTraceBodiesFlagAndWorkLine(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	if err := os.WriteFile(in, []byte("alice\ncarol\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	defer func(l LogLevel) { logLevel = l }(logLevel)
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	out := filepath.Join(dir, "out.txt")
+	if code := Main([]string{"-input", in, "-output", out, "-trace", filepath.Join(dir, "t.jsonl"),
+		"-trace-bodies", "pages"}); code != 2 {
+		t.Errorf("-trace-bodies pages: exit %d, want 2", code)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("the output was created before the bad flag was refused")
+	}
+	tracePath := filepath.Join(dir, "all.jsonl")
+	if code := Main([]string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "1", "-debug", "-trace", tracePath, "-trace-bodies", "all"}); code != 0 {
+		t.Fatalf("exit %d\n%s", code, logs.String())
+	}
+	if !strings.Contains(logs.String(), "Work per name on this machine (parsing, page cache): p50=") {
+		t.Errorf("no work line in the summary:\n%s", logs.String())
+	}
+	events, err := tracelog.ReadAll(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := 0
+	for _, e := range events {
+		if e.Kind == "run_start" && e.Info["trace_bodies"] != "all" {
+			t.Errorf("run_start info %v", e.Info)
+		}
+		if e.Kind == "attempt" && e.Body != "" {
+			kept++
+		}
+	}
+	if kept != 2 {
+		t.Errorf("%d pages kept with -trace-bodies all, want 2", kept)
+	}
+}

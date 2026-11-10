@@ -429,6 +429,7 @@ function openWorkerModal(w) {
     $("#worker-timeout").value = nsToSec(cfg.timeout_ns ?? def.timeout_ns ?? 15_000_000_000);
     $("#worker-ua").value = cfg.user_agent ?? "";
     $("#worker-trace").checked = !!cfg.trace;
+    $("#worker-trace-bodies").value = cfg.trace_bodies || "anomalies";
 
     workerModal.removeAttribute("hidden");
     setTimeout(() => $("#worker-name").focus(), 30);
@@ -475,6 +476,7 @@ $("#worker-form").addEventListener("submit", async (ev) => {
         timeout_ns: (+$("#worker-timeout").value || 15) * 1_000_000_000,
         user_agent: $("#worker-ua").value.trim(),
         trace: $("#worker-trace").checked,
+        trace_bodies: $("#worker-trace-bodies").value,
     });
     const body = { name: $("#worker-name").value.trim(), config: cfg };
     try {
@@ -590,7 +592,11 @@ function buildResultRow(r) {
     if (r.evidence) tip.push(r.evidence);
     if (r.took_ns) {
         let t = `took ${fmtMs(r.took_ns)}`;
-        if (r.net_ns || r.wait_ns) t += ` (network ${fmtMs(r.net_ns || 0)}, waiting ${fmtMs(r.wait_ns || 0)})`;
+        if (r.net_ns || r.wait_ns) {
+            t += ` (network ${fmtMs(r.net_ns || 0)}, waiting ${fmtMs(r.wait_ns || 0)}`;
+            if (r.work_ns) t += `, work ${fmtMs(r.work_ns)}`;
+            t += ")";
+        }
         if (r.attempts) t += `, ${r.attempts} ${r.attempts === 1 ? "try" : "tries"}`;
         tip.push(t);
     }

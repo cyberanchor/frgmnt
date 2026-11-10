@@ -83,15 +83,34 @@ type attempt struct {
 	waits waits // before the request: the gate, a shared pause, a -rate start
 
 	// Set on the goroutine of the request.
-	start, end time.Time // request sent .. body drained
-	bodyDone   time.Time
-	inFlight   bool // counted in Stats.InFlight until done
-	cookies    []string
-	code       int
-	proto      string
-	header     http.Header
-	bytes      int   // body bytes read for the parser (decoded)
-	rawBytes   int64 // body bytes received, as sent (compressed), drained rest included
+	start, end    time.Time // request sent .. body drained
+	bodyDone      time.Time
+	inFlight      bool // counted in Stats.InFlight until done
+	method, host  string
+	reqHeader     http.Header // as the request was built; the jar adds the cookies (names in cookies)
+	cookies       []string
+	code          int
+	status        string // "302 Found"
+	proto         string
+	header        http.Header
+	contentLength int64
+	trailer       http.Header
+	bytes         int   // body bytes read for the parser (decoded)
+	rawBytes      int64 // body bytes received, as sent (compressed), drained rest included
+
+	// The page, when the trace keeps it (Config.TraceBodies): head is
+	// what the parser read, body the whole decoded page up to maxKeptBody.
+	head, body    []byte
+	bodyKept      bool
+	bodyTruncated bool
+
+	// Time on this machine inside the request: parsing the page and
+	// writing it to the page cache. It is not network time.
+	work            time.Duration
+	parse           time.Duration
+	cacheWrite      time.Duration
+	cacheWriteBytes int
+	cacheErr        string
 	// The bytes on the connection for this request, taken when its body
 	// hit EOF: right after that an HTTP/1.1 connection goes back to the
 	// pool and the next request starts on it.
@@ -146,9 +165,13 @@ func (a *attempt) who() string {
 	return fmt.Sprintf("@%s #%d", a.name, a.try)
 }
 
-// begin marks the request as sent and notes the cookies the jar will add
-// (names only).
+// begin marks the request as sent and notes it: method, host, headers,
+// and the cookies the jar will add (names only).
 func (a *attempt) begin(req *http.Request) {
+	a.method, a.host = req.Method, req.URL.Host
+	if a.c.eventsOn() {
+		a.reqHeader = req.Header.Clone()
+	}
 	if jar := a.c.client.Jar; jar != nil {
 		for _, ck := range jar.Cookies(req.URL) {
 			a.cookies = append(a.cookies, ck.Name)
@@ -162,8 +185,97 @@ func (a *attempt) begin(req *http.Request) {
 // response keeps what the answer says.
 func (a *attempt) response(resp *http.Response) {
 	a.code = resp.StatusCode
+	a.status = resp.Status
 	a.proto = resp.Proto
 	a.header = resp.Header
+	a.contentLength = resp.ContentLength
+}
+
+// maxKeptBody caps a page kept in the trace.
+const maxKeptBody = 1 << 20
+
+// bodyMode is Config.TraceBodies in effect: none without a trace.
+func (a *attempt) bodyMode() string {
+	if !a.c.eventsOn() {
+		return BodiesNone
+	}
+	if m := a.c.cfg.TraceBodies; m != "" {
+		return m
+	}
+	return BodiesAnomalies
+}
+
+// keepHead copies what the parser read when the trace may keep the page;
+// anomaly says the answer is one that "anomalies" keeps.
+func (a *attempt) keepHead(b []byte, anomaly bool) {
+	switch a.bodyMode() {
+	case BodiesAll:
+	case BodiesAnomalies:
+		if !anomaly {
+			return
+		}
+	default:
+		return
+	}
+	a.head = append(a.head[:0], b...)
+}
+
+// wantBody tells whether the trace keeps the page of a try that ended
+// with res: every page with "all"; with "anomalies" the unknown answers
+// and the errors (challenges, unexpected codes, 429, broken bodies).
+func (a *attempt) wantBody(res Result) bool {
+	switch a.bodyMode() {
+	case BodiesAll:
+		return true
+	case BodiesAnomalies:
+		return res.Status == StatusUnknown || res.Status == StatusError && !res.notSent
+	}
+	return false
+}
+
+// keepBody reads the rest of the page after what the parser read (the
+// connection drains it anyway) and keeps it, up to maxKeptBody.
+func (a *attempt) keepBody(rest io.Reader) {
+	b := make([]byte, 0, min(len(a.head)+(64<<10), maxKeptBody+1))
+	b = append(b, a.head...)
+	if len(b) <= maxKeptBody {
+		more, _ := io.ReadAll(io.LimitReader(rest, int64(maxKeptBody+1-len(b))))
+		b = append(b, more...)
+	}
+	if len(b) > maxKeptBody {
+		b, a.bodyTruncated = b[:maxKeptBody], true
+	}
+	a.body, a.bodyKept = b, true
+}
+
+// requestHeaders are the headers the request went out with: the ones it
+// was built with, Host, and the cookies of the jar by name only.
+func (a *attempt) requestHeaders() http.Header {
+	if a.reqHeader == nil {
+		return nil
+	}
+	h := a.reqHeader.Clone()
+	h.Set("Host", a.host)
+	if len(a.cookies) > 0 {
+		masked := make([]string, len(a.cookies))
+		for i, n := range a.cookies {
+			masked[i] = n + "=…"
+		}
+		h.Set("Cookie", strings.Join(masked, "; "))
+	}
+	return h
+}
+
+// maskedHeaders is h with the values of Set-Cookie hidden.
+func maskedHeaders(h http.Header) http.Header {
+	if h == nil {
+		return nil
+	}
+	out := h.Clone()
+	if v := out.Values("Set-Cookie"); len(v) > 0 {
+		out["Set-Cookie"] = maskSetCookies(v)
+	}
+	return out
 }
 
 // snapshot copies what the hooks recorded.
@@ -321,7 +433,8 @@ type timing struct {
 	total    time.Duration // request sent .. body drained
 	connWait time.Duration // waiting for a free connection (-conns), not the own dial
 	dial     time.Duration // DNS, TCP and TLS of a connection this request opened
-	net      time.Duration // total minus connWait: on the network
+	work     time.Duration // parsing and the cache write, on this machine
+	net      time.Duration // total minus connWait and work: on the network
 }
 
 func (a *attempt) timing(h hooks) timing {
@@ -348,7 +461,8 @@ func (a *attempt) timing(h hooks) timing {
 		}
 		t.connWait = max(h.gotConn.Sub(h.getConn)-t.dial, 0)
 	}
-	t.net = max(t.total-t.connWait, 0)
+	t.work = a.work
+	t.net = max(t.total-t.connWait-t.work, 0)
 	return t
 }
 
@@ -400,6 +514,9 @@ func (a *attempt) line(outcome string) string {
 		span("tls", h.tlsStart, h.tlsDone)
 		span("ttfb", a.start, h.firstByte)
 		span("body", h.firstByte, a.bodyDone)
+		if tm.work >= 100*time.Microsecond {
+			phases = append(phases, "work="+msStr(tm.work))
+		}
 		parts = append(parts, strings.Join(phases, " "))
 		conn := "conn=new"
 		if h.reused {

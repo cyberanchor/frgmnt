@@ -1,9 +1,11 @@
 package checker
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // TraceEvent is one record of the structured trace (Logger.Event): an HTTP
@@ -24,32 +26,34 @@ type TraceEvent struct {
 	Try  int       `json:"try,omitempty"` // HTTP try of the name, from 1; throttled tries count
 
 	// The request (attempt, probe).
-	URL            string   `json:"url,omitempty"`
-	CookiesSent    []string `json:"cookies_sent,omitempty"`
-	WaitGateMs     float64  `json:"wait_gate_ms,omitempty"`  // waiting for the gate (one request at a time)
-	WaitPauseMs    float64  `json:"wait_pause_ms,omitempty"` // waiting out a shared pause
-	WaitRateMs     float64  `json:"wait_rate_ms,omitempty"`  // waiting for the -rate start
-	Alone          bool     `json:"alone,omitempty"`         // went alone through the closed gate
-	ConnWaitMs     float64  `json:"conn_wait_ms,omitempty"`  // waiting for a free connection (-conns); not network time
-	DNSMs          float64  `json:"dns_ms,omitempty"`
-	DNSAddrs       []string `json:"dns_addrs,omitempty"`
-	DNSCoalesced   bool     `json:"dns_coalesced,omitempty"` // shared the lookup of another request
-	ConnectMs      float64  `json:"connect_ms,omitempty"`
-	TLSMs          float64  `json:"tls_ms,omitempty"`
-	WroteHeadersMs float64  `json:"wrote_headers_ms,omitempty"` // the headers written, from the start of the request
-	WroteMs        float64  `json:"wrote_ms,omitempty"`         // the request written, from the start of the request
-	TTFBMs         float64  `json:"ttfb_ms,omitempty"`          // first byte of the answer, from the start
-	BodyMs         float64  `json:"body_ms,omitempty"`          // reading the body after the first byte
-	NetMs          float64  `json:"net_ms,omitempty"`           // on the network: until the body is drained, without conn_wait_ms
-	Informational  []int    `json:"informational,omitempty"`    // 1xx answers before the final one (e.g. 103)
-	ConnReused     bool     `json:"conn_reused,omitempty"`
-	ConnIdleMs     float64  `json:"conn_idle_ms,omitempty"`
-	Remote         string   `json:"remote,omitempty"`
-	Local          string   `json:"local,omitempty"`
-	TLS            string   `json:"tls,omitempty"`
-	ALPN           string   `json:"alpn,omitempty"`
-	WireIn         int64    `json:"wire_in,omitempty"`  // bytes received on the connection for this request (HTTP/1.x; HTTP/2 shares a connection: see conn_close)
-	WireOut        int64    `json:"wire_out,omitempty"` // bytes sent, likewise
+	URL            string      `json:"url,omitempty"`
+	Method         string      `json:"method,omitempty"`
+	ReqHeaders     http.Header `json:"req_headers,omitempty"` // as sent; Cookie by name only ("stel_ssid=…")
+	CookiesSent    []string    `json:"cookies_sent,omitempty"`
+	WaitGateMs     float64     `json:"wait_gate_ms,omitempty"`  // waiting for the gate (one request at a time)
+	WaitPauseMs    float64     `json:"wait_pause_ms,omitempty"` // waiting out a shared pause
+	WaitRateMs     float64     `json:"wait_rate_ms,omitempty"`  // waiting for the -rate start
+	Alone          bool        `json:"alone,omitempty"`         // went alone through the closed gate
+	ConnWaitMs     float64     `json:"conn_wait_ms,omitempty"`  // waiting for a free connection (-conns); not network time
+	DNSMs          float64     `json:"dns_ms,omitempty"`
+	DNSAddrs       []string    `json:"dns_addrs,omitempty"`
+	DNSCoalesced   bool        `json:"dns_coalesced,omitempty"` // shared the lookup of another request
+	ConnectMs      float64     `json:"connect_ms,omitempty"`
+	TLSMs          float64     `json:"tls_ms,omitempty"`
+	WroteHeadersMs float64     `json:"wrote_headers_ms,omitempty"` // the headers written, from the start of the request
+	WroteMs        float64     `json:"wrote_ms,omitempty"`         // the request written, from the start of the request
+	TTFBMs         float64     `json:"ttfb_ms,omitempty"`          // first byte of the answer, from the start
+	BodyMs         float64     `json:"body_ms,omitempty"`          // reading the body after the first byte
+	NetMs          float64     `json:"net_ms,omitempty"`           // on the network: until the body is drained, without conn_wait_ms
+	Informational  []int       `json:"informational,omitempty"`    // 1xx answers before the final one (e.g. 103)
+	ConnReused     bool        `json:"conn_reused,omitempty"`
+	ConnIdleMs     float64     `json:"conn_idle_ms,omitempty"`
+	Remote         string      `json:"remote,omitempty"`
+	Local          string      `json:"local,omitempty"`
+	TLS            string      `json:"tls,omitempty"`
+	ALPN           string      `json:"alpn,omitempty"`
+	WireIn         int64       `json:"wire_in,omitempty"`  // bytes received on the connection for this request (HTTP/1.x; HTTP/2 shares a connection: see conn_close)
+	WireOut        int64       `json:"wire_out,omitempty"` // bytes sent, likewise
 
 	// A connection (conn_open, conn_tls, conn_close, conn_error; attempts
 	// and probes carry cid too).
@@ -72,18 +76,34 @@ type TraceEvent struct {
 	SCTs         int        `json:"scts,omitempty"`
 
 	// The answer.
-	Proto           string   `json:"proto,omitempty"`
-	Code            int      `json:"code,omitempty"`
-	Location        string   `json:"location,omitempty"`
-	ContentType     string   `json:"content_type,omitempty"`
-	ContentEncoding string   `json:"content_encoding,omitempty"`
-	Server          string   `json:"server,omitempty"`
-	CFRay           string   `json:"cf_ray,omitempty"`
-	CFMitigated     string   `json:"cf_mitigated,omitempty"`
-	RetryAfter      string   `json:"retry_after,omitempty"`
-	SetCookies      []string `json:"set_cookies,omitempty"`    // names
-	Bytes           int      `json:"bytes,omitempty"`          // body bytes read for the parser, decoded
-	BodyRawBytes    int64    `json:"body_raw_bytes,omitempty"` // body bytes received as sent (compressed), the drained rest included
+	Proto           string      `json:"proto,omitempty"`
+	Code            int         `json:"code,omitempty"`
+	StatusLine      string      `json:"status_line,omitempty"`  // "302 Found"
+	RespHeaders     http.Header `json:"resp_headers,omitempty"` // every header; Set-Cookie values hidden
+	ContentLength   *int64      `json:"content_length,omitempty"`
+	Trailers        http.Header `json:"trailers,omitempty"`
+	Location        string      `json:"location,omitempty"`
+	ContentType     string      `json:"content_type,omitempty"`
+	ContentEncoding string      `json:"content_encoding,omitempty"`
+	Server          string      `json:"server,omitempty"`
+	CFRay           string      `json:"cf_ray,omitempty"`
+	CFMitigated     string      `json:"cf_mitigated,omitempty"`
+	RetryAfter      string      `json:"retry_after,omitempty"`
+	SetCookies      []string    `json:"set_cookies,omitempty"`    // names
+	Bytes           int         `json:"bytes,omitempty"`          // body bytes read for the parser, decoded
+	BodyRawBytes    int64       `json:"body_raw_bytes,omitempty"` // body bytes received as sent (compressed), the drained rest included
+	// The page itself, decoded, when Config.TraceBodies keeps it (up to
+	// 1 MB; body_b64 when it is not UTF-8).
+	Body          string `json:"body,omitempty"`
+	BodyB64       string `json:"body_b64,omitempty"`
+	BodyTruncated bool   `json:"body_truncated,omitempty"`
+
+	// Work on this machine inside a request: parsing the page, writing it
+	// to the page cache.
+	ParseUs         float64 `json:"parse_us,omitempty"`
+	CacheWriteMs    float64 `json:"cache_write_ms,omitempty"`
+	CacheWriteBytes int     `json:"cache_write_bytes,omitempty"`
+	CacheError      string  `json:"cache_error,omitempty"`
 
 	// The outcome of a request or of a name.
 	Status     Status `json:"status,omitempty"`
@@ -100,12 +120,16 @@ type TraceEvent struct {
 	Attempts int     `json:"attempts,omitempty"`
 	TookMs   float64 `json:"took_ms,omitempty"`
 	WaitMs   float64 `json:"wait_ms,omitempty"`
+	WorkMs   float64 `json:"work_ms,omitempty"` // result, attempt: parsing and the page cache
 	Cached   bool    `json:"cached,omitempty"`
 	Stale    bool    `json:"stale,omitempty"`
 
-	// A cache lookup (cache): hit, stale or miss, and the age of the entry.
-	Cache string  `json:"cache,omitempty"`
-	AgeMs float64 `json:"age_ms,omitempty"`
+	// A cache lookup (cache): hit, stale, miss or error (an entry that
+	// cannot be read; Error says why), the age of the entry and the time
+	// the lookup took.
+	Cache  string  `json:"cache,omitempty"`
+	AgeMs  float64 `json:"age_ms,omitempty"`
+	ReadMs float64 `json:"read_ms,omitempty"`
 
 	// Engine events.
 	PauseMs     float64 `json:"pause_ms,omitempty"`     // pause: how long every request waits
@@ -148,48 +172,73 @@ func (a *attempt) event(res Result, retry bool) TraceEvent {
 	h := a.snapshot()
 	tm := a.timing(h)
 	e := TraceEvent{
-		Time:           a.start,
-		Kind:           a.kind,
-		Name:           a.name,
-		Try:            a.try,
-		URL:            a.url,
-		CookiesSent:    a.cookies,
-		WaitGateMs:     ms(a.waits.gate),
-		WaitPauseMs:    ms(a.waits.pause),
-		WaitRateMs:     ms(a.waits.rate),
-		Alone:          a.waits.scout,
-		ConnWaitMs:     ms(tm.connWait),
-		DNSMs:          spanMs(h.dnsStart, h.dnsDone),
-		DNSAddrs:       h.dnsAddrs,
-		DNSCoalesced:   h.dnsCoalesced,
-		ConnectMs:      spanMs(h.connectStart, h.connectDone),
-		TLSMs:          spanMs(h.tlsStart, h.tlsDone),
-		WroteHeadersMs: spanMs(a.start, h.wroteHeaders),
-		WroteMs:        spanMs(a.start, h.wrote),
-		TTFBMs:         spanMs(a.start, h.firstByte),
-		BodyMs:         spanMs(h.firstByte, a.bodyDone),
-		NetMs:          ms(tm.net),
-		Informational:  h.got1xx,
-		ConnReused:     h.reused,
-		ConnIdleMs:     ms(h.idle),
-		Remote:         h.remote,
-		Local:          h.local,
-		TLS:            h.tlsVersion,
-		ALPN:           h.alpn,
-		Proto:          a.proto,
-		Code:           a.code,
-		Bytes:          a.bytes,
-		BodyRawBytes:   a.rawBytes,
-		Status:         res.Status,
-		Retry:          retry,
-		Confidence:     res.Confidence,
-		Evidence:       res.Evidence,
-		Offset:         res.Offset,
-		Error:          res.Error,
-		NotSent:        res.notSent,
+		Time:            a.start,
+		Kind:            a.kind,
+		Name:            a.name,
+		Try:             a.try,
+		URL:             a.url,
+		CookiesSent:     a.cookies,
+		WaitGateMs:      ms(a.waits.gate),
+		WaitPauseMs:     ms(a.waits.pause),
+		WaitRateMs:      ms(a.waits.rate),
+		Alone:           a.waits.scout,
+		ConnWaitMs:      ms(tm.connWait),
+		DNSMs:           spanMs(h.dnsStart, h.dnsDone),
+		DNSAddrs:        h.dnsAddrs,
+		DNSCoalesced:    h.dnsCoalesced,
+		ConnectMs:       spanMs(h.connectStart, h.connectDone),
+		TLSMs:           spanMs(h.tlsStart, h.tlsDone),
+		WroteHeadersMs:  spanMs(a.start, h.wroteHeaders),
+		WroteMs:         spanMs(a.start, h.wrote),
+		TTFBMs:          spanMs(a.start, h.firstByte),
+		BodyMs:          spanMs(h.firstByte, a.bodyDone),
+		NetMs:           ms(tm.net),
+		WorkMs:          ms(tm.work),
+		Informational:   h.got1xx,
+		ConnReused:      h.reused,
+		ConnIdleMs:      ms(h.idle),
+		Remote:          h.remote,
+		Local:           h.local,
+		TLS:             h.tlsVersion,
+		ALPN:            h.alpn,
+		Method:          a.method,
+		ReqHeaders:      a.requestHeaders(),
+		Proto:           a.proto,
+		Code:            a.code,
+		StatusLine:      a.status,
+		RespHeaders:     maskedHeaders(a.header),
+		Trailers:        a.trailer,
+		Bytes:           a.bytes,
+		BodyRawBytes:    a.rawBytes,
+		ParseUs:         float64(a.parse.Nanoseconds()) / 1000,
+		CacheWriteMs:    ms(a.cacheWrite),
+		CacheWriteBytes: a.cacheWriteBytes,
+		CacheError:      a.cacheErr,
+		Status:          res.Status,
+		Retry:           retry,
+		Confidence:      res.Confidence,
+		Evidence:        res.Evidence,
+		Offset:          res.Offset,
+		Error:           res.Error,
+		NotSent:         res.notSent,
 	}
 	if e.Time.IsZero() {
 		e.Time = time.Now() // not sent: no request start
+	}
+	if a.code != 0 && a.contentLength >= 0 {
+		n := a.contentLength
+		e.ContentLength = &n
+	}
+	if len(e.Trailers) == 0 {
+		e.Trailers = nil
+	}
+	if a.bodyKept {
+		if utf8.Valid(a.body) {
+			e.Body = string(a.body)
+		} else {
+			e.BodyB64 = base64.StdEncoding.EncodeToString(a.body)
+		}
+		e.BodyTruncated = a.bodyTruncated
 	}
 	if h.k != nil {
 		e.Conn = h.k.id

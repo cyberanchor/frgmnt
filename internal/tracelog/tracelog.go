@@ -176,7 +176,7 @@ func Open(path string, opt Options) (*Writer, error) {
 		queue: make(chan checker.TraceEvent, queueLen), done: make(chan struct{}),
 	}
 	t.enc = json.NewEncoder(&t.buf)
-	t.enc.SetEscapeHTML(false) // pages and headers stay readable: "<" not "<"
+	t.enc.SetEscapeHTML(false) // pages and headers stay readable: "<" not "\u003c"
 	if !opt.Append {
 		// A new trace: the older segment of an earlier run is not part of it.
 		if err := os.Remove(t.older); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -486,7 +486,7 @@ func StatsInfo(e checker.Stats) map[string]any {
 		"available": e.Available, "taken": e.Taken, "sold": e.Sold, "unknown": e.Unknown,
 		"errors": e.Errors, "retries": e.Retries, "rate_limited": e.RateLimit, "pauses": e.Pauses,
 		"challenges": e.Challenges, "conn_new": e.ConnNew, "conn_reused": e.ConnReuse,
-		"cache_hits": e.CacheHits, "cache_stale": e.CacheStale, "cache_misses": e.CacheMisses,
+		"cache_hits": e.CacheHits, "cache_stale": e.CacheStale, "cache_misses": e.CacheMisses, "cache_errors": e.CacheErrors,
 		"bytes_in": e.BytesIn, "bytes_out": e.BytesOut,
 	}
 }

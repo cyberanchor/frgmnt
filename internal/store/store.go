@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS results (
     cached       INTEGER NOT NULL DEFAULT 0,
     net_ns       INTEGER NOT NULL DEFAULT 0,
     wait_ns      INTEGER NOT NULL DEFAULT 0,
+    work_ns      INTEGER NOT NULL DEFAULT 0,
     attempts     INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (worker_id) REFERENCES workers(id) ON DELETE CASCADE
 );
@@ -165,6 +166,7 @@ func migrate(db *sql.DB) error {
 		`ALTER TABLE results ADD COLUMN cached INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE results ADD COLUMN net_ns INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE results ADD COLUMN wait_ns INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE results ADD COLUMN work_ns INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE results ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := db.Exec(alter); err != nil && !strings.Contains(err.Error(), "duplicate column") {
@@ -524,9 +526,11 @@ type Result struct {
 
 	// The split of TookNs (checker.Result): the time of the name's own
 	// requests, the time it waited (a -rate start, a pause, a retry delay,
-	// a probe), and its HTTP tries.
+	// a probe, a free connection), the work on this machine, and its HTTP
+	// tries.
 	NetNs    int64 `json:"net_ns,omitempty"`
 	WaitNs   int64 `json:"wait_ns,omitempty"`
+	WorkNs   int64 `json:"work_ns,omitempty"` // parsing and the page cache, on this machine
 	Attempts int   `json:"attempts,omitempty"`
 }
 
@@ -568,12 +572,12 @@ func (s *Store) insertResults(ctx context.Context, rs []Result, markChecked bool
 		return err
 	}
 	defer tx.Rollback()
-	ins := newBatchInsert(tx, insertResultsHead, 12, resultChunk)
+	ins := newBatchInsert(tx, insertResultsHead, 13, resultChunk)
 	defer ins.Close()
 	now := time.Now().UnixMilli()
 	for _, r := range rs {
 		if err := ins.Add(ctx, r.WorkerID, r.Username, r.Status, r.Error, r.TookNs, now,
-			r.Confidence, r.Evidence, r.Cached, r.NetNs, r.WaitNs, r.Attempts); err != nil {
+			r.Confidence, r.Evidence, r.Cached, r.NetNs, r.WaitNs, r.Attempts, r.WorkNs); err != nil {
 			return err
 		}
 	}
@@ -600,10 +604,10 @@ func (s *Store) insertResults(ctx context.Context, rs []Result, markChecked bool
 // below SQLite's limit of 32,766 parameters per statement.
 const (
 	inputChunk  = 200 // rows per INSERT INTO worker_inputs (3 parameters each)
-	resultChunk = 64  // rows per INSERT INTO results (12 parameters each), names per checked-flag UPDATE
+	resultChunk = 64  // rows per INSERT INTO results (13 parameters each), names per checked-flag UPDATE
 
 	insertInputsHead  = `INSERT INTO worker_inputs (worker_id, seq, username)`
-	insertResultsHead = `INSERT INTO results (worker_id, username, status, error, took_ns, checked_at, confidence, evidence, cached, net_ns, wait_ns, attempts)`
+	insertResultsHead = `INSERT INTO results (worker_id, username, status, error, took_ns, checked_at, confidence, evidence, cached, net_ns, wait_ns, attempts, work_ns)`
 )
 
 // valuesSQL returns head followed by " VALUES (?,…),(?,…)…" for rows rows
@@ -734,7 +738,7 @@ func (s *Store) ListResults(ctx context.Context, workerID string, afterID int64,
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, worker_id, username, status, error, took_ns, checked_at, confidence, evidence, cached,
-		        net_ns, wait_ns, attempts
+		        net_ns, wait_ns, attempts, work_ns
 		 FROM results WHERE worker_id = ? AND id > ?
 		 ORDER BY id ASC LIMIT ?`,
 		workerID, afterID, limit,
@@ -749,7 +753,7 @@ func (s *Store) ListResults(ctx context.Context, workerID string, afterID int64,
 		var checkedMs int64
 		var errStr sql.NullString
 		if err := rows.Scan(&r.ID, &r.WorkerID, &r.Username, &r.Status, &errStr, &r.TookNs, &checkedMs,
-			&r.Confidence, &r.Evidence, &r.Cached, &r.NetNs, &r.WaitNs, &r.Attempts); err != nil {
+			&r.Confidence, &r.Evidence, &r.Cached, &r.NetNs, &r.WaitNs, &r.Attempts, &r.WorkNs); err != nil {
 			return nil, err
 		}
 		if errStr.Valid {

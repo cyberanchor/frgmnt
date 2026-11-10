@@ -174,6 +174,7 @@ type Stats struct {
 	netPage     durHist
 	wait        durHist
 	connWait    durHist
+	work        durHist
 	tries       [4]int64
 
 	startTime time.Time
@@ -250,6 +251,7 @@ func (s *Stats) observe(r checker.Result) {
 	}
 	s.wait.add(r.Wait)
 	s.connWait.add(r.ConnWait)
+	s.work.add(r.Work)
 	k := min(max(r.Attempts, 1), len(s.tries))
 	atomic.AddInt64(&s.tries[k-1], 1)
 	if r.Offset > 0 {
@@ -310,6 +312,9 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Wire: in=%s, out=%s | Rate-limits: %d | Retries: %d",
 		e.ConnNew, e.ConnReuse, fmtBytes(e.BytesIn), fmtBytes(e.BytesOut), e.RateLimit, e.Retries)
 	line += fmt.Sprintf("\n  Page cache: hits=%d, stale=%d, misses=%d", e.CacheHits, e.CacheStale, e.CacheMisses)
+	if e.CacheErrors > 0 {
+		line += fmt.Sprintf(" (%d of them broken entries; see -debug)", e.CacheErrors)
+	}
 	if e.Challenges > 0 {
 		line += fmt.Sprintf("\n  Cloudflare challenges: %d", e.Challenges)
 	}
@@ -323,6 +328,7 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 		if s.wait.count() > 0 {
 			line += "\n  Waiting per name (-rate starts, pauses, retry delays, probes, connections): " + s.wait.summary()
 			line += "\n  Waiting for a free connection per name (-conns): " + s.connWait.summary()
+			line += "\n  Work per name on this machine (parsing, page cache): " + s.work.summary()
 			line += fmt.Sprintf("\n  Tries per name: 1: %d | 2: %d | 3: %d | 4+: %d",
 				atomic.LoadInt64(&s.tries[0]), atomic.LoadInt64(&s.tries[1]),
 				atomic.LoadInt64(&s.tries[2]), atomic.LoadInt64(&s.tries[3]))
@@ -332,7 +338,7 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 				maxOff, readLimit, maxOff+safetyMargin)
 		}
 		if e.Unknown > 0 {
-			line += fmt.Sprintf("\n  WARN: unknown=%d — either readLimit is too small or the redirect target is new; re-run with -trace FILE to see the answers", e.Unknown)
+			line += fmt.Sprintf("\n  WARN: unknown=%d — either readLimit is too small or the redirect target is new; re-run with -trace FILE: it keeps the pages of the unknown answers", e.Unknown)
 		}
 	}
 	return line
@@ -699,6 +705,7 @@ func Main(args []string) int {
 		debugFlag = fs.Bool("debug", false, "Print one line per HTTP try with its timings, the verdicts and cache use, and timing figures at the end")
 		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines (gzip when it ends in .gz): every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
 		traceOld  = fs.String("trace-file", "", "Deprecated spelling of -trace FILE")
+		traceBody = fs.String("trace-bodies", checker.BodiesAnomalies, "Pages the -trace keeps, whole and decoded (up to 1 MB each): anomalies (unknown answers, challenges, unexpected codes, errors), all, or none")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
 	traceMax := byteSize(1 << 30)
@@ -729,6 +736,12 @@ func Main(args []string) int {
 	}
 	if err := checkTracePath(tracePath); err != nil {
 		log.Printf("[ERROR] %v", err)
+		return 2
+	}
+	switch *traceBody {
+	case checker.BodiesAnomalies, checker.BodiesAll, checker.BodiesNone:
+	default:
+		log.Printf("[ERROR] -trace-bodies must be anomalies, all or none, got %q", *traceBody)
 		return 2
 	}
 
@@ -842,6 +855,7 @@ func Main(args []string) int {
 	cfg.Timeout = *timeout
 	cfg.ReadLimit = *readLimitF
 	cfg.InsecureTLS = *insecure
+	cfg.TraceBodies = *traceBody
 	if !*noCache {
 		cfg.CacheDir = *cacheDir
 		cfg.CacheTTL = *cacheTTLFlag
@@ -874,7 +888,8 @@ func Main(args []string) int {
 			"retry_delay_ms": eff.RetryDelay.Milliseconds(), "timeout_ms": eff.Timeout.Milliseconds(),
 			"read_limit": eff.ReadLimit, "rl_wait_max_ms": eff.RLWaitMax.Milliseconds(),
 			"block_cooldown_ms": eff.BlockCooldown.Milliseconds(), "throttle_max_ms": eff.ThrottleMax.Milliseconds(),
-			"cache_dir": eff.CacheDir, "log": logLevel.String(),
+			"cache_dir": eff.CacheDir, "log": logLevel.String(), "trace_bodies": eff.TraceBodies,
+			"trace_max": int64(traceMax),
 		}})
 	}
 

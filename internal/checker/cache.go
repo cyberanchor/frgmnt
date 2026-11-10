@@ -3,6 +3,8 @@ package checker
 import (
 	"compress/gzip"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -83,35 +85,44 @@ func (c *pageCache) paths(name string) (htmlPath, metaPath string) {
 }
 
 // get returns the cached metadata and raw HTML body, if both are readable.
-func (c *pageCache) get(name string) (*cacheEntry, []byte, bool) {
+// A name that is not in the cache is a miss (ok false, err nil); err tells
+// an entry that is there but cannot be used (a broken file, a permission),
+// which is a miss too but used to be silent.
+func (c *pageCache) get(name string) (ent *cacheEntry, body []byte, ok bool, err error) {
 	htmlPath, metaPath := c.paths(name)
 
 	metaRaw, err := os.ReadFile(metaPath)
 	if err != nil {
-		return nil, nil, false
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, false, nil
+		}
+		return nil, nil, false, err
 	}
-	var ent cacheEntry
-	if err := json.Unmarshal(metaRaw, &ent); err != nil {
-		return nil, nil, false
+	ent = new(cacheEntry)
+	if err := json.Unmarshal(metaRaw, ent); err != nil {
+		return nil, nil, false, fmt.Errorf("%s: %w", filepath.Base(metaPath), err)
 	}
 
 	f, err := os.Open(htmlPath)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, err
 	}
 	defer f.Close()
 
 	gz, err := gzip.NewReader(f)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, fmt.Errorf("%s: %w", filepath.Base(htmlPath), err)
 	}
 	defer gz.Close()
 
-	body, err := io.ReadAll(io.LimitReader(gz, 256<<10))
-	if err != nil || len(body) == 0 {
-		return nil, nil, false
+	body, err = io.ReadAll(io.LimitReader(gz, 256<<10))
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("%s: %w", filepath.Base(htmlPath), err)
 	}
-	return &ent, body, true
+	if len(body) == 0 {
+		return nil, nil, false, fmt.Errorf("%s: empty page", filepath.Base(htmlPath))
+	}
+	return ent, body, true, nil
 }
 
 // put writes the body and metadata atomically. Errors are deliberately

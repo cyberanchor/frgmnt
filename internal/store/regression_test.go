@@ -372,7 +372,7 @@ INSERT INTO results (worker_id, username, status, took_ns, checked_at) VALUES ('
 	}
 	defer s.Close()
 	if err := s.RecordResults(context.Background(), []Result{{WorkerID: "w1", Username: "bobby", Status: "taken",
-		TookNs: 900, NetNs: 200, WaitNs: 700, Attempts: 2}}); err != nil {
+		TookNs: 900, NetNs: 200, WaitNs: 650, WorkNs: 50, Attempts: 2}}); err != nil {
 		t.Fatal(err)
 	}
 	rs, err := s.ListResults(context.Background(), "w1", 0, 10)
@@ -382,10 +382,10 @@ INSERT INTO results (worker_id, username, status, took_ns, checked_at) VALUES ('
 	if len(rs) != 2 {
 		t.Fatalf("%d rows, want 2", len(rs))
 	}
-	if r := rs[0]; r.Username != "alice" || r.NetNs != 0 || r.Attempts != 0 {
+	if r := rs[0]; r.Username != "alice" || r.NetNs != 0 || r.WorkNs != 0 || r.Attempts != 0 {
 		t.Errorf("old row %+v, want the new columns at 0", r)
 	}
-	if r := rs[1]; r.NetNs != 200 || r.WaitNs != 700 || r.Attempts != 2 || r.TookNs != 900 {
-		t.Errorf("new row %+v, want net 200, wait 700, 2 tries", r)
+	if r := rs[1]; r.NetNs != 200 || r.WaitNs != 650 || r.WorkNs != 50 || r.Attempts != 2 || r.TookNs != 900 {
+		t.Errorf("new row %+v, want net 200, wait 650, work 50, 2 tries", r)
 	}
 }

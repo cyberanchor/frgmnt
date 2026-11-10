@@ -67,17 +67,20 @@ func TestWriterConcurrentAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.Write(checker.TraceEvent{Kind: "run_start", Info: map[string]any{"version": "x"}})
+	w.Write(checker.TraceEvent{Kind: "run_start", Info: map[string]any{"version": "x"}, Body: "<p>a & b</p>"})
 	_, _ = w.Close()
 	events = read(t, path)
 	if last := events[len(events)-1]; len(events) != 2001 || last.Info["schema"] != float64(Schema) {
 		t.Errorf("%d lines after appending, last %+v; want 2001 with the schema in run_start", len(events), last)
 	}
+	// Pages stay readable in the file: HTML is not escaped as \u003c.
+	if raw, _ := os.ReadFile(path); !strings.Contains(string(raw), `"body":"<p>a & b</p>"`) {
+		t.Error("the page is escaped in the file")
+	}
 }
 
 // A path ending in .gz is written with gzip; appending adds a member and
-// the file still reads as one stream. Pages stay readable ("<", not
-// "<").
+// the file still reads as one stream.
 func TestWriterGzip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "trace.jsonl.gz")
 	for run := 0; run < 2; run++ {

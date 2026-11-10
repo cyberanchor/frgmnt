@@ -194,9 +194,17 @@
                     <span class="field-label">User-Agent (optional)</span>
                     <input type="text" id="worker-ua" placeholder="Mozilla/5.0 …" />
                 </label>
-                <label class="field check" title="JSON Lines: every request of a run with its waits, timings and the answer, every name, pause and stop. Download it from the worker's details.">
+                <label class="field check" title="Gzip JSON Lines: every request of a run with its headers, waits, timings, connection and the answer, every name, pause and stop; it keeps the last 100 MB. Download it from the worker's details.">
                     <input type="checkbox" id="worker-trace" />
                     <span class="field-label">Write a trace of every run (each request with its timings and the answer)</span>
+                </label>
+                <label class="field" title="Pages kept whole in the trace (up to 1 MB each). Anomalies: unknown answers, challenges, unexpected codes and errors.">
+                    <span class="field-label">Pages in the trace</span>
+                    <select id="worker-trace-bodies">
+                        <option value="anomalies">anomalies only</option>
+                        <option value="all">every page</option>
+                        <option value="none">none</option>
+                    </select>
                 </label>
                 <footer class="modal-foot">
                     <button type="button" class="btn" data-close>Cancel</button>
