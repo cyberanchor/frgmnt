@@ -156,6 +156,12 @@ type Config struct {
 	// read it (the console has -trace FILE).
 	Trace bool `json:"trace,omitempty"`
 
+	// KeyLog, when set, receives the TLS keys of every connection in the
+	// NSS key log format (tls.Config.KeyLogWriter): with a capture of the
+	// traffic (tcpdump), Wireshark decrypts every byte, HTTP/2 frames
+	// included. Process-wide (-tls-keylog), never in a worker's settings.
+	KeyLog io.Writer `json:"-"`
+
 	// TraceBodies says which pages the trace keeps (whole, decoded, up to
 	// 1 MB each): "anomalies" (the default, also ""): unknown answers,
 	// challenges, unexpected codes and errors; "all": every answer;
@@ -1181,6 +1187,7 @@ func (chk *Checker) newHTTPClient() *http.Client {
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS12,
 			InsecureSkipVerify: c.InsecureTLS,
+			KeyLogWriter:       c.KeyLog,
 		},
 	}
 	jar, _ := cookiejar.New(nil)

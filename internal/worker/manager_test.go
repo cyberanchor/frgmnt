@@ -1096,6 +1096,61 @@ func TestTileTraceHasDatabaseWrites(t *testing.T) {
 	}
 }
 
+// frgmnt web -tls-keylog: every run's connections write their TLS keys to
+// the manager's key log; the worker's saved config does not carry it.
+func TestKeyLogReachesRuns(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/?query="+strings.TrimPrefix(r.URL.Path, "/username/"), http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	old := checker.FragmentURLTemplate
+	checker.FragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() { checker.FragmentURLTemplate = old })
+	h := newHarness(t)
+	var keys syncBuffer
+	h.m.SetKeyLog(&keys)
+	ctx := context.Background()
+	cfg := testConfig(1)
+	cfg.InsecureTLS = true
+	w, err := h.m.Create(ctx, "keys", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+	if !strings.Contains(keys.String(), "_TRAFFIC_SECRET") {
+		t.Errorf("no TLS keys from the run: %q", keys.String())
+	}
+	if w.Config().KeyLog != nil {
+		t.Error("the worker's config holds the key log")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for concurrent writers.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
 // The rows a run saves carry the split of the time and the tries.
 func TestSavedResultsCarryTheTimeSplit(t *testing.T) {
 	newFakeFragment(t, 20*time.Millisecond)

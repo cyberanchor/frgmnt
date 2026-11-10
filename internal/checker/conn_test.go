@@ -1,7 +1,9 @@
 package checker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -278,5 +280,32 @@ func TestHooksAfterACancelledDial(t *testing.T) {
 	}
 	if n := len(log.of("attempt")); n != 3 {
 		t.Errorf("%d attempt events, want 3", n)
+	}
+}
+
+// KeyLog gets the TLS keys of every connection in the NSS key log format
+// (what Wireshark reads to decrypt a capture); the config never carries
+// it into JSON (a worker's settings, run_start).
+func TestTLSKeyLog(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(freeRedirect))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	old := FragmentURLTemplate
+	FragmentURLTemplate = srv.URL + "/username/%s"
+	t.Cleanup(func() { FragmentURLTemplate = old })
+	var keys bytes.Buffer
+	cfg := Config{Workers: 1, InsecureTLS: true, Timeout: 3 * time.Second, KeyLog: &keys}
+	c := New(cfg)
+	defer c.Close()
+	if res := c.CheckOne(context.Background(), "keylogged"); res.Status != StatusFree {
+		t.Fatalf("%s %s", res.Status, res.Error)
+	}
+	if !strings.Contains(keys.String(), "CLIENT_HANDSHAKE_TRAFFIC_SECRET ") || !strings.Contains(keys.String(), "CLIENT_TRAFFIC_SECRET_0 ") {
+		t.Errorf("key log:\n%s", keys.String())
+	}
+	raw, err := json.Marshal(cfg)
+	if err != nil || strings.Contains(string(raw), "KeyLog") || strings.Contains(string(raw), "key_log") {
+		t.Errorf("the key log reached the JSON of the config: %s (%v)", raw, err)
 	}
 }

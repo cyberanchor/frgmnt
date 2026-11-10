@@ -799,6 +799,7 @@ func Main(args []string) int {
 		pprofAddr = fs.String("pprof", "", "Serve pprof on `ADDR` while the run goes on, e.g. 127.0.0.1:6060 (/debug/pprof/: CPU, heap, goroutines, block and mutex contention, execution trace)")
 		cpuProf   = fs.String("cpuprofile", "", "Write a CPU profile of the run to `FILE` (go tool pprof FILE)")
 		memProf   = fs.String("memprofile", "", "Write the heap profile at the end of the run to `FILE` (live and allocated memory: go tool pprof [-sample_index=alloc_space] FILE)")
+		keyLog    = fs.String("tls-keylog", "", "Append the TLS keys of every connection to `FILE` (NSS key log): with a capture of the traffic (tcpdump), Wireshark decrypts every byte, HTTP/2 frames included. Keep the file private")
 		execTrace = fs.String("exectrace", "", "Write the execution trace of the run to `FILE` (go tool trace FILE): every goroutine switch, network wait, syscall and GC, with a task per name; it stops at -trace-max or when the disk runs low")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
@@ -843,7 +844,8 @@ func Main(args []string) int {
 		printUsage(fs)
 		return 2
 	}
-	for _, f := range []struct{ flag, path string }{{"-cpuprofile", *cpuProf}, {"-memprofile", *memProf}, {"-exectrace", *execTrace}} {
+	for _, f := range []struct{ flag, path string }{{"-cpuprofile", *cpuProf}, {"-memprofile", *memProf}, {"-exectrace", *execTrace},
+		{"-tls-keylog", *keyLog}} {
 		if f.path == "" {
 			continue
 		}
@@ -961,6 +963,17 @@ func Main(args []string) int {
 	cfg.ReadLimit = *readLimitF
 	cfg.InsecureTLS = *insecure
 	cfg.TraceBodies = *traceBody
+	if *keyLog != "" {
+		f, err := os.OpenFile(*keyLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Printf("[ERROR] -tls-keylog: %v", err)
+			return 2
+		}
+		defer f.Close()
+		cfg.KeyLog = f
+		log.Printf("[WARN] -tls-keylog: the TLS keys of every connection go to %s; with a capture of the traffic "+
+			"they decrypt all of it. Keep the file private and delete it after use", *keyLog)
+	}
 	if !*noCache {
 		cfg.CacheDir = *cacheDir
 		cfg.CacheTTL = *cacheTTLFlag

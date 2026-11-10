@@ -1258,3 +1258,33 @@ func TestProfilingFlags(t *testing.T) {
 		t.Errorf("-cpuprofile on the output: exit %d, want 2", code)
 	}
 }
+
+// -tls-keylog appends the TLS keys of the run to a private file and warns
+// about it.
+func TestTLSKeyLogFlag(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		freeHandler(w, r, strings.TrimPrefix(r.URL.Path, "/username/"))
+	}))
+	t.Cleanup(srv.Close)
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	if err := os.WriteFile(in, []byte("alice\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	keys := filepath.Join(dir, "keys.log")
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	if code := Main([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL, "-insecure",
+		"-no-cache", "-quiet", "-workers", "1", "-tls-keylog", keys}); code != 0 {
+		t.Fatalf("exit %d\n%s", code, logs.String())
+	}
+	raw, err := os.ReadFile(keys)
+	fi, _ := os.Stat(keys)
+	if err != nil || !strings.Contains(string(raw), "_TRAFFIC_SECRET") || fi.Mode().Perm() != 0o600 {
+		t.Errorf("key log %q (%v), mode %v", raw, err, fi.Mode().Perm())
+	}
+	if !strings.Contains(logs.String(), "-tls-keylog: the TLS keys of every connection go to") {
+		t.Errorf("no warning:\n%s", logs.String())
+	}
+}

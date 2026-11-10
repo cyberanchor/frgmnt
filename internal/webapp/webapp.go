@@ -59,6 +59,7 @@ func Main(args []string) int {
 		allowHosts   = fs.String("allow-host", "", "comma-separated host names the panel answers to besides localhost, e.g. the domain of a reverse proxy")
 		tlsCert      = fs.String("tls-cert", "", "PEM certificate (full chain) to serve HTTPS; reloaded when the file changes")
 		tlsKey       = fs.String("tls-key", "", "PEM private key for -tls-cert")
+		keyLogPath   = fs.String("tls-keylog", "", "append the TLS keys of every connection to Fragment to this file (NSS key log, for Wireshark with a capture of the traffic); keep it private")
 		pprofOn      = fs.Bool("pprof", false, "serve pprof under /debug/pprof/ behind the login (CPU, heap, goroutines, block and mutex contention, execution trace)")
 		showVer      = fs.Bool("version", false, "print version and exit")
 	)
@@ -114,6 +115,16 @@ func Main(args []string) int {
 
 	mgr := worker.New(st, bus)
 	mgr.ConfigureCache(*cacheDir, *cacheTTL, *cacheSoldTTL, *noCache)
+	if *keyLogPath != "" {
+		f, err := os.OpenFile(*keyLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Fatalf("-tls-keylog: %v", err)
+		}
+		defer f.Close()
+		mgr.SetKeyLog(f)
+		bus.Publish(logbus.LevelWarn, "", "-tls-keylog: the TLS keys of every connection to Fragment go to "+*keyLogPath+
+			"; with a capture of the traffic they decrypt all of it. Keep the file private and delete it after use")
+	}
 	if err := mgr.Load(context.Background()); err != nil {
 		log.Fatalf("load workers: %v", err)
 	}

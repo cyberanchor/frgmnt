@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	rpprof "runtime/pprof"
@@ -51,6 +52,7 @@ type Manager struct {
 	cacheTTL      time.Duration
 	cacheSoldTTL  time.Duration
 	cacheDisabled bool
+	keyLog        io.Writer // -tls-keylog: the TLS keys of every run, or nil
 }
 
 // New returns an empty Manager. Call Load() once at startup to rehydrate
@@ -73,8 +75,14 @@ func (m *Manager) ConfigureCache(dir string, ttl, soldTTL time.Duration, disable
 	m.cacheDisabled = disabled
 }
 
-// applyCache fills empty per-worker cache fields with manager defaults.
+// SetKeyLog sends the TLS keys of every run's connections to w (frgmnt
+// web -tls-keylog); nil turns it off. Call it before the first Start.
+func (m *Manager) SetKeyLog(w io.Writer) { m.keyLog = w }
+
+// applyCache fills empty per-worker cache fields with manager defaults,
+// and adds the process-wide TLS key log.
 func (m *Manager) applyCache(cfg checker.Config) checker.Config {
+	cfg.KeyLog = m.keyLog
 	if m.cacheDisabled {
 		cfg.CacheDir = ""
 		return cfg
