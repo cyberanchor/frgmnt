@@ -1199,6 +1199,9 @@ func Main(args []string) int {
 		}
 	}
 	if trace != nil {
+		// Close the connections first: their conn_close events (bytes,
+		// requests) used to come after the trace was closed and were lost.
+		chk.Close()
 		info := tracelog.StatsInfo(final)
 		info["elapsed_ms"] = time.Since(stats.startTime).Milliseconds()
 		info["exit_code"] = exitCode

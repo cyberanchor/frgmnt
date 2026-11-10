@@ -909,6 +909,9 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	w.lastStats = final
 	w.mu.Unlock()
 	if trace != nil {
+		// Close the connections first, so their conn_close events (bytes,
+		// requests) are in the trace.
+		chk.Close()
 		info := tracelog.StatsInfo(final)
 		info["elapsed_ms"] = time.Since(runStart).Milliseconds()
 		switch {

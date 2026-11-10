@@ -842,6 +842,11 @@ func TestTraceFileJSONLines(t *testing.T) {
 	if count["attempt:retryme"] != 2 {
 		t.Errorf("retryme: %d attempt events, want 2", count["attempt:retryme"])
 	}
+	// The connections are closed before run_end, so their totals are in
+	// the trace (they used to be closed after it and were lost).
+	if count["conn_open:"] == 0 || count["conn_close:"] != count["conn_open:"] {
+		t.Errorf("%d conn_open and %d conn_close events, want them equal", count["conn_open:"], count["conn_close:"])
+	}
 
 	if code := Main(append(args, "-resume")); code != 0 {
 		t.Fatalf("resume: exit code %d", code)

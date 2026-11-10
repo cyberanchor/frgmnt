@@ -958,8 +958,9 @@ func TestTileTraceFile(t *testing.T) {
 		return out
 	}
 	run(false)
-	if k := kinds(); k["run_start"] != 1 || k["run_end"] != 1 || k["attempt"] != 5 || k["result"] != 5 {
-		t.Errorf("first run: %v", k)
+	if k := kinds(); k["run_start"] != 1 || k["run_end"] != 1 || k["attempt"] != 5 || k["result"] != 5 ||
+		k["conn_open"] == 0 || k["conn_close"] != k["conn_open"] {
+		t.Errorf("first run: %v (every connection opened must be closed in the trace)", k)
 	}
 	if fi, err := os.Stat(h.m.TracePath(w.ID())); err != nil || fi.Mode().Perm() != 0o600 ||
 		!strings.HasSuffix(h.m.TracePath(w.ID()), ".jsonl.gz") {
