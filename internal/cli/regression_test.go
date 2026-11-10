@@ -1335,3 +1335,51 @@ func TestBadDiagnosticFlagsKeepTheOutput(t *testing.T) {
 		}
 	}
 }
+
+// Invalid names (too short, a digit first) are errors in the results, but
+// no request would ever answer differently. -resume checked them again
+// every time, and once nothing else was left every such run ended with
+// exit 1 ("every checked name ended with an error"). They are final now,
+// and the exit code leaves them out.
+func TestInvalidNamesAreFinal(t *testing.T) {
+	var fail atomic.Bool
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		freeHandler(w, r, name)
+	})
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, []byte("1bad\nalice\nx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	base := []string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet", "-retries", "0"}
+	if code := Main(base); code != 0 {
+		t.Fatalf("first run: exit %d\n%s", code, logs.String())
+	}
+	if !strings.Contains(logs.String(), "Invalid names: 2") {
+		t.Errorf("no invalid-names line in the summary:\n%s", logs.String())
+	}
+	before, _ := os.ReadFile(out)
+	logs = lockedBuffer{}
+	if code := Main(append(base, "-resume")); code != 0 {
+		t.Errorf("-resume over a finished list: exit %d, want 0\n%s", code, logs.String())
+	}
+	if after, _ := os.ReadFile(out); string(after) != string(before) {
+		t.Errorf("-resume checked something again:\n%s", after)
+	}
+	if !strings.Contains(logs.String(), "[resume] loaded 3 already-processed names") {
+		t.Errorf("the invalid names are not in the resume set:\n%s", logs.String())
+	}
+	// A real failure of every valid name still gives exit 1.
+	fail.Store(true)
+	if code := Main(base); code != 1 {
+		t.Errorf("every valid name failing: exit %d, want 1", code)
+	}
+}

@@ -124,7 +124,7 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-cache-dir` / `-no-cache` | `.fragment_cache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
 | `-filter` | | Write only these statuses, e.g. `free,auction`; every name with a verdict is also listed in `<output>.checked`, so `-resume` skips the ones the filter left out |
-| `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again) |
+| `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again, except invalid names) |
 | `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
 | `-quiet` / `-debug` | | Less output on stdout, or one line per HTTP try with its timings on stderr and timing figures at the end |
 | `-trace FILE` | | Structured trace of the run as JSON Lines (gzip when `FILE` ends in `.gz`); independent of `-debug` |

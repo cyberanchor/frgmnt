@@ -168,6 +168,11 @@ type Stats struct {
 	listNames int64
 	dropped   int64
 
+	// invalid counts the names the engine refused without a request (too
+	// short, a digit first, ...). They are errors in the results, but say
+	// nothing about Fragment: the exit code leaves them out.
+	invalid int64
+
 	// The -debug summary: the network time of a name (its own requests)
 	// for redirects (free/reserved, no body) and for pages, the time it
 	// waited (starts, pauses, retry delays, probes), and how many tries it
@@ -243,6 +248,9 @@ func atomicMax(p *int64, v int64) {
 // marker offset. Cache answers and errors are left out: they would skew
 // the figures of real requests.
 func (s *Stats) observe(r checker.Result) {
+	if r.Status == StatusError && strings.HasPrefix(r.Error, "invalid:") {
+		atomic.AddInt64(&s.invalid, 1)
+	}
 	if r.Cached || r.Status == StatusError {
 		return
 	}
@@ -261,6 +269,8 @@ func (s *Stats) observe(r checker.Result) {
 		atomicMax(&s.statusOffsetMax, int64(r.Offset))
 	}
 }
+
+func (s *Stats) invalidCount() int64 { return atomic.LoadInt64(&s.invalid) }
 
 // snapshot returns a compact single-line summary for the progress logger.
 func (s *Stats) snapshot(e checker.Stats) string {
@@ -312,6 +322,9 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 		e.Free, e.Reserved, e.Auction, e.Available, e.Taken, e.Sold, e.Unknown, e.Errors,
 		elapsed, rps,
 	)
+	if inv := atomic.LoadInt64(&s.invalid); inv > 0 {
+		line += fmt.Sprintf("\n  Invalid names: %d (counted among the errors; not sent to Fragment)", inv)
+	}
 	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Wire: in=%s, out=%s | Rate-limits: %d | Retries: %d",
 		e.ConnNew, e.ConnReuse, fmtBytes(e.BytesIn), fmtBytes(e.BytesOut), e.RateLimit, e.Retries)
 	line += fmt.Sprintf("\n  Page cache: hits=%d, stale=%d, misses=%d", e.CacheHits, e.CacheStale, e.CacheMisses)
@@ -431,8 +444,12 @@ func loadResumeSet(path string) (*checker.NameSet, error) {
 		// An error is not a verdict (a network failure, a Cloudflare
 		// challenge, or a check that older versions wrote as "error
 		// (cancelled)" on Ctrl+C): -resume checks the name again. A name
-		// with a verdict on any line is done.
-		if strings.HasPrefix(strings.TrimSpace(line[pipe+3:]), string(StatusError)) {
+		// with a verdict on any line is done. An invalid name is final: no
+		// request would ever answer differently (it used to be checked
+		// again by every -resume, and ended every such run with exit 1
+		// once nothing else was left).
+		rest := strings.TrimSpace(line[pipe+3:])
+		if strings.HasPrefix(rest, string(StatusError)) && !strings.HasPrefix(rest, string(StatusError)+" (invalid:") {
 			continue
 		}
 		name := strings.ToLower(strings.TrimSpace(line[1:pipe]))
@@ -1205,7 +1222,10 @@ func Main(args []string) int {
 		if exitCode == 0 {
 			exitCode = 3
 		}
-	case final.Checked > 0 && final.Errors == final.Checked:
+	case final.Checked-stats.invalidCount() > 0 && final.Errors-stats.invalidCount() == final.Checked-stats.invalidCount():
+		// Invalid names always end as errors and say nothing about the
+		// network, so they are left out: a -resume that only had them
+		// left used to exit 1.
 		log.Printf("[ERROR] every checked name ended with an error")
 		if exitCode == 0 {
 			exitCode = 1
