@@ -357,6 +357,8 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 // reports them as "invalid" errors without a request. Memory grows only
 // with the number of unique names when dedup is on (checker.NameSet, about
 // 8 bytes per name of up to 12 characters), and stays flat otherwise.
+//
+// onSkip, when set, hears every name left out and why (the trace).
 func produceUsernames(
 	ctx context.Context,
 	src io.Reader,
@@ -364,16 +366,23 @@ func produceUsernames(
 	dedup bool,
 	skip *checker.NameSet,
 	stats *Stats,
+	onSkip func(name, why string),
 ) (rejected int64, err error) {
 	var seen checker.NameSet
 	err = checker.ScanNames(src, func(name string) error {
 		if dedup && !seen.Add(name) {
 			atomic.AddInt64(&stats.dropped, 1)
+			if onSkip != nil {
+				onSkip(name, "duplicate")
+			}
 			return nil
 		}
 		if skip.Has(name) {
 			rejected++
 			atomic.AddInt64(&stats.dropped, 1)
+			if onSkip != nil {
+				onSkip(name, "has a verdict in the output (-resume)")
+			}
 			return nil
 		}
 		select {
@@ -483,14 +492,41 @@ func parseFilter(raw string) (map[Status]bool, error) {
 // -----------------------------------------------------------------------------
 
 // outputs are the writers of one run. checked is nil without -filter.
+// st, when set, counts what they wrote for the trace.
 type outputs struct {
 	file    *bufio.Writer // the results file
 	stdout  *bufio.Writer
 	checked *bufio.Writer // <output>.checked: every name with a verdict
+	st      *outStats
+}
+
+// outStats count what the writer wrote: lines and bytes per file, the
+// flushes and their time, the failed flushes.
+type outStats struct {
+	fileLines, fileBytes, checkedLines, stdoutLines int64
+	flushes, flushNs, flushMaxNs, flushErrors       int64
+}
+
+func (o *outStats) info() map[string]any {
+	return map[string]any{
+		"file_lines": atomic.LoadInt64(&o.fileLines), "file_bytes": atomic.LoadInt64(&o.fileBytes),
+		"checked_lines": atomic.LoadInt64(&o.checkedLines), "stdout_lines": atomic.LoadInt64(&o.stdoutLines),
+		"flushes": atomic.LoadInt64(&o.flushes), "flush_ms": float64(atomic.LoadInt64(&o.flushNs)) / 1e6,
+		"flush_max_ms": float64(atomic.LoadInt64(&o.flushMaxNs)) / 1e6, "flush_errors": atomic.LoadInt64(&o.flushErrors),
+	}
 }
 
 // flush flushes every writer and returns the first error of the files.
 func (o outputs) flush() error {
+	if o.st != nil {
+		start := time.Now()
+		defer func() {
+			d := int64(time.Since(start))
+			atomic.AddInt64(&o.st.flushes, 1)
+			atomic.AddInt64(&o.st.flushNs, d)
+			atomicMax(&o.st.flushMaxNs, d)
+		}()
+	}
 	ferr := o.file.Flush()
 	var cerr error
 	if o.checked != nil {
@@ -506,6 +542,24 @@ func (o outputs) flush() error {
 		return fmt.Errorf("stdout flush: %w", serr)
 	}
 	return nil
+}
+
+// flushCounted flushes and counts a failure (the final flush returns it).
+func (o outputs) flushCounted() {
+	if err := o.flush(); err != nil && o.st != nil {
+		atomic.AddInt64(&o.st.flushErrors, 1)
+	}
+}
+
+// count notes a written line in the stats.
+func (o outputs) count(field *int64, bytes *int64, n int) {
+	if o.st == nil {
+		return
+	}
+	atomic.AddInt64(field, 1)
+	if bytes != nil {
+		atomic.AddInt64(bytes, int64(n))
+	}
 }
 
 // writeResults writes every result to the output file and stdout until
@@ -528,21 +582,34 @@ func writeResults(results <-chan checker.Result, out outputs, filter map[Status]
 	for {
 		select {
 		case <-ticker.C:
-			_ = out.flush()
+			out.flushCounted()
 			lastFlush = time.Now()
 		case r, ok := <-results:
 			if !ok {
-				return out.flush()
+				err := out.flush()
+				if err != nil && out.st != nil {
+					atomic.AddInt64(&out.st.flushErrors, 1)
+				}
+				return err
 			}
 			stats.observe(r)
 			fileLine, stdoutLine, color := formatResult(r, filter, quiet)
 			if fileLine != "" {
 				_, _ = out.file.WriteString(fileLine)
 				_ = out.file.WriteByte('\n')
+				if out.st != nil {
+					out.count(&out.st.fileLines, &out.st.fileBytes, len(fileLine)+1)
+				}
 			}
 			if out.checked != nil && r.Status != StatusError {
 				_, _ = out.checked.WriteString(r.Username)
 				_ = out.checked.WriteByte('\n')
+				if out.st != nil {
+					out.count(&out.st.checkedLines, nil, 0)
+				}
+			}
+			if stdoutLine != "" && out.st != nil {
+				out.count(&out.st.stdoutLines, nil, 0)
 			}
 			if stdoutLine != "" {
 				if color != "" {
@@ -552,7 +619,7 @@ func writeResults(results <-chan checker.Result, out outputs, filter map[Status]
 				}
 			}
 			if len(results) == 0 && time.Since(lastFlush) >= flushInterval {
-				_ = out.flush() // nothing else waiting: show it now
+				out.flushCounted() // nothing else waiting: show it now
 				lastFlush = time.Now()
 			}
 		}
@@ -599,7 +666,7 @@ func formatResult(r checker.Result, filter map[Status]bool, quiet bool) (fileLin
 
 // runProgress prints a one-line snapshot every progressInterval, with an
 // "instant" requests-per-second value to help spot throughput stalls.
-func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queues, trace *tracelog.Writer) {
+func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queues, trace *tracelog.Writer, ost *outStats) {
 	ticker := time.NewTicker(progressInterval)
 	defer ticker.Stop()
 	var lastChecked int64
@@ -627,6 +694,9 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queu
 				ts := trace.Stats()
 				info := pipelineInfo(e, q, chk.Config().Workers, instRPS)
 				info["trace"] = ts
+				if ost != nil {
+					info["output"] = ost.info()
+				}
 				trace.Write(checker.TraceEvent{Time: now, Kind: "pipeline", Info: info})
 				if ts.Stopped != "" && !traceStopWarned {
 					traceStopWarned = true
@@ -877,6 +947,7 @@ func Main(args []string) int {
 			return 2
 		}
 		logger.Event = trace.Write
+		out.st = new(outStats)
 	}
 	chk.SetLogger(logger)
 	eff := chk.Config()
@@ -905,6 +976,7 @@ func Main(args []string) int {
 	// --- Context and signals ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var stopAt atomic.Int64 // when a signal asked to stop (UnixNano), for the trace
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -918,6 +990,7 @@ func Main(args []string) int {
 			if trace != nil {
 				trace.Write(checker.TraceEvent{Kind: "stop", Reason: "signal " + sig.String()})
 			}
+			stopAt.Store(time.Now().UnixNano())
 			cancel()
 		case <-ctx.Done():
 		}
@@ -937,7 +1010,7 @@ func Main(args []string) int {
 	progDone := make(chan struct{})
 	go func() {
 		defer close(progDone)
-		runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace)
+		runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace, out.st)
 	}()
 
 	// --- Checks: eff.Workers goroutines inside the engine ---
@@ -949,10 +1022,29 @@ func Main(args []string) int {
 
 	// --- Input producer ---
 	producerDone := make(chan error, 1)
+	inCount := &byteCounter{r: inReader}
+	var onSkip func(name, why string)
+	if trace != nil {
+		skipped := 0
+		onSkip = func(name, why string) {
+			if skipped++; skipped <= maxSkipEvents {
+				trace.Write(checker.TraceEvent{Kind: "input_skip", Name: name, Reason: why})
+			}
+		}
+	}
 	go func() {
-		rejected, err := produceUsernames(ctx, inReader, tasks, !*noDedup, skip, stats)
+		readStart := time.Now()
+		rejected, err := produceUsernames(ctx, inCount, tasks, !*noDedup, skip, stats, onSkip)
 		if rejected > 0 {
 			log.Printf("[resume] skipped %d already-processed names", rejected)
+		}
+		if trace != nil {
+			dropped := atomic.LoadInt64(&stats.dropped)
+			trace.Write(checker.TraceEvent{Kind: "input", Info: map[string]any{
+				"path": *inputPath, "bytes": inCount.n.Load(), "read_ms": time.Since(readStart).Milliseconds(),
+				"queued": atomic.LoadInt64(&stats.total), "duplicates": dropped - rejected, "resume_skipped": rejected,
+				"complete": err == nil, "skip_events": min(dropped, maxSkipEvents),
+			}})
 		}
 		close(tasks)
 		producerDone <- err
@@ -963,6 +1055,7 @@ func Main(args []string) int {
 	// because Fragment answers every request with a Cloudflare challenge.
 	// In the last case the producer still waits to hand over a name.
 	<-runDone
+	runDoneAt := time.Now()
 	blocked := chk.Blocked()
 	if blocked {
 		cancel()
@@ -996,6 +1089,7 @@ func Main(args []string) int {
 		log.Printf("[ERROR] writing results: %v", err)
 		exitCode = 1
 	}
+	writeDoneAt := time.Now()
 
 	// --- Close output files ---
 	if err := outFile.Close(); err != nil {
@@ -1042,6 +1136,14 @@ func Main(args []string) int {
 			info["blocked"] = b
 		}
 		info["trace"] = trace.Stats()
+		info["output"] = out.st.info()
+		// How long the end took: the checks after the stop, then writing
+		// the last results out.
+		shutdown := map[string]any{"results_ms": writeDoneAt.Sub(runDoneAt).Milliseconds()}
+		if at := stopAt.Load(); at != 0 {
+			shutdown["checks_ms"] = runDoneAt.Sub(time.Unix(0, at)).Milliseconds()
+		}
+		info["shutdown"] = shutdown
 		trace.Write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
 		st, err := trace.Close()
 		switch {
@@ -1112,6 +1214,22 @@ func fmtBytes(n int64) string {
 		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
 	}
 	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
+}
+
+// maxSkipEvents caps the input_skip events of a run (a list can hold
+// millions of duplicates); the input event counts them all.
+const maxSkipEvents = 1000
+
+// byteCounter counts the bytes read through it.
+type byteCounter struct {
+	r io.Reader
+	n atomic.Int64
+}
+
+func (b *byteCounter) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.n.Add(int64(n))
+	return n, err
 }
 
 // checkTracePath catches the old boolean -trace. It takes a file now, so

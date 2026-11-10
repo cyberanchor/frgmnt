@@ -1053,6 +1053,49 @@ func TestTileTraceSaysWhyItStopped(t *testing.T) {
 	}
 }
 
+// The trace of a panel run shows its writes to the database (rows, time,
+// errors) and the list it started from.
+func TestTileTraceHasDatabaseWrites(t *testing.T) {
+	newFakeFragment(t, 0)
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg := testConfig(2)
+	cfg.Trace = true
+	w, err := h.m.Create(ctx, "dbtrace", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(40)); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Start(ctx, w.ID(), StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !waitNotRunning(w, 10*time.Second) {
+		t.Fatal("run did not finish")
+	}
+	events, err := tracelog.ReadAll(h.m.TraceFiles(w.ID())...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := 0.0
+	for _, e := range events {
+		if e.Kind == "db_flush" {
+			if e.Error != "" || e.Info["took_ms"] == nil {
+				t.Errorf("db_flush %+v", e)
+			}
+			rows += e.Info["rows"].(float64)
+		}
+	}
+	if rows != 40 {
+		t.Errorf("db_flush events saved %v rows, want 40", rows)
+	}
+	in, _ := events[0].Info["input"].(map[string]any)
+	if in["names"] != float64(40) || in["store_ms"] == nil {
+		t.Errorf("run_start input %v", events[0].Info["input"])
+	}
+}
+
 // The rows a run saves carry the split of the time and the tries.
 func TestSavedResultsCarryTheTimeSplit(t *testing.T) {
 	newFakeFragment(t, 20*time.Millisecond)

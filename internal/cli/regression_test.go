@@ -1158,3 +1158,59 @@ func TestTraceBodiesFlagAndWorkLine(t *testing.T) {
 		t.Errorf("%d pages kept with -trace-bodies all, want 2", kept)
 	}
 }
+
+// The trace said nothing about what happened around the checks: which
+// names the list dropped (duplicates, -resume) and what the run wrote. It
+// has input_skip events, an input event with the counts and the bytes
+// read, and the writer's counters and the time of the end in run_end.
+func TestTraceCoversInputAndOutput(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	out := filepath.Join(dir, "out.txt")
+	list := "alice\ncarol\nalice\ndavid\n"
+	if err := os.WriteFile(in, []byte(list), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, []byte("@david | taken\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracePath := filepath.Join(dir, "t.jsonl")
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	if code := Main([]string{"-input", in, "-output", out, "-base-url", srv.URL, "-no-cache", "-quiet",
+		"-workers", "1", "-resume", "-trace", tracePath}); code != 0 {
+		t.Fatalf("exit %d\n%s", code, logs.String())
+	}
+	events, err := tracelog.ReadAll(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	skips := map[string]string{}
+	var input, end checker.TraceEvent
+	for _, e := range events {
+		switch e.Kind {
+		case "input_skip":
+			skips[e.Name] = e.Reason
+		case "input":
+			input = e
+		case "run_end":
+			end = e
+		}
+	}
+	if skips["alice"] != "duplicate" || !strings.Contains(skips["david"], "-resume") {
+		t.Errorf("input_skip events %v", skips)
+	}
+	if input.Info["bytes"] != float64(len(list)) || input.Info["queued"] != float64(2) ||
+		input.Info["duplicates"] != float64(1) || input.Info["resume_skipped"] != float64(1) || input.Info["complete"] != true {
+		t.Errorf("input event %v", input.Info)
+	}
+	o, _ := end.Info["output"].(map[string]any)
+	if o["file_lines"] != float64(2) || o["file_bytes"] != float64(len("@alice | free\n@carol | free\n")) || o["flushes"] == float64(0) {
+		t.Errorf("run_end output %v", end.Info["output"])
+	}
+	if sd, _ := end.Info["shutdown"].(map[string]any); sd["results_ms"] == nil {
+		t.Errorf("run_end shutdown %v", end.Info["shutdown"])
+	}
+}

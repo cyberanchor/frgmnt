@@ -298,10 +298,14 @@ func (m *Manager) SetInputFrom(ctx context.Context, id string, each func(add fun
 		return 0, ErrWorkerBusy
 	}
 	defer w.endLoad()
+	loadStart := time.Now()
 	n, err := m.store.ReplaceInputsFrom(ctx, id, each)
 	if err != nil {
 		return 0, err
 	}
+	w.mu.Lock()
+	w.lastInput = map[string]any{"names": n, "stored_at": loadStart, "store_ms": time.Since(loadStart).Milliseconds()}
+	w.mu.Unlock()
 	m.refreshProgress(ctx, w)
 	switch checked := w.checkedCount(); {
 	case n == 0:
@@ -452,6 +456,7 @@ type Worker struct {
 	loading   bool // SetInputFrom is storing a new list; Start waits for it
 	cancel    context.CancelFunc
 	stopWhy   string           // why the current run was cancelled (the first reason), for its trace
+	lastInput map[string]any   // the last list stored: names, time to store it; for the next run's trace
 	done      chan struct{}    // closed when the current run returns; nil before the first Start
 	chk       *checker.Checker // non-nil while running
 	lastStats checker.Stats    // cached snapshot from the most recent run
@@ -591,6 +596,14 @@ func (w *Worker) stop(why string) {
 	}
 	w.mu.Unlock()
 	cancel()
+}
+
+// lastInputInfo describes the last list stored (since the server
+// started), or nil.
+func (w *Worker) lastInputInfo() map[string]any {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.lastInput
 }
 
 func (w *Worker) stopReason() string {
@@ -792,7 +805,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 				"read_limit": cfg.ReadLimit, "rl_wait_max_ms": cfg.RLWaitMax.Milliseconds(),
 				"block_cooldown_ms": cfg.BlockCooldown.Milliseconds(), "throttle_max_ms": cfg.ThrottleMax.Milliseconds(),
 				"cache_dir": cfg.CacheDir, "log": m.bus.Level().String(), "trace_bodies": cfg.TraceBodies,
-				"trace_max": maxTraceBytes, "env": tracelog.Environment(), "config": cfg,
+				"trace_max": maxTraceBytes, "env": tracelog.Environment(), "config": cfg, "input": w.lastInputInfo(),
 			}})
 		}
 	}
@@ -823,7 +836,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 
 	// Persister goroutine: batch writes to SQLite.
 	batchDone := make(chan struct{})
-	go m.persister(ctx, w, out, batchDone)
+	go m.persister(ctx, w, out, batchDone, trace)
 
 	// With a trace, the state of the run once a second: the queues and
 	// what the workers do.
@@ -926,7 +939,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	w.setStatus(StatusDone)
 }
 
-func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Result, done chan<- struct{}) {
+func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Result, done chan<- struct{}, trace *tracelog.Writer) {
 	defer close(done)
 	const batchSize = 32
 	const flushEvery = 250 * time.Millisecond
@@ -971,7 +984,20 @@ func (m *Manager) persister(ctx context.Context, w *Worker, in <-chan checker.Re
 		// The rows and the per-name "done" flags used by resume mode are
 		// written in one transaction (one commit per batch, not one per
 		// name).
-		if err := m.store.RecordResults(c, batch); err != nil {
+		start := time.Now()
+		err := m.store.RecordResults(c, batch)
+		if trace != nil {
+			// Every write of results, so a slow or failing database shows
+			// in the trace next to the checks it held up.
+			e := checker.TraceEvent{Kind: "db_flush", Info: map[string]any{
+				"rows": len(batch), "took_ms": float64(time.Since(start).Microseconds()) / 1000, "retrying": failing,
+			}}
+			if err != nil {
+				e.Error = err.Error()
+			}
+			trace.Write(e)
+		}
+		if err != nil {
 			if !store.IsTransient(err) {
 				// A closed database or a broken file does not get better:
 				// report it and go on; the names stay pending for Resume.

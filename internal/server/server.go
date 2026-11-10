@@ -77,7 +77,7 @@ func New(opt Options) *Server {
 		mux:        http.NewServeMux(),
 	}
 	s.routes()
-	s.handler = s.guard(s.requireToken(s.mux))
+	s.handler = s.accessLog(s.guard(s.requireToken(s.mux)))
 	return s
 }
 
@@ -107,7 +107,10 @@ func (s *Server) requireToken(next http.Handler) http.Handler {
 			return
 		}
 		if tok := tokenFrom(r); tok != "" {
-			if _, err := s.keeper.Verify(tok); err == nil {
+			if claims, err := s.keeper.Verify(tok); err == nil {
+				if info, ok := r.Context().Value(reqInfoKey{}).(*reqInfo); ok {
+					info.user = claims.Name
+				}
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -213,6 +216,95 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", MaxAge: -1, HttpOnly: true,
 		SameSite: http.SameSiteLaxMode, Secure: secureRequest(r)})
 	http.Redirect(w, r, "/login", http.StatusSeeOther)
+}
+
+// reqInfo is what the inner handlers tell the access log about a request:
+// the name of the token that was let in.
+type reqInfo struct{ user string }
+
+type reqInfoKey struct{}
+
+// statusRecorder notes the status and size of an answer for the access
+// log. It passes Flush on, so the log streams (SSE) still flush.
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Write(p []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(p)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the connection.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+// accessLog puts every request to the panel in the log at the debug level:
+// method, path and query (tokens travel in a header or a cookie, never
+// here), status, size, time, client and the name of the token used. A
+// stream (the live log, a worker's events) is logged when it opens and
+// when it ends. The panel's own polls of /api/workers and /api/health are
+// left out when they succeed quickly. Below debug it costs one level
+// check.
+func (s *Server) accessLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.bus == nil || s.bus.Level() < logbus.LevelDebug {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		info := &reqInfo{}
+		rec := &statusRecorder{ResponseWriter: w}
+		target := r.URL.Path
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		stream := strings.HasSuffix(r.URL.Path, "/stream") || strings.HasSuffix(r.URL.Path, "/events")
+		if stream {
+			s.bus.Publish(logbus.LevelDebug, "", fmt.Sprintf("http: %s %s stream opened by %s", r.Method, target, clientAddr(r)))
+		}
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), reqInfoKey{}, info)))
+		status := rec.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		took := time.Since(start)
+		if r.Method == http.MethodGet && (r.URL.Path == "/api/workers" || r.URL.Path == "/api/health") &&
+			status < 400 && took < time.Second {
+			// The panel polls these every second or five: a line each
+			// would push everything else out of the log. Failures and
+			// slow answers are still logged.
+			return
+		}
+		who := clientAddr(r)
+		if info.user != "" {
+			who += fmt.Sprintf(" (token %q)", info.user)
+		}
+		what := ""
+		if stream {
+			what = " stream closed after"
+		}
+		s.bus.Publish(logbus.LevelDebug, "", fmt.Sprintf("http: %s %s -> %d, %d bytes,%s %.1f ms, %s",
+			r.Method, target, status, rec.bytes, what, float64(took.Microseconds())/1000, who))
+	})
 }
 
 // Handler returns the underlying http.Handler (useful for tests).

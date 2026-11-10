@@ -580,6 +580,48 @@ func TestAllowHostForReverseProxy(t *testing.T) {
 	}
 }
 
+// At the debug level every request to the panel is in the log: method,
+// path, status, size, time, client and the name of the token; the panel's
+// own polls of /api/workers are left out when they succeed. Below debug
+// nothing is logged.
+func TestAccessLogAtDebug(t *testing.T) {
+	keeper, _, err := auth.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bus *logbus.Bus
+	s, _ := newTestServerWith(t, func(o *Options) { o.Auth = keeper; bus = o.Bus })
+	good, _, _ := keeper.Issue("laptop", time.Hour)
+	hdr := map[string]string{"Authorization": "Bearer " + good}
+	lines := func() string {
+		var b strings.Builder
+		for _, e := range bus.Recent(100, "") {
+			if strings.HasPrefix(e.Message, "http: ") {
+				b.WriteString(e.Message + "\n")
+			}
+		}
+		return b.String()
+	}
+	_ = do(t, s, "GET", "/api/settings", "", "", hdr)
+	if got := lines(); got != "" {
+		t.Errorf("access lines at info:\n%s", got)
+	}
+	bus.SetLevel(logbus.LevelDebug)
+	_ = do(t, s, "GET", "/api/settings?x=1", "", "", hdr)
+	_ = do(t, s, "GET", "/api/workers", "", "", hdr)
+	_ = do(t, s, "GET", "/api/settings", "", "", nil)
+	got := lines()
+	if !strings.Contains(got, `http: GET /api/settings?x=1 -> 200`) || !strings.Contains(got, `(token "laptop")`) {
+		t.Errorf("no access line with the token name:\n%s", got)
+	}
+	if !strings.Contains(got, "http: GET /api/settings -> 401") {
+		t.Errorf("the refused request is not logged:\n%s", got)
+	}
+	if strings.Contains(got, "GET /api/workers ") || strings.Contains(got, good) {
+		t.Errorf("a poll or the token itself is in the log:\n%s", got)
+	}
+}
+
 // The panel had no login: anyone who could reach it (through ssh -L or a
 // domain) could create, start and delete workers and read every result.
 // Now every request needs an access token, except the login page.
