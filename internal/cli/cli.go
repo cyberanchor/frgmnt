@@ -10,15 +10,17 @@
 //	frgmnt check -input names.txt -output results.txt -resume -append
 //	frgmnt check -input - -output results.txt           # stdin
 //	frgmnt check -input names.txt -output results.txt -debug
-//	frgmnt check -input names.txt -output results.txt -trace run.jsonl
+//	frgmnt check -input names.txt -output results.txt -trace run.jsonl.gz
 //
 // Diagnostics (independent: either, both or none):
 //
 //	(default)    — results + progress line once per second
 //	-debug       — one line per HTTP try with its timings, the verdicts and
 //	               cache use on the console, timing figures at the end
-//	-trace FILE  — the structured trace of the run in FILE as JSON Lines:
-//	               every request, cache lookup, name and engine event
+//	-trace FILE  — the structured trace of the run in FILE as JSON Lines
+//	               (gzip when FILE ends in .gz): every request, cache lookup,
+//	               name and engine event; it keeps the end of the run within
+//	               -trace-max (default 1G) and stops when the disk runs low
 //
 // Failure handling:
 //
@@ -593,6 +595,7 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queu
 	defer ticker.Stop()
 	var lastChecked int64
 	lastTime := time.Now()
+	traceStopWarned := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -612,7 +615,14 @@ func runProgress(ctx context.Context, stats *Stats, chk *checker.Checker, q queu
 			}
 			log.Print(line)
 			if trace != nil {
-				trace.Write(checker.TraceEvent{Time: now, Kind: "pipeline", Info: pipelineInfo(e, q, chk.Config().Workers, instRPS)})
+				ts := trace.Stats()
+				info := pipelineInfo(e, q, chk.Config().Workers, instRPS)
+				info["trace"] = ts
+				trace.Write(checker.TraceEvent{Time: now, Kind: "pipeline", Info: info})
+				if ts.Stopped != "" && !traceStopWarned {
+					traceStopWarned = true
+					log.Printf("[WARN] the trace stopped: %s; the run goes on", ts.Stopped)
+				}
 			}
 		}
 	}
@@ -682,10 +692,12 @@ func Main(args []string) int {
 		insecure   = fs.Bool("insecure", false, "Skip TLS certificate verification (debug only)")
 
 		debugFlag = fs.Bool("debug", false, "Print one line per HTTP try with its timings, the verdicts and cache use, and timing figures at the end")
-		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines: every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
+		traceOut  = fs.String("trace", "", "Write the structured trace of the run to `FILE` as JSON Lines (gzip when it ends in .gz): every request, cache lookup, name and engine event; appended with -resume/-append. Independent of -debug")
 		traceOld  = fs.String("trace-file", "", "Deprecated spelling of -trace FILE")
 		showVer   = fs.Bool("version", false, "Print version and exit")
 	)
+	traceMax := byteSize(1 << 30)
+	fs.Var(&traceMax, "trace-max", "Largest size of the -trace files on disk, e.g. 512M or 2G (0 = no limit). The trace keeps the end of the run: FILE holds the newest part, FILE with .1 before the extension the part before it")
 	fs.Usage = func() { printUsage(fs) }
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -838,7 +850,9 @@ func Main(args []string) int {
 	}
 	var trace *tracelog.Writer
 	if tracePath != "" {
-		trace, err = tracelog.Open(tracePath, *appendFlag || *resume, 0)
+		trace, err = tracelog.Open(tracePath, tracelog.Options{
+			Append: *appendFlag || *resume, MaxBytes: int64(traceMax), MinFree: traceMinFree,
+		})
 		if err != nil {
 			log.Printf("[ERROR] -trace: %v", err)
 			return 2
@@ -897,7 +911,11 @@ func Main(args []string) int {
 
 	// --- Progress reporter ---
 	progCtx, progCancel := context.WithCancel(ctx)
-	go runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace)
+	progDone := make(chan struct{})
+	go func() {
+		defer close(progDone)
+		runProgress(progCtx, stats, chk, queues{in: func() int { return len(tasks) }, out: func() int { return len(results) }}, trace)
+	}()
 
 	// --- Checks: eff.Workers goroutines inside the engine ---
 	runDone := make(chan struct{})
@@ -941,7 +959,10 @@ func Main(args []string) int {
 	}
 
 	// --- Stop progress reporter ---
+	// Waited for: a progress line or a pipeline event after this point
+	// would land after the summary, or after run_end in the trace.
 	progCancel()
+	<-progDone
 
 	// --- Close the results and wait for the final flush ---
 	// A failed write (disk full, I/O error) means results.txt is missing
@@ -997,15 +1018,77 @@ func Main(args []string) int {
 		if b := tracelog.BlockedName(chk.BlockedBy()); b != "" {
 			info["blocked"] = b
 		}
+		info["trace"] = trace.Stats()
 		trace.Write(checker.TraceEvent{Time: time.Now(), Kind: "run_end", Info: info})
-		n, _, err := trace.Close()
-		if err != nil {
+		st, err := trace.Close()
+		switch {
+		case err != nil:
 			log.Printf("[ERROR] -trace %s: %v (the trace is incomplete)", tracePath, err)
-		} else {
-			log.Printf("[INFO] trace: %d events in %s", n, tracePath)
+		case st.Rotations > 0:
+			log.Printf("[INFO] trace: %d events, %s in %s and %s (the trace keeps the last %s of the run; the start was dropped)",
+				st.Events, fmtBytes(st.Bytes), tracelog.OlderPath(tracePath), tracePath, traceMax.String())
+		default:
+			log.Printf("[INFO] trace: %d events, %s in %s", st.Events, fmtBytes(st.Bytes), tracePath)
+		}
+		if st.Stopped != "" {
+			log.Printf("[WARN] the trace stopped before the end of the run: %s", st.Stopped)
 		}
 	}
 	return exitCode
+}
+
+// byteSize is a flag value in bytes: "0", "512K", "100M", "1G" (base 1024;
+// a trailing "B" is allowed).
+type byteSize int64
+
+func (b *byteSize) String() string {
+	n := int64(*b)
+	switch {
+	case n == 0:
+		return "0"
+	case n%(1<<30) == 0:
+		return strconv.FormatInt(n>>30, 10) + "G"
+	case n%(1<<20) == 0:
+		return strconv.FormatInt(n>>20, 10) + "M"
+	case n%(1<<10) == 0:
+		return strconv.FormatInt(n>>10, 10) + "K"
+	}
+	return strconv.FormatInt(n, 10)
+}
+
+func (b *byteSize) Set(s string) error {
+	v := strings.TrimSuffix(strings.ToUpper(strings.TrimSpace(s)), "B")
+	shift := 0
+	switch {
+	case strings.HasSuffix(v, "K"):
+		shift = 10
+	case strings.HasSuffix(v, "M"):
+		shift = 20
+	case strings.HasSuffix(v, "G"):
+		shift = 30
+	}
+	if shift > 0 {
+		v = v[:len(v)-1]
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 || n > (1<<62)>>shift {
+		return fmt.Errorf("want a size such as 512M or 2G (0 = no limit), got %q", s)
+	}
+	*b = byteSize(n << shift)
+	return nil
+}
+
+// fmtBytes prints a size for the log: 812 B, 3.4 KB, 12.0 MB, 1.2 GB.
+func fmtBytes(n int64) string {
+	switch {
+	case n < 1<<10:
+		return fmt.Sprintf("%d B", n)
+	case n < 1<<20:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	case n < 1<<30:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	}
+	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
 }
 
 // checkTracePath catches the old boolean -trace. It takes a file now, so
@@ -1013,7 +1096,7 @@ func Main(args []string) int {
 // the command line goes wrong), and "-trace=true" reads "true".
 func checkTracePath(p string) error {
 	if strings.HasPrefix(p, "-") || p == "true" || p == "false" {
-		return fmt.Errorf("-trace takes the path of the trace file (for example -trace run.jsonl), got %q; "+
+		return fmt.Errorf("-trace takes the path of the trace file (for example -trace run.jsonl.gz), got %q; "+
 			"for one line per request on the console use -debug", p)
 	}
 	return nil
@@ -1058,6 +1141,10 @@ func sameFile(a, b string) bool {
 	return err == nil && os.SameFile(ai, bi)
 }
 
+// traceMinFree stops the trace when the disk runs low; a variable so tests
+// do not depend on the free space of the machine they run on.
+var traceMinFree int64 = tracelog.DefaultMinFree
+
 // hiddenFlags work but are left out of -h: old spellings kept so that
 // scripts do not break.
 var hiddenFlags = map[string]bool{"trace-file": true}
@@ -1076,7 +1163,7 @@ func printUsage(fs *flag.FlagSet) {
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -resume -append\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  cat names.txt | %s -input - -output results.txt -no-dedup\n", ProgName)
 	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -debug -workers 200 -rate 1000\n", ProgName)
-	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -trace run.jsonl\n", ProgName)
+	fmt.Fprintf(os.Stderr, "  %s -input names.txt -output results.txt -trace run.jsonl.gz\n", ProgName)
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Statuses describe Fragment, not Telegram: \"free\" means Fragment has no page")
 	fmt.Fprintln(os.Stderr, "for the name (not a collectible, not for sale); a regular account may still hold it.")

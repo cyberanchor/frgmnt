@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cyberanchor/frgmnt/internal/checker"
+	"github.com/cyberanchor/frgmnt/internal/tracelog"
 )
 
 // hitServer is a fake Fragment that counts requests per name.
@@ -1029,5 +1030,77 @@ func TestUsageShowsTraceFile(t *testing.T) {
 	if code != 0 || !strings.Contains(string(out), "-trace FILE") || strings.Contains(string(out), "-trace-file") ||
 		strings.Contains(string(out), "implies -debug") {
 		t.Errorf("-h (exit %d):\n%s", code, out)
+	}
+}
+
+// -trace FILE.gz writes gzip. With -trace-max the trace keeps the end of
+// the run in two files (it has no limit before 3.0.0 and could fill the
+// disk), run_end is always the last line (the progress goroutine is
+// waited for), and the lines are numbered without a gap.
+func TestTraceGzipKeepsTheEnd(t *testing.T) {
+	srv := newHitServer(t, func(w http.ResponseWriter, r *http.Request, name string) { freeHandler(w, r, name) })
+	dir := t.TempDir()
+	in := filepath.Join(dir, "names.txt")
+	var names strings.Builder
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&names, "name%04d\n", i)
+	}
+	if err := os.WriteFile(in, []byte(names.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracePath := filepath.Join(dir, "run.jsonl.gz")
+	var logs lockedBuffer
+	log.SetOutput(&logs)
+	defer log.SetOutput(os.Stderr)
+	if code := Main([]string{"-input", in, "-output", filepath.Join(dir, "out.txt"), "-base-url", srv.URL,
+		"-no-cache", "-quiet", "-workers", "4", "-trace", tracePath, "-trace-max", "16K"}); code != 0 {
+		t.Fatalf("exit code %d\n%s", code, logs.String())
+	}
+	files := tracelog.Files(tracePath)
+	if len(files) != 2 {
+		t.Fatalf("trace files %v, want two segments", files)
+	}
+	events, err := tracelog.ReadAll(files...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(events); i++ {
+		if events[i].Seq != events[i-1].Seq+1 {
+			t.Fatalf("seq %d after %d", events[i].Seq, events[i-1].Seq)
+		}
+	}
+	if last := events[len(events)-1]; last.Kind != "run_end" || last.Info["checked"] != float64(600) {
+		t.Errorf("last event %+v, want run_end of 600 names", last)
+	}
+	cur, err := tracelog.ReadAll(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur[0].Kind != "segment" || cur[0].Info["version"] != Version {
+		t.Errorf("the newest file starts with %+v, want a segment line repeating run_start", cur[0])
+	}
+	if !strings.Contains(logs.String(), "the trace keeps the last 16K of the run") {
+		t.Errorf("no note about the dropped start:\n%s", logs.String())
+	}
+}
+
+func TestByteSizeFlag(t *testing.T) {
+	for in, want := range map[string]int64{"0": 0, "512K": 512 << 10, "100M": 100 << 20, "1G": 1 << 30,
+		"2gb": 2 << 30, "1500": 1500} {
+		var b byteSize
+		if err := b.Set(in); err != nil || int64(b) != want {
+			t.Errorf("Set(%q) = %d, %v; want %d", in, int64(b), err, want)
+		}
+	}
+	for _, in := range []string{"-1", "1T", "abc", "", "9999999999G"} {
+		var b byteSize
+		if err := b.Set(in); err == nil {
+			t.Errorf("Set(%q) accepted", in)
+		}
+	}
+	for b, want := range map[byteSize]string{0: "0", 1 << 30: "1G", 16 << 10: "16K", 1500: "1500"} {
+		if got := b.String(); got != want {
+			t.Errorf("String(%d) = %q, want %q", int64(b), got, want)
+		}
 	}
 }

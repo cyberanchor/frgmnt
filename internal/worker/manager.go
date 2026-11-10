@@ -217,20 +217,60 @@ func (m *Manager) Delete(ctx context.Context, id string) error {
 	if err := m.store.DeleteWorker(ctx, id); err != nil {
 		return err
 	}
-	_ = os.Remove(m.TracePath(id))
+	m.removeTrace(id)
 	m.bus.Publish(logbus.LevelInfo, id, "worker deleted")
 	return nil
 }
 
 // TracePath is where the structured trace of a worker's runs is written
-// when its config has trace on.
+// when its config has trace on (gzip). With its size limit the trace keeps
+// the end of the runs: the part before it is in tracelog.OlderPath.
 func (m *Manager) TracePath(id string) string {
+	return filepath.Join(m.store.DataDir(), "traces", id+".jsonl.gz")
+}
+
+// legacyTracePath is the plain trace file of 2.1.0, which kept the start
+// of a run and cut the rest.
+func (m *Manager) legacyTracePath(id string) string {
 	return filepath.Join(m.store.DataDir(), "traces", id+".jsonl")
 }
 
-// maxTraceBytes caps the trace file of a worker (about 200,000 requests);
-// a variable so tests can lower it.
+// TraceFiles lists the trace files of a worker that exist, oldest first.
+// A trace written by 2.1.0 is listed only while the worker has no newer
+// one.
+func (m *Manager) TraceFiles(id string) []string {
+	if files := tracelog.Files(m.TracePath(id)); len(files) > 0 {
+		return files
+	}
+	if _, err := os.Stat(m.legacyTracePath(id)); err == nil {
+		return []string{m.legacyTracePath(id)}
+	}
+	return nil
+}
+
+// RemoveTrace deletes the trace files of a worker; the worker must not be
+// running.
+func (m *Manager) RemoveTrace(id string) error {
+	var first error
+	for _, p := range []string{tracelog.OlderPath(m.TracePath(id)), m.TracePath(id), m.legacyTracePath(id)} {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+func (m *Manager) removeTrace(id string) { _ = m.RemoveTrace(id) }
+
+// maxTraceBytes caps the trace of a worker on disk, both segments together
+// (compressed: about a million requests without page bodies); a variable
+// so tests can lower it.
 var maxTraceBytes int64 = 100 << 20
+
+// TraceMinFree stops a trace when the disk runs low; a variable so tests
+// (here and in the server) do not depend on the free space of the machine
+// they run on.
+var TraceMinFree int64 = tracelog.DefaultMinFree
 
 // SetInput replaces the input list of a worker. Allowed only when the
 // worker is not currently running.
@@ -713,14 +753,19 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 	m.refreshProgress(ctx, w)
 
 	// The structured trace of the run, when the worker asks for it: a fresh
-	// start begins a new file, Resume appends to it.
+	// start begins a new trace, Resume appends to it.
 	var trace *tracelog.Writer
 	runStart := time.Now()
 	if cfg.Trace {
 		path := m.TracePath(w.id)
+		if !resume {
+			_ = os.Remove(m.legacyTracePath(w.id))
+		}
 		var err error
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
-			trace, err = tracelog.Open(path, resume, maxTraceBytes)
+			trace, err = tracelog.Open(path, tracelog.Options{
+				Append: resume, MaxBytes: maxTraceBytes, MinFree: TraceMinFree,
+			})
 		}
 		if err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("trace: %v (the run goes on without it)", err))
@@ -788,6 +833,7 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 						"queue_in": len(in), "queue_out": len(out), "checked": e.Checked, "workers": cfg.Workers,
 						"busy": e.Busy, "in_flight": e.InFlight, "wait_gate": e.WaitGate, "wait_pause": e.WaitPause,
 						"wait_rate": e.WaitRate, "wait_retry": e.WaitRetry, "wait_probe": e.WaitProbe,
+						"trace": trace.Stats(),
 					}})
 				}
 			}
@@ -824,15 +870,20 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 		case ctx.Err() != nil:
 			info["stopped"] = true
 		}
+		info["trace"] = trace.Stats()
 		trace.Write(checker.TraceEvent{Kind: "run_end", Info: info})
-		if n, dropped, err := trace.Close(); err != nil {
+		st, err := trace.Close()
+		if err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("trace: %v (the trace is incomplete)", err))
 		} else {
-			msg := fmt.Sprintf("trace: %d events written", n)
-			if dropped > 0 {
-				msg += fmt.Sprintf(", %d dropped over the %d MB limit", dropped, maxTraceBytes>>20)
+			msg := fmt.Sprintf("trace: %d events, %.1f MB", st.Events, float64(st.Bytes)/(1<<20))
+			if st.Rotations > 0 {
+				msg += fmt.Sprintf("; it keeps the last %d MB of the runs, the older part was dropped", maxTraceBytes>>20)
 			}
 			m.bus.Publish(logbus.LevelInfo, w.id, msg)
+		}
+		if st.Stopped != "" {
+			m.bus.Publish(logbus.LevelWarn, w.id, "the trace stopped before the end of the run: "+st.Stopped)
 		}
 	}
 

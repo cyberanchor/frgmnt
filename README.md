@@ -127,7 +127,8 @@ cat names.txt | ./frgmnt check -input - -output free.txt -filter free -quiet
 | `-append` / `-resume` | | Append to the output; `-resume` also skips names that already have a verdict in it (error lines are checked again) |
 | `-no-dedup` | | Do not deduplicate the input (saves RAM on huge files) |
 | `-quiet` / `-debug` | | Less output on stdout, or one line per HTTP try with its timings on stderr and timing figures at the end |
-| `-trace FILE` | | Structured trace of the run as JSON Lines; independent of `-debug` |
+| `-trace FILE` | | Structured trace of the run as JSON Lines (gzip when `FILE` ends in `.gz`); independent of `-debug` |
+| `-trace-max` | `1G` | Largest size of the trace on disk (`0` = no limit); it keeps the end of the run: `FILE` holds the newest part, `FILE` with `.1` before the extension the part before it. The trace also stops when less than 256 MB are free on the disk |
 | `-insecure` | | Skip TLS verification (debugging only) |
 | `-base-url` | | Another Fragment base URL (tests, mirrors) |
 
@@ -174,7 +175,7 @@ answers with a Cloudflare challenge (see above).
 | ---- | ------- | ----------- |
 | `-addr` | `127.0.0.1:8080` | Listen address |
 | `-data` | `./data` | Directory for `data.db` and `settings.json` |
-| `-log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
+| `-log-level` | `info` | `error`, `warn`, `info`, `debug` (the old `trace` counts as `debug`) |
 | `-cache-dir` / `-no-cache` | `<data>/pagecache` | Page cache directory, or no cache |
 | `-cache-ttl` / `-cache-sold-ttl` | `2m` / `168h` | TTL of auction/sale pages and of sold pages |
 | `-allow-host` | | Host names the panel answers to besides `localhost`, comma-separated: the domain of a reverse proxy in front of it |

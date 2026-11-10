@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/tracelog"
 	"github.com/cyberanchor/frgmnt/internal/worker"
 )
 
@@ -777,16 +779,17 @@ func TestTraceDownloadAPI(t *testing.T) {
 		t.Fatalf("status %s", st)
 	}
 	rec := do(t, s, "GET", "/api/workers/"+id+"/trace", "", "", nil)
-	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/x-ndjson" ||
-		!strings.Contains(rec.Header().Get("Content-Disposition"), "traced-trace.jsonl") {
-		t.Fatalf("GET: %d %v", rec.Code, rec.Header())
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "application/gzip" ||
+		!strings.Contains(rec.Header().Get("Content-Disposition"), "traced-trace.jsonl.gz") ||
+		rec.Header().Get("Content-Length") != strconv.Itoa(rec.Body.Len()) {
+		t.Fatalf("GET: %d %v (%d bytes)", rec.Code, rec.Header(), rec.Body.Len())
+	}
+	events, err := tracelog.Decode(rec.Body)
+	if err != nil {
+		t.Fatal(err)
 	}
 	kinds := map[string]int{}
-	for _, line := range strings.Split(strings.TrimSpace(rec.Body.String()), "\n") {
-		var e checker.TraceEvent
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			t.Fatalf("not JSON: %q", line)
-		}
+	for _, e := range events {
 		kinds[e.Kind]++
 	}
 	if kinds["run_start"] != 1 || kinds["result"] != 2 || kinds["run_end"] != 1 {

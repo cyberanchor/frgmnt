@@ -15,8 +15,11 @@ import (
 // said. Durations are milliseconds; fields that do not apply are left out.
 // Cookie values never appear, only their names.
 type TraceEvent struct {
+	// Seq numbers the lines of a trace file from 1, across its segments
+	// (set by the writer): a gap means lines were lost.
+	Seq  int64     `json:"seq,omitempty"`
 	Time time.Time `json:"ts"`
-	Kind string    `json:"kind"` // attempt, probe, cache, result, pause, gate, throttle_over, blocked; run_start, run_end, pipeline from the hosts
+	Kind string    `json:"kind"` // attempt, probe, cache, result, pause, gate, throttle_over, blocked; run_start, run_end, pipeline, segment, trace_stopped from the hosts and the writer
 	Name string    `json:"name,omitempty"`
 	Try  int       `json:"try,omitempty"` // HTTP try of the name, from 1; throttled tries count
 

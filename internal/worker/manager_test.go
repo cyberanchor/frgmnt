@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +15,7 @@ import (
 	"github.com/cyberanchor/frgmnt/internal/checker"
 	"github.com/cyberanchor/frgmnt/internal/logbus"
 	"github.com/cyberanchor/frgmnt/internal/store"
+	"github.com/cyberanchor/frgmnt/internal/tracelog"
 )
 
 // fakeFragment answers every username with "free" (302 to /?query=) after
@@ -901,9 +901,10 @@ func TestEngineDetailFollowsTheLogLevel(t *testing.T) {
 }
 
 // A worker whose config has trace on writes the structured trace of its
-// runs to <data>/traces/<id>.jsonl: a fresh start begins the file again,
-// Resume appends, deleting the worker deletes it, and the file stops at
-// maxTraceBytes with a trace_truncated line.
+// runs to <data>/traces/<id>.jsonl.gz: a fresh start begins the trace
+// again, Resume appends, deleting the worker deletes it. Over
+// maxTraceBytes it keeps the end of the runs in two segments (it used to
+// keep the start and cut the rest, end of run included).
 func TestTileTraceFile(t *testing.T) {
 	newFakeFragment(t, 0)
 	h := newHarness(t)
@@ -926,21 +927,21 @@ func TestTileTraceFile(t *testing.T) {
 			t.Fatal("run did not finish")
 		}
 	}
-	kinds := func() map[string]int {
+	read := func() []checker.TraceEvent {
 		t.Helper()
-		raw, err := os.ReadFile(h.m.TracePath(w.ID()))
+		events, err := tracelog.ReadAll(h.m.TraceFiles(w.ID())...)
 		if err != nil {
 			t.Fatal(err)
 		}
+		return events
+	}
+	kinds := func() map[string]int {
+		t.Helper()
 		out := map[string]int{}
-		for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-			var e checker.TraceEvent
-			if err := json.Unmarshal([]byte(line), &e); err != nil {
-				t.Fatalf("not JSON: %q", line)
-			}
+		for _, e := range read() {
 			out[e.Kind]++
-			if e.Kind == "run_start" && e.Info["worker"] != w.ID() {
-				t.Errorf("run_start info %v", e.Info)
+			if (e.Kind == "run_start" || e.Kind == "segment") && e.Info["worker"] != w.ID() {
+				t.Errorf("%s info %v", e.Kind, e.Info)
 			}
 		}
 		return out
@@ -949,10 +950,11 @@ func TestTileTraceFile(t *testing.T) {
 	if k := kinds(); k["run_start"] != 1 || k["run_end"] != 1 || k["attempt"] != 5 || k["result"] != 5 {
 		t.Errorf("first run: %v", k)
 	}
-	if fi, err := os.Stat(h.m.TracePath(w.ID())); err != nil || fi.Mode().Perm() != 0o600 {
-		t.Errorf("trace file: %v %v", err, fi.Mode().Perm())
+	if fi, err := os.Stat(h.m.TracePath(w.ID())); err != nil || fi.Mode().Perm() != 0o600 ||
+		!strings.HasSuffix(h.m.TracePath(w.ID()), ".jsonl.gz") {
+		t.Errorf("trace file %s: %v %v", h.m.TracePath(w.ID()), err, fi.Mode().Perm())
 	}
-	run(false) // a fresh start: a new file
+	run(false) // a fresh start: a new trace
 	if k := kinds(); k["run_start"] != 1 {
 		t.Errorf("after a fresh start: %d run_start, want 1", k["run_start"])
 	}
@@ -967,21 +969,28 @@ func TestTileTraceFile(t *testing.T) {
 	}
 
 	old := maxTraceBytes
-	maxTraceBytes = 2 << 10
+	maxTraceBytes = 4 << 10
 	t.Cleanup(func() { maxTraceBytes = old })
-	if _, err := h.m.SetInput(ctx, w.ID(), testNames(40)); err != nil {
+	if _, err := h.m.SetInput(ctx, w.ID(), testNames(300)); err != nil {
 		t.Fatal(err)
 	}
 	run(false)
-	if k := kinds(); k["trace_truncated"] != 1 || k["run_end"] != 0 {
-		t.Errorf("over the limit: %v, want one trace_truncated and nothing after it", k)
+	events := read()
+	if files := h.m.TraceFiles(w.ID()); len(files) != 2 {
+		t.Errorf("trace files %v, want two segments", files)
+	}
+	if last := events[len(events)-1]; last.Kind != "run_end" {
+		t.Errorf("last event %+v, want run_end: the trace keeps the end", last)
+	}
+	if k := kinds(); k["run_start"] != 0 || k["segment"] == 0 || k["result"] >= 300 {
+		t.Errorf("over the limit: %v, want the start dropped and a segment line", k)
 	}
 
 	if err := h.m.Delete(ctx, w.ID()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(h.m.TracePath(w.ID())); !os.IsNotExist(err) {
-		t.Errorf("trace file after Delete: %v, want gone", err)
+	if files := tracelog.Files(h.m.TracePath(w.ID())); len(files) != 0 {
+		t.Errorf("trace files after Delete: %v, want none", files)
 	}
 }
 
@@ -1044,19 +1053,15 @@ func TestTileTraceHasPipelineEvents(t *testing.T) {
 	if !waitNotRunning(w, 10*time.Second) {
 		t.Fatal("run did not finish")
 	}
-	raw, err := os.ReadFile(h.m.TracePath(w.ID()))
+	events, err := tracelog.ReadAll(h.m.TraceFiles(w.ID())...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	n := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		var e checker.TraceEvent
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			t.Fatalf("not JSON: %q", line)
-		}
+	for _, e := range events {
 		if e.Kind == "pipeline" {
 			n++
-			if e.Info["workers"] != float64(1) || e.Info["busy"] == nil {
+			if ts, _ := e.Info["trace"].(map[string]any); e.Info["workers"] != float64(1) || e.Info["busy"] == nil || ts["events"] == nil {
 				t.Errorf("pipeline info %v", e.Info)
 			}
 		}

@@ -1014,39 +1014,71 @@ func (s *Server) handleWorkerResults(w http.ResponseWriter, r *http.Request, id 
 }
 
 // handleWorkerTrace downloads (GET) or deletes (DELETE) the structured
-// trace of a worker's runs: JSON Lines, written while the worker's config
-// has trace on. A trace that is being written can be downloaded (it is
-// flushed every second); it cannot be deleted while the worker runs.
+// trace of a worker's runs, written while the worker's config has trace
+// on: gzip JSON Lines, the older segment first when the trace has kept
+// only its tail (the two gzip files in a row read as one stream; a trace
+// from 2.1.0 is served as the plain file it is). A trace that is being
+// written can be downloaded up to its last flush (every second); it
+// cannot be deleted while the worker runs.
 func (s *Server) handleWorkerTrace(w http.ResponseWriter, r *http.Request, id string) {
 	wk, err := s.mgr.Get(id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	path := s.mgr.TracePath(id)
 	switch r.Method {
 	case http.MethodGet:
-		f, err := os.Open(path)
-		if err != nil {
+		type part struct {
+			f    *os.File
+			size int64
+		}
+		var parts []part
+		defer func() {
+			for _, p := range parts {
+				p.f.Close()
+			}
+		}()
+		var total int64
+		gz := false
+		for _, path := range s.mgr.TraceFiles(id) {
+			f, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			fi, err := f.Stat()
+			if err != nil {
+				f.Close()
+				continue
+			}
+			// The size now: the current file grows while a run writes it,
+			// and Content-Length must hold.
+			parts = append(parts, part{f, fi.Size()})
+			total += fi.Size()
+			gz = gz || strings.HasSuffix(path, ".gz")
+		}
+		if len(parts) == 0 {
 			writeError(w, http.StatusNotFound,
 				"no trace for this worker: turn on \"Write a trace\" in its settings and run it")
 			return
 		}
-		defer f.Close()
-		fi, err := f.Stat()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
+		name, ctype := safeFilename(wk.Name())+"-trace.jsonl", "application/x-ndjson"
+		if gz {
+			name, ctype = name+".gz", "application/gzip"
 		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s-trace.jsonl"`, safeFilename(wk.Name())))
-		http.ServeContent(w, r, "", fi.ModTime(), f)
+		w.Header().Set("Content-Type", ctype)
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+		w.Header().Set("Content-Length", strconv.FormatInt(total, 10))
+		for _, p := range parts {
+			if _, err := io.CopyN(w, p.f, p.size); err != nil {
+				return // the client went away
+			}
+		}
 	case http.MethodDelete:
 		if wk.Status() == worker.StatusRunning {
 			writeError(w, http.StatusConflict, "worker is running; stop it before deleting its trace")
 			return
 		}
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := s.mgr.RemoveTrace(id); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
