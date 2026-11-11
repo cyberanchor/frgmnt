@@ -1,6 +1,6 @@
 module github.com/cyberanchor/frgmnt
 
-go 1.21
+go 1.26
 
 require modernc.org/sqlite v1.34.1
 

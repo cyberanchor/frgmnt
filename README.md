@@ -12,7 +12,7 @@
 ![GitHub Pull Requests](https://img.shields.io/github/issues-pr/cyberanchor/frgmnt?color=green&style=flat-square)
 ![GitHub Contributors](https://img.shields.io/github/contributors/cyberanchor/frgmnt?color=green&style=flat-square)
 
-[![Go](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go&logoColor=white&style=flat-square)](https://go.dev/)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white&style=flat-square)](https://go.dev/)
 [![SQLite](https://img.shields.io/badge/SQLite-pure_Go-003B57?logo=sqlite&logoColor=white&style=flat-square)](https://pkg.go.dev/modernc.org/sqlite)
 ![HTML5](https://img.shields.io/badge/HTML5-E34F26?logo=html5&logoColor=white&style=flat-square)
 ![CSS3](https://img.shields.io/badge/CSS3-1572B6?logo=css3&logoColor=white&style=flat-square)
@@ -39,7 +39,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o frgmnt ./cmd/frgmnt
 ./frgmnt web
 ```
 
-Go **1.21+**, no CGO, no system SQLite. `./frgmnt version` prints
+Go **1.26+** (build releases with the newest Go: the standard library's
+security fixes, in net/http and crypto/tls for one, come with it), no CGO,
+no system SQLite. `./frgmnt version` prints
 `frgmnt 3.0.0` (the console, the panel and its header show the same version); `./frgmnt help`, `./frgmnt check -h` and
 `./frgmnt web -h` and `./frgmnt token -h` list every flag. The old shorthands still work:
 `./frgmnt -input ...` runs `check`, `./frgmnt -addr ...` runs `web`.
@@ -464,8 +466,9 @@ make clean-cache  # drops .fragment_cache and data/pagecache
 - `internal/*/*_test.go`: white-box tests, including one regression test per
   bug fixed after the import (`regression_test.go`, `manager_test.go`,
   `server_test.go`).
-- [CI](.github/workflows/ci.yml) on Go 1.21 and 1.22: gofmt, vet, race tests,
-  the black-box suite and the release build.
+- [CI](.github/workflows/ci.yml) on the two Go releases that get security fixes
+  (`stable` and `oldstable`): gofmt, vet, race tests, the black-box suite,
+  govulncheck and the release build.
 
 ## Project layout
 

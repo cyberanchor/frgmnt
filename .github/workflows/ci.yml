@@ -19,7 +19,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.21.x", "1.22.x"]
+        # The two Go releases that get security fixes: setup-go resolves
+        # these to the newest and the previous minor release (go.mod asks
+        # for 1.26 at least).
+        go: ["stable", "oldstable"]
+    env:
+      # Test each job on its own Go, never a toolchain go.mod might ask for.
+      GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +62,10 @@ jobs:
 
       - name: separate black-box unit suite
         run: go test ./tests/... -v
+
+      - name: govulncheck (known vulnerabilities in the code paths used)
+        if: matrix.go == 'stable'
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: go build (release flags)
         run: |

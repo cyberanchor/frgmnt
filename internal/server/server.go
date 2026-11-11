@@ -521,8 +521,9 @@ func (s *Server) routes() {
 				http.NotFound(w, r)
 				return
 			}
-			// fs.ReadFile (not http.ServeFileFS) keeps the module
-			// buildable on Go 1.21, which the README/CI still target.
+			// Read whole and written as it is: the page is small, and it
+			// gets no Last-Modified or Range handling (the embedded files
+			// have no modification time to offer).
 			data, err := fs.ReadFile(s.staticFS, "index.html")
 			if err != nil {
 				http.Error(w, "index.html not found", http.StatusInternalServerError)
