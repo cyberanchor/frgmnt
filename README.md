@@ -363,8 +363,8 @@ Three tools, each independent of the others:
 ### The trace
 
 JSON Lines, gzip when the file ends in `.gz` (about 11 times smaller; read it with `zcat`
-or `gzip -dc`). Every line has `seq` (numbered from 1 across the file's segments: a
-gap means lost lines), `ts` and `kind`. Events of one check of a name share `nid`,
+or `gzip -dc`). Every line has `seq` (numbered from 1 for each run, across the file's segments: a gap
+means lost lines; a `-resume` run appended to the file starts at 1 again), `ts` and `kind`. Events of one check of a name share `nid`,
 every HTTP request has its `aid`, every connection its `cid`, and `w` is the worker
 that did it.
 
