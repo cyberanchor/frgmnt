@@ -78,6 +78,7 @@ type Stats struct {
 	Dropped   int64   `json:"dropped"`           // not written: after Close, or after the trace stopped
 	Bytes     int64   `json:"bytes"`             // written by this Writer, as stored
 	Rotations int64   `json:"rotations"`         // times the current file became the older segment
+	OnDisk    int64   `json:"on_disk"`           // bytes of the trace files now (the segments kept)
 	Queue     int     `json:"queue"`             // events waiting to be written
 	BlockedMs float64 `json:"blocked_ms"`        // time the workers waited for room in the queue
 	Stopped   string  `json:"stopped,omitempty"` // why the trace stopped before the end of the run
@@ -163,6 +164,32 @@ func OlderPath(path string) string {
 		return dir + base[:i] + ".1" + base[i:]
 	}
 	return path + ".1"
+}
+
+// OnDisk is the size of the trace files at path (the segments kept).
+func OnDisk(path string) int64 {
+	var n int64
+	for _, p := range Files(path) {
+		if fi, err := os.Stat(p); err == nil {
+			n += fi.Size()
+		}
+	}
+	return n
+}
+
+// FormatBytes prints a size for a log line: 812 B, 3.4 KB, 12.0 MB,
+// 1.2 GB (sizes used to be printed as whole megabytes, which made a
+// 96 KB limit "0 MB").
+func FormatBytes(n int64) string {
+	switch {
+	case n < 1<<10:
+		return fmt.Sprintf("%d B", n)
+	case n < 1<<20:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	case n < 1<<30:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	}
+	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
 }
 
 // Files lists the files of the trace at path that exist, oldest first.
@@ -267,7 +294,7 @@ func (t *Writer) Close() (Stats, error) {
 func (t *Writer) Stats() Stats {
 	s := Stats{
 		Events: t.events.Load(), Dropped: t.dropped.Load(), Bytes: t.bytes.Load(),
-		Rotations: t.rotations.Load(), Queue: len(t.queue),
+		Rotations: t.rotations.Load(), Queue: len(t.queue), OnDisk: OnDisk(t.path),
 		BlockedMs: float64(t.blockedNs.Load()) / float64(time.Millisecond),
 	}
 	if p := t.stopped.Load(); p != nil {
@@ -371,8 +398,8 @@ func (t *Writer) rotate() bool {
 	t.seg = seg
 	t.rotations.Add(1)
 	h := checker.TraceEvent{Kind: "segment", Time: time.Now(), Seq: t.seq + 1,
-		Message: fmt.Sprintf("the trace keeps its last %d MB: the part before this line is in %s, anything older was dropped",
-			t.opt.MaxBytes>>20, filepath.Base(t.older))}
+		Message: fmt.Sprintf("the trace keeps its last %s: the part before this line is in %s, anything older was dropped",
+			FormatBytes(t.opt.MaxBytes), filepath.Base(t.older))}
 	if t.header != nil {
 		h.Info = t.header.Info
 	} else {
@@ -394,7 +421,7 @@ func (t *Writer) checkDisk() {
 	if !ok || free >= t.opt.MinFree {
 		return
 	}
-	reason := fmt.Sprintf("less than %d MB free on the disk (%d MB left)", t.opt.MinFree>>20, free>>20)
+	reason := fmt.Sprintf("less than %s free on the disk (%s left)", FormatBytes(t.opt.MinFree), FormatBytes(free))
 	e := checker.TraceEvent{Kind: "trace_stopped", Time: time.Now(), Seq: t.seq + 1,
 		Message: "the trace stops here: " + reason + "; the run goes on"}
 	if t.put(t.encode(e)) {

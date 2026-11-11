@@ -326,7 +326,7 @@ func (s *Stats) finalSummary(e checker.Stats, readLimit int) string {
 		line += fmt.Sprintf("\n  Invalid names: %d (counted among the errors; not sent to Fragment)", inv)
 	}
 	line += fmt.Sprintf("\n  Connections: new=%d, reused=%d | Wire: in=%s, out=%s | Rate-limits: %d | Retries: %d",
-		e.ConnNew, e.ConnReuse, fmtBytes(e.BytesIn), fmtBytes(e.BytesOut), e.RateLimit, e.Retries)
+		e.ConnNew, e.ConnReuse, tracelog.FormatBytes(e.BytesIn), tracelog.FormatBytes(e.BytesOut), e.RateLimit, e.Retries)
 	line += fmt.Sprintf("\n  Page cache: hits=%d, stale=%d, misses=%d", e.CacheHits, e.CacheStale, e.CacheMisses)
 	if e.CacheErrors > 0 {
 		line += fmt.Sprintf(" (%d of them broken entries; see -debug)", e.CacheErrors)
@@ -753,9 +753,9 @@ func pipelineLine(e checker.Stats, q queues, workers int) string {
 // goroutines, live heap, resident memory, how long goroutines waited for a
 // CPU (p99 in the last second) and the GC cycles so far.
 func runtimeLine(s rtstats.Sample) string {
-	line := fmt.Sprintf("go=%d heap=%s", s.Goroutines, fmtBytes(int64(s.HeapBytes)))
+	line := fmt.Sprintf("go=%d heap=%s", s.Goroutines, tracelog.FormatBytes(int64(s.HeapBytes)))
 	if s.RSSBytes > 0 {
-		line += " rss=" + fmtBytes(s.RSSBytes)
+		line += " rss=" + tracelog.FormatBytes(s.RSSBytes)
 	}
 	return line + fmt.Sprintf(" sched_p99=%.1fms gc=%d", s.SchedLatP99Ms, s.GCCycles)
 }
@@ -1257,10 +1257,10 @@ func Main(args []string) int {
 		case err != nil:
 			log.Printf("[ERROR] -trace %s: %v (the trace is incomplete)", tracePath, err)
 		case st.Rotations > 0:
-			log.Printf("[INFO] trace: %d events, %s in %s and %s (the trace keeps the last %s of the run; the start was dropped)",
-				st.Events, fmtBytes(st.Bytes), tracelog.OlderPath(tracePath), tracePath, traceMax.String())
+			log.Printf("[INFO] trace: %d events, %s on disk in %s and %s (the trace keeps the last %s of the run; the start was dropped)",
+				st.Events, tracelog.FormatBytes(st.OnDisk), tracelog.OlderPath(tracePath), tracePath, traceMax.String())
 		default:
-			log.Printf("[INFO] trace: %d events, %s in %s", st.Events, fmtBytes(st.Bytes), tracePath)
+			log.Printf("[INFO] trace: %d events, %s in %s", st.Events, tracelog.FormatBytes(st.OnDisk), tracePath)
 		}
 		if st.Stopped != "" {
 			log.Printf("[WARN] the trace stopped before the end of the run: %s", st.Stopped)
@@ -1308,19 +1308,6 @@ func (b *byteSize) Set(s string) error {
 	}
 	*b = byteSize(n << shift)
 	return nil
-}
-
-// fmtBytes prints a size for the log: 812 B, 3.4 KB, 12.0 MB, 1.2 GB.
-func fmtBytes(n int64) string {
-	switch {
-	case n < 1<<10:
-		return fmt.Sprintf("%d B", n)
-	case n < 1<<20:
-		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
-	case n < 1<<30:
-		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
-	}
-	return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
 }
 
 // startProfiling starts what the profiling flags ask for and returns the
@@ -1381,9 +1368,9 @@ func startProfiling(pprofAddr, cpuPath, execPath, memPath string, execMax int64)
 			case err != nil:
 				log.Printf("[ERROR] -exectrace: %v", err)
 			case early != "":
-				log.Printf("[WARN] the execution trace %s stopped before the end of the run: it %s (%s)", execPath, early, fmtBytes(n))
+				log.Printf("[WARN] the execution trace %s stopped before the end of the run: it %s (%s)", execPath, early, tracelog.FormatBytes(n))
 			default:
-				log.Printf("[INFO] execution trace: %s in %s (go tool trace %s)", fmtBytes(n), execPath, execPath)
+				log.Printf("[INFO] execution trace: %s in %s (go tool trace %s)", tracelog.FormatBytes(n), execPath, execPath)
 			}
 		})
 	}

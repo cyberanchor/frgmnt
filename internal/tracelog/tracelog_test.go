@@ -162,6 +162,9 @@ func TestWriterKeepsTheTail(t *testing.T) {
 			if total > limit+limit/2 {
 				t.Errorf("%d bytes on disk with a %d limit", total, limit)
 			}
+			if st.OnDisk != total {
+				t.Errorf("Stats.OnDisk %d, the files have %d", st.OnDisk, total)
+			}
 			events := read(t, files...)
 			checkSeq(t, events)
 			if last := events[len(events)-1]; last.Kind != "run_end" {
@@ -171,8 +174,9 @@ func TestWriterKeepsTheTail(t *testing.T) {
 				t.Error("the start of the run is still there; nothing was dropped")
 			}
 			cur := read(t, path)
-			if cur[0].Kind != "segment" || cur[0].Info["version"] != "test" || cur[0].Info["schema"] != float64(Schema) {
-				t.Errorf("the current file starts with %+v, want a segment repeating run_start", cur[0])
+			if cur[0].Kind != "segment" || cur[0].Info["version"] != "test" || cur[0].Info["schema"] != float64(Schema) ||
+				!strings.Contains(cur[0].Message, "keeps its last 64.0 KB") {
+				t.Errorf("the current file starts with %+v, want a segment repeating run_start and naming the limit", cur[0])
 			}
 		})
 	}
@@ -226,7 +230,7 @@ func TestWriterStopsOnALowDisk(t *testing.T) {
 		w.Write(checker.TraceEvent{Kind: "attempt", Name: "after"})
 	}
 	st, err := w.Close()
-	if err != nil || !strings.Contains(st.Stopped, "less than 256 MB free") || st.Dropped != 10 {
+	if err != nil || !strings.Contains(st.Stopped, "less than 256.0 MB free") || st.Dropped != 10 {
 		t.Fatalf("Close = %+v, %v", st, err)
 	}
 	events := read(t, path)
@@ -266,6 +270,15 @@ func TestOlderPath(t *testing.T) {
 	} {
 		if got := OlderPath(in); got != want {
 			t.Errorf("OlderPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	for n, want := range map[int64]string{0: "0 B", 812: "812 B", 96 << 10: "96.0 KB", 3500: "3.4 KB",
+		12 << 20: "12.0 MB", 1<<30 + 200<<20: "1.2 GB"} {
+		if got := FormatBytes(n); got != want {
+			t.Errorf("FormatBytes(%d) = %q, want %q", n, got, want)
 		}
 	}
 }

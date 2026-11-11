@@ -927,9 +927,9 @@ func (m *Manager) run(ctx context.Context, w *Worker) {
 		if err != nil {
 			m.bus.Publish(logbus.LevelError, w.id, fmt.Sprintf("trace: %v (the trace is incomplete)", err))
 		} else {
-			msg := fmt.Sprintf("trace: %d events, %.1f MB", st.Events, float64(st.Bytes)/(1<<20))
+			msg := fmt.Sprintf("trace: %d events, %s", st.Events, tracelog.FormatBytes(st.OnDisk))
 			if st.Rotations > 0 {
-				msg += fmt.Sprintf("; it keeps the last %d MB of the runs, the older part was dropped", maxTraceBytes>>20)
+				msg += fmt.Sprintf("; it keeps the last %s of the runs, the older part was dropped", tracelog.FormatBytes(maxTraceBytes))
 			}
 			m.bus.Publish(logbus.LevelInfo, w.id, msg)
 		}

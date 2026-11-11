@@ -1097,8 +1097,14 @@ func TestTraceGzipKeepsTheEnd(t *testing.T) {
 	if cur[0].Kind != "segment" || cur[0].Info["version"] != Version {
 		t.Errorf("the newest file starts with %+v, want a segment line repeating run_start", cur[0])
 	}
-	if !strings.Contains(logs.String(), "the trace keeps the last 16K of the run") {
-		t.Errorf("no note about the dropped start:\n%s", logs.String())
+	var onDisk int64
+	for _, f := range files {
+		fi, _ := os.Stat(f)
+		onDisk += fi.Size()
+	}
+	if want := fmt.Sprintf("%s on disk in", tracelog.FormatBytes(onDisk)); !strings.Contains(logs.String(), want) ||
+		!strings.Contains(logs.String(), "the trace keeps the last 16K of the run") {
+		t.Errorf("no note with the size on disk (%q) and the dropped start:\n%s", want, logs.String())
 	}
 }
 
