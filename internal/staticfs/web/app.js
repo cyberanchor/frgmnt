@@ -430,6 +430,7 @@ function openWorkerModal(w) {
     $("#worker-ua").value = cfg.user_agent ?? "";
     $("#worker-trace").checked = !!cfg.trace;
     $("#worker-trace-bodies").value = cfg.trace_bodies || "anomalies";
+    $("#worker-trace-bodies").disabled = !cfg.trace;
 
     workerModal.removeAttribute("hidden");
     setTimeout(() => $("#worker-name").focus(), 30);
@@ -458,6 +459,11 @@ function defaultConfig() {
 
 function nsToMs(ns) { return Math.round(Number(ns) / 1_000_000); }
 function nsToSec(ns) { return Math.round(Number(ns) / 1_000_000_000); }
+
+// The pages kept in the trace matter only when a trace is written.
+$("#worker-trace").addEventListener("change", () => {
+    $("#worker-trace-bodies").disabled = !$("#worker-trace").checked;
+});
 
 $("#worker-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
