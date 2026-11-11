@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.0.1 (2026-11-11)
+
+### Changed
+
+- Go 1.26 or newer is needed (`go.mod`); releases are built with Go 1.27.
+  The versions used so far (1.21 to 1.23) no longer get security fixes,
+  and a binary takes `net/http` and `crypto/tls` from the Go that builds it.
+- CI runs on the two supported Go releases (`stable` and `oldstable`) and
+  runs `govulncheck`.
+
+### Fixed
+
+- A bad path in `-trace`, `-tls-keylog`, `-cpuprofile`, `-memprofile` or
+  `-exectrace`, or a `-pprof` address that cannot be used, stopped the run
+  after the results file had been truncated: the previous results were
+  lost. These files are opened before the results file now.
+- Invalid names (too short, a digit first) are final: `-resume` no longer
+  checks them again, and they no longer make a run end with exit 1 when
+  nothing else was left. The summary counts them.
+- Trace sizes in the log: "keeps its last 0 MB" for a 96 KB limit, "0.0 MB"
+  in the panel, and the bytes written instead of the bytes on disk after a
+  rotation.
+- Panel: "Pages in the trace" is disabled until "Write a trace" is on.
+- README: `seq` is numbered per run (a `-resume` run appended to a trace
+  starts at 1 again).
+
 ## 3.0.0 (2026-11-10)
 
 The trace covers everything a run does, down to the bytes on the wire, and
